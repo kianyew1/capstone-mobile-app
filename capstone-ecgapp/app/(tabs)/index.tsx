@@ -1,7 +1,10 @@
 import { Card, CardContent, Progress, Text } from "@/components/ui";
 import { Ionicons } from "@expo/vector-icons";
-import { Pressable, ScrollView, View } from "react-native";
+import { Pressable, ScrollView, View, ActivityIndicator } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { router } from "expo-router";
+import { useBluetoothService } from "@/services/bluetooth-service";
+import { useAppStore } from "@/stores/app-store";
 
 // Mock data for the health metrics
 const heartRateData = {
@@ -111,6 +114,34 @@ function ActivityBar({ value, day }: { value: number; day: string }) {
 
 export default function HomeScreen() {
   const insets = useSafeAreaInsets();
+  const {
+    connectionStatus,
+    pairedDevice,
+    reconnectToPairedDevice,
+    isScanning,
+    startScan,
+  } = useBluetoothService();
+  const { user } = useAppStore();
+
+  const isConnected = connectionStatus === "connected";
+  const isConnecting =
+    connectionStatus === "connecting" || connectionStatus === "reconnecting";
+
+  const handleDeviceAction = () => {
+    if (!pairedDevice) {
+      // Navigate to bluetooth pairing screen
+      router.push("/(onboarding)/bluetooth");
+    } else if (!isConnected && !isConnecting) {
+      reconnectToPairedDevice();
+    }
+  };
+
+  const getGreeting = () => {
+    const hour = new Date().getHours();
+    if (hour < 12) return "Good morning";
+    if (hour < 18) return "Good afternoon";
+    return "Good evening";
+  };
 
   return (
     <ScrollView
@@ -122,8 +153,12 @@ export default function HomeScreen() {
       <View className="px-5 pt-4 pb-2">
         <View className="flex-row justify-between items-center">
           <View>
-            <Text className="text-muted-foreground text-sm">Good morning</Text>
-            <Text className="text-2xl font-bold">Your Health</Text>
+            <Text className="text-muted-foreground text-sm">
+              {getGreeting()}
+            </Text>
+            <Text className="text-2xl font-bold">
+              {user?.name || "Your Health"}
+            </Text>
           </View>
           <Pressable className="w-10 h-10 rounded-full bg-secondary items-center justify-center">
             <Ionicons name="person" size={20} className="text-foreground" />
@@ -138,41 +173,89 @@ export default function HomeScreen() {
             <View className="flex-row justify-between items-start mb-3">
               <View className="flex-row items-center gap-2">
                 <View className="w-10 h-10 rounded-full bg-red-500/20 items-center justify-center">
-                  <Ionicons name="pulse" size={24} color="#ef4444" />
+                  {isConnecting ? (
+                    <ActivityIndicator size="small" color="#ef4444" />
+                  ) : (
+                    <Ionicons name="pulse" size={24} color="#ef4444" />
+                  )}
                 </View>
                 <View>
-                  <Text className="font-semibold text-base">ECG Monitor</Text>
+                  <Text className="font-semibold text-base">
+                    {pairedDevice?.name || "ECG Monitor"}
+                  </Text>
                   <View className="flex-row items-center gap-1">
-                    <View className="w-2 h-2 rounded-full bg-green-500" />
+                    <View
+                      className={`w-2 h-2 rounded-full ${
+                        isConnected
+                          ? "bg-green-500"
+                          : isConnecting
+                            ? "bg-yellow-500"
+                            : pairedDevice
+                              ? "bg-orange-500"
+                              : "bg-gray-400"
+                      }`}
+                    />
                     <Text className="text-muted-foreground text-xs">
-                      Connected
+                      {isConnected
+                        ? "Connected"
+                        : isConnecting
+                          ? "Connecting..."
+                          : pairedDevice
+                            ? "Disconnected"
+                            : "No Device"}
                     </Text>
                   </View>
                 </View>
               </View>
-              <Pressable className="px-3 py-1.5 bg-red-500 rounded-full">
-                <Text className="text-white text-xs font-medium">Take ECG</Text>
+              <Pressable
+                className={`px-3 py-1.5 rounded-full ${
+                  isConnected ? "bg-red-500" : "bg-primary"
+                }`}
+                onPress={handleDeviceAction}
+                disabled={isConnecting}
+              >
+                <Text className="text-white text-xs font-medium">
+                  {isConnected
+                    ? "Take ECG"
+                    : isConnecting
+                      ? "Connecting..."
+                      : pairedDevice
+                        ? "Reconnect"
+                        : "Pair Device"}
+                </Text>
               </Pressable>
             </View>
 
-            <ECGWaveform />
+            {isConnected && <ECGWaveform />}
 
-            <View className="flex-row justify-between mt-3 pt-3 border-t border-border">
-              <View>
-                <Text className="text-muted-foreground text-xs">
-                  Last Reading
-                </Text>
-                <Text className="font-medium text-sm">
-                  {ecgStatus.lastReading}
-                </Text>
-              </View>
-              <View className="items-end">
-                <Text className="text-muted-foreground text-xs">Status</Text>
-                <Text className="font-medium text-sm text-green-600">
-                  {ecgStatus.status}
+            {!isConnected && !isConnecting && (
+              <View className="py-4 items-center">
+                <Text className="text-muted-foreground text-sm text-center">
+                  {pairedDevice
+                    ? "Tap 'Reconnect' to connect to your ECG device"
+                    : "Pair your ECG device to start monitoring"}
                 </Text>
               </View>
-            </View>
+            )}
+
+            {isConnected && (
+              <View className="flex-row justify-between mt-3 pt-3 border-t border-border">
+                <View>
+                  <Text className="text-muted-foreground text-xs">
+                    Last Reading
+                  </Text>
+                  <Text className="font-medium text-sm">
+                    {ecgStatus.lastReading}
+                  </Text>
+                </View>
+                <View className="items-end">
+                  <Text className="text-muted-foreground text-xs">Status</Text>
+                  <Text className="font-medium text-sm text-green-600">
+                    {ecgStatus.status}
+                  </Text>
+                </View>
+              </View>
+            )}
           </CardContent>
         </Card>
       </View>
