@@ -64,6 +64,30 @@ export default function RootLayout() {
         <Stack.Screen name="(onboarding)" />
         <Stack.Screen name="(tabs)" />
         <Stack.Screen
+          name="calibration"
+          options={{
+            presentation: "modal",
+            title: "Device Calibration",
+            headerShown: false,
+          }}
+        />
+        <Stack.Screen
+          name="run-session"
+          options={{
+            title: "Run Session",
+            headerShown: false,
+            gestureEnabled: false, // Prevent accidental swipe back during session
+          }}
+        />
+        <Stack.Screen
+          name="run-summary"
+          options={{
+            title: "Session Summary",
+            headerShown: false,
+            gestureEnabled: false, // Keep user on summary until they tap Done
+          }}
+        />
+        <Stack.Screen
           name="modal"
           options={{ presentation: "modal", title: "Modal", headerShown: true }}
         />

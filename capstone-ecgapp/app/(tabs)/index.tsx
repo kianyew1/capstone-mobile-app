@@ -1,10 +1,17 @@
 import { Card, CardContent, Progress, Text } from "@/components/ui";
 import { Ionicons } from "@expo/vector-icons";
-import { Pressable, ScrollView, View, ActivityIndicator } from "react-native";
+import {
+  Pressable,
+  ScrollView,
+  View,
+  ActivityIndicator,
+  Alert,
+} from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { router } from "expo-router";
 import { useBluetoothService } from "@/services/bluetooth-service";
 import { useAppStore } from "@/stores/app-store";
+import { useSessionHistoryStore } from "@/stores/session-store";
 
 // Mock data for the health metrics
 const heartRateData = {
@@ -121,7 +128,8 @@ export default function HomeScreen() {
     isScanning,
     startScan,
   } = useBluetoothService();
-  const { user } = useAppStore();
+  const { user, isCalibrated } = useAppStore();
+  const { sessions } = useSessionHistoryStore();
 
   const isConnected = connectionStatus === "connected";
   const isConnecting =
@@ -133,7 +141,65 @@ export default function HomeScreen() {
       router.push("/(onboarding)/bluetooth");
     } else if (!isConnected && !isConnecting) {
       reconnectToPairedDevice();
+    } else if (isConnected) {
+      // Start ECG recording - go to calibration if not calibrated
+      if (!isCalibrated) {
+        router.push("/calibration");
+      } else {
+        router.push("/run-session");
+      }
     }
+  };
+
+  const handleStartRun = () => {
+    if (!pairedDevice) {
+      Alert.alert(
+        "No Device Paired",
+        "Please pair your ECG device before starting a session.",
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Pair Device",
+            onPress: () => router.push("/(onboarding)/bluetooth"),
+          },
+        ],
+      );
+      return;
+    }
+
+    if (!isConnected) {
+      Alert.alert(
+        "Device Not Connected",
+        "Your ECG device is not connected. Would you like to reconnect?",
+        [
+          { text: "Cancel", style: "cancel" },
+          { text: "Reconnect", onPress: () => reconnectToPairedDevice() },
+        ],
+      );
+      return;
+    }
+
+    if (!isCalibrated) {
+      Alert.alert(
+        "Calibration Required",
+        "Your device needs to be calibrated before starting a session.",
+        [
+          { text: "Cancel", style: "cancel" },
+          { text: "Calibrate", onPress: () => router.push("/calibration") },
+        ],
+      );
+      return;
+    }
+
+    router.push("/run-session");
+  };
+
+  const handleCalibrate = () => {
+    router.push("/calibration");
+  };
+
+  const handleViewHistory = () => {
+    router.push("/(tabs)/explore");
   };
 
   const getGreeting = () => {
@@ -375,22 +441,42 @@ export default function HomeScreen() {
       {/* Quick Actions */}
       <View className="px-5 py-3">
         <Text className="text-lg font-semibold mb-3">Quick Actions</Text>
-        <View className="flex-row gap-3">
-          <Pressable className="flex-1 bg-primary rounded-xl p-4 items-center">
+        <View className="flex-row gap-3 mb-3">
+          <Pressable
+            className="flex-1 bg-green-500 rounded-xl p-4 items-center active:opacity-80"
+            onPress={handleStartRun}
+          >
+            <Ionicons name="play" size={28} color="white" />
+            <Text className="text-white font-medium mt-2">Start Run</Text>
+          </Pressable>
+          <Pressable
+            className="flex-1 bg-primary rounded-xl p-4 items-center active:opacity-80"
+            onPress={handleCalibrate}
+          >
             <Ionicons name="pulse" size={28} color="white" />
             <Text className="text-primary-foreground font-medium mt-2">
-              Take ECG
+              {isCalibrated ? "Re-calibrate" : "Calibrate"}
             </Text>
           </Pressable>
-          <Pressable className="flex-1 bg-secondary rounded-xl p-4 items-center">
+        </View>
+        <View className="flex-row gap-3">
+          <Pressable
+            className="flex-1 bg-secondary rounded-xl p-4 items-center active:opacity-80"
+            onPress={handleViewHistory}
+          >
             <Ionicons
               name="stats-chart"
               size={28}
               className="text-foreground"
             />
-            <Text className="font-medium mt-2">View History</Text>
+            <Text className="font-medium mt-2">History</Text>
+            {sessions.length > 0 && (
+              <Text className="text-muted-foreground text-xs">
+                {sessions.length} sessions
+              </Text>
+            )}
           </Pressable>
-          <Pressable className="flex-1 bg-secondary rounded-xl p-4 items-center">
+          <Pressable className="flex-1 bg-secondary rounded-xl p-4 items-center active:opacity-80">
             <Ionicons
               name="share-outline"
               size={28}
