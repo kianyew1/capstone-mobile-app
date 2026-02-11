@@ -1,13 +1,18 @@
+import {
+  ENABLE_MOCK_MODE,
+  MOCK_DEVICE,
+  MOCK_TIMING,
+} from "@/config/mock-config";
+import { useAppStore } from "@/stores/app-store";
+import type { BluetoothStatus, ConnectionStatus, ECGDevice } from "@/types";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Platform, PermissionsAndroid } from "react-native";
+import { PermissionsAndroid, Platform } from "react-native";
 import {
   BleManager,
   Device,
   State,
   type Subscription,
 } from "react-native-ble-plx";
-import type { BluetoothStatus, ConnectionStatus, ECGDevice } from "@/types";
-import { useAppStore } from "@/stores/app-store";
 
 // Service UUID for ECG device - replace with your actual device's service UUID
 const ECG_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"; // Heart Rate Service UUID
@@ -24,11 +29,15 @@ const getBleManager = (): BleManager => {
 };
 
 export function useBluetoothService() {
-  const [bluetoothStatus, setBluetoothStatus] =
-    useState<BluetoothStatus>("unknown");
-  const [connectionStatus, setConnectionStatus] =
-    useState<ConnectionStatus>("disconnected");
-  const [discoveredDevices, setDiscoveredDevices] = useState<ECGDevice[]>([]);
+  const [bluetoothStatus, setBluetoothStatus] = useState<BluetoothStatus>(
+    ENABLE_MOCK_MODE ? "poweredOn" : "unknown",
+  );
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>(
+    ENABLE_MOCK_MODE ? "connected" : "disconnected",
+  );
+  const [discoveredDevices, setDiscoveredDevices] = useState<ECGDevice[]>(
+    ENABLE_MOCK_MODE ? [MOCK_DEVICE] : [],
+  );
   const [connectedDevice, setConnectedDevice] = useState<Device | null>(null);
   const [isScanning, setIsScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -36,11 +45,25 @@ export function useBluetoothService() {
   const { pairedDevice, setPairedDevice } = useAppStore();
 
   const bleManager = useRef(getBleManager()).current;
+  const autoReconnectRef = useRef(false);
   const scanSubscription = useRef<Subscription | null>(null);
   const stateSubscription = useRef<Subscription | null>(null);
 
+  // Initialize mock mode
+  useEffect(() => {
+    if (ENABLE_MOCK_MODE) {
+      setPairedDevice(MOCK_DEVICE);
+      setBluetoothStatus("poweredOn");
+      setConnectionStatus("connected");
+      console.log("🎭 Mock Mode Enabled - Using simulated ECG device");
+    }
+  }, [setPairedDevice]);
+
   // Monitor Bluetooth state
   useEffect(() => {
+    // Skip real Bluetooth setup in mock mode
+    if (ENABLE_MOCK_MODE) return;
+
     const setupBluetooth = async () => {
       try {
         // Check initial state
@@ -66,10 +89,19 @@ export function useBluetoothService() {
 
   // Auto-reconnect to paired device
   useEffect(() => {
-    if (pairedDevice && bluetoothStatus === "poweredOn" && !connectedDevice) {
+    // Skip auto-reconnect in mock mode
+    if (ENABLE_MOCK_MODE) return;
+
+    if (
+      pairedDevice &&
+      bluetoothStatus === "poweredOn" &&
+      !connectedDevice &&
+      autoReconnectRef.current
+    ) {
       reconnectToPairedDevice();
     }
-  }, [pairedDevice, bluetoothStatus]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pairedDevice, bluetoothStatus, connectedDevice]);
 
   const mapBleState = (state: State): BluetoothStatus => {
     switch (state) {
@@ -131,6 +163,30 @@ export function useBluetoothService() {
 
     setError(null);
     setDiscoveredDevices([]);
+
+    // Mock mode: Simulate device discovery
+    if (ENABLE_MOCK_MODE) {
+      setIsScanning(true);
+      setConnectionStatus("scanning");
+
+      setTimeout(() => {
+        setDiscoveredDevices([
+          MOCK_DEVICE,
+          {
+            id: "mock-ecg-device-002",
+            name: "Mock ECG Device 2",
+            rssi: -65,
+            isConnected: false,
+            isPaired: false,
+          },
+        ]);
+        setIsScanning(false);
+        setConnectionStatus("disconnected");
+        console.log("🎭 Mock scan completed - Found 2 devices");
+      }, MOCK_TIMING.scanDuration);
+
+      return;
+    }
 
     const hasPermissions = await requestPermissions();
     if (!hasPermissions) {
@@ -214,6 +270,31 @@ export function useBluetoothService() {
         // Stop scanning if active
         stopScan();
 
+        // Mock mode: Simulate connection
+        if (ENABLE_MOCK_MODE) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, MOCK_TIMING.connectionDelay),
+          );
+
+          const mockDevice =
+            discoveredDevices.find((d) => d.id === deviceId) || MOCK_DEVICE;
+
+          setConnectionStatus("connected");
+          autoReconnectRef.current = true;
+
+          const connectedMockDevice: ECGDevice = {
+            ...mockDevice,
+            isConnected: true,
+            isPaired: true,
+            lastConnected: new Date(),
+          };
+
+          setPairedDevice(connectedMockDevice);
+          console.log("🎭 Mock connection successful:", mockDevice.name);
+
+          return true;
+        }
+
         // Connect to device
         const device = await bleManager.connectToDevice(deviceId, {
           autoConnect: false,
@@ -225,6 +306,7 @@ export function useBluetoothService() {
 
         setConnectedDevice(device);
         setConnectionStatus("connected");
+        autoReconnectRef.current = true;
 
         // Update paired device in store
         const ecgDevice: ECGDevice = {
@@ -263,6 +345,14 @@ export function useBluetoothService() {
 
   const disconnectDevice = useCallback(async (): Promise<void> => {
     try {
+      // Mock mode: Simulate disconnection
+      if (ENABLE_MOCK_MODE) {
+        setConnectedDevice(null);
+        setConnectionStatus("disconnected");
+        console.log("🎭 Mock device disconnected");
+        return;
+      }
+
       if (connectedDevice) {
         await connectedDevice.cancelConnection();
       }
@@ -278,6 +368,15 @@ export function useBluetoothService() {
 
     setConnectionStatus("reconnecting");
 
+    // Mock mode: Simulate reconnection
+    if (ENABLE_MOCK_MODE) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      setConnectionStatus("connected");
+      autoReconnectRef.current = true;
+      console.log("🎭 Mock device reconnected");
+      return true;
+    }
+
     try {
       // Check if device is already connected
       const isConnected = await bleManager.isDeviceConnected(pairedDevice.id);
@@ -287,6 +386,7 @@ export function useBluetoothService() {
         if (device.length > 0) {
           setConnectedDevice(device[0]);
           setConnectionStatus("connected");
+          autoReconnectRef.current = true;
           return true;
         }
       }

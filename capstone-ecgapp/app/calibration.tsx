@@ -1,36 +1,32 @@
-import { useState, useEffect } from "react";
-import { View, Image, ActivityIndicator, ScrollView } from "react-native";
 import { router, useLocalSearchParams } from "expo-router";
-import { SafeAreaView } from "react-native-safe-area-context";
 import {
+  AlertCircle,
   ArrowLeft,
   Check,
-  X,
-  AlertCircle,
+  FlaskConical,
   RefreshCw,
+  X,
   Zap,
 } from "lucide-react-native";
+import { useEffect, useState } from "react";
+import { ActivityIndicator, ScrollView, View } from "react-native";
 import Animated, {
-  useSharedValue,
-  useAnimatedStyle,
-  withRepeat,
-  withTiming,
-  withSequence,
   Easing,
+  useAnimatedStyle,
+  useSharedValue,
+  withRepeat,
+  withSequence,
+  withTiming,
 } from "react-native-reanimated";
+import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Button } from "@/components/ui/button";
-import { Text } from "@/components/ui/text";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { useAppStore } from "@/stores/app-store";
+import { Text } from "@/components/ui/text";
+import { ENABLE_MOCK_MODE } from "@/config/mock-config";
 import { submitCalibrationData } from "@/services/api-service";
+import { useAppStore } from "@/stores/app-store";
 import type { CalibrationStatus } from "@/types";
 
 type CalibrationStep = "guidance" | "ready" | "calibrating" | "result";
@@ -466,6 +462,23 @@ export default function CalibrationScreen() {
           <Text className="font-semibold">Device Calibration</Text>
           <View className="w-10" />
         </View>
+
+        {/* Mock Mode Indicator */}
+        {ENABLE_MOCK_MODE && step === "guidance" && (
+          <View className="bg-purple-500/20 border border-purple-500/50 rounded-lg p-3 mb-4">
+            <View className="flex-row items-center gap-2">
+              <FlaskConical size={18} className="text-purple-500" />
+              <View className="flex-1">
+                <Text className="text-purple-500 font-semibold text-sm">
+                  Mock Mode Active
+                </Text>
+                <Text className="text-purple-400 text-xs">
+                  Calibration will use simulated signal data
+                </Text>
+              </View>
+            </View>
+          </View>
+        )}
 
         {/* Content based on step */}
         {step === "guidance" && renderGuidance()}

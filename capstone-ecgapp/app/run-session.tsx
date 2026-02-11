@@ -1,34 +1,37 @@
-import { useState, useEffect, useRef, useCallback } from "react";
-import { View, Pressable, AppState, type AppStateStatus } from "react-native";
 import { router } from "expo-router";
-import { SafeAreaView } from "react-native-safe-area-context";
 import {
-  Play,
-  Pause,
-  Square,
-  Flag,
-  Heart,
-  Clock,
-  Activity,
-  Smartphone,
-  ChevronUp,
-  Zap,
   AlertCircle,
+  ChevronUp,
+  Clock,
+  Flag,
+  FlaskConical,
+  Heart,
+  Pause,
+  Play,
+  Smartphone,
+  Square,
+  Zap,
 } from "lucide-react-native";
+import { useEffect, useRef, useState } from "react";
+import {
+  AppState,
+  Pressable,
+  ScrollView,
+  View,
+  type AppStateStatus,
+} from "react-native";
 import Animated, {
-  useSharedValue,
-  useAnimatedStyle,
-  withRepeat,
-  withTiming,
-  withSequence,
   Easing,
   FadeIn,
   FadeOut,
+  useAnimatedStyle,
+  useSharedValue,
+  withRepeat,
+  withSequence,
+  withTiming,
 } from "react-native-reanimated";
+import { SafeAreaView } from "react-native-safe-area-context";
 
-import { Button } from "@/components/ui/button";
-import { Text } from "@/components/ui/text";
-import { Card, CardContent } from "@/components/ui/card";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -40,9 +43,13 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { useSessionStore } from "@/stores/session-store";
-import { useBluetoothService } from "@/services/bluetooth-service";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Text } from "@/components/ui/text";
+import { ENABLE_MOCK_MODE } from "@/config/mock-config";
 import { generateMockHeartRate } from "@/services/api-service";
+import { useBluetoothService } from "@/services/bluetooth-service";
+import { useSessionStore } from "@/stores/session-store";
 
 export default function RunSessionScreen() {
   const [showBackgroundTip, setShowBackgroundTip] = useState(true);
@@ -175,7 +182,11 @@ export default function RunSessionScreen() {
 
   const handleEnd = () => {
     endSession();
-    router.push("/run-summary");
+    // Use replace to avoid re-rendering the current screen during navigation
+    // and a small delay to ensure state updates are processed
+    setTimeout(() => {
+      router.replace("/run-summary");
+    }, 100);
   };
 
   const handleMarkEvent = (type: "symptom" | "episode" | "user-mark") => {
@@ -202,6 +213,23 @@ export default function RunSessionScreen() {
     return (
       <SafeAreaView className="flex-1 bg-background">
         <View className="flex-1 px-6 pt-4">
+          {/* Mock Mode Indicator */}
+          {ENABLE_MOCK_MODE && (
+            <View className="bg-purple-500/20 border border-purple-500/50 rounded-lg p-3 mb-4">
+              <View className="flex-row items-center gap-2">
+                <FlaskConical size={20} className="text-purple-500" />
+                <View className="flex-1">
+                  <Text className="text-purple-500 font-semibold text-sm">
+                    Mock Mode Active
+                  </Text>
+                  <Text className="text-purple-400 text-xs">
+                    Using simulated ECG data for prototyping
+                  </Text>
+                </View>
+              </View>
+            </View>
+          )}
+
           <View className="flex-1 items-center justify-center">
             {/* Device Status */}
             <Card className="w-full mb-8">
@@ -272,6 +300,18 @@ export default function RunSessionScreen() {
   return (
     <SafeAreaView className="flex-1 bg-black">
       <View className="flex-1">
+        {/* Mock Mode Banner */}
+        {ENABLE_MOCK_MODE && (
+          <View className="bg-purple-500/90 px-4 py-2 border-b border-purple-400">
+            <View className="flex-row items-center justify-center gap-2">
+              <FlaskConical size={16} color="white" />
+              <Text className="text-white font-medium text-xs">
+                MOCK MODE - Simulated Data
+              </Text>
+            </View>
+          </View>
+        )}
+
         {/* Background Tip Banner */}
         {showBackgroundTip && sessionStatus === "running" && (
           <Animated.View
@@ -297,155 +337,163 @@ export default function RunSessionScreen() {
           </Animated.View>
         )}
 
-        {/* Main Stats Display */}
-        <View className="flex-1 items-center justify-center px-6">
-          {/* Heart Rate - Main Focus */}
-          <View className="items-center mb-8">
-            <Animated.View style={heartPulseStyle}>
-              <Heart size={48} className="text-red-500 mb-2" fill="#ef4444" />
-            </Animated.View>
-            <Text className="text-white text-8xl font-bold">
-              {currentHeartRate || "--"}
-            </Text>
-            <Text className="text-white/60 text-xl">BPM</Text>
-            <View
-              className={`px-3 py-1 rounded-full mt-2 ${
-                zone.name === "Rest"
-                  ? "bg-gray-500/30"
-                  : zone.name === "Fat Burn"
-                    ? "bg-green-500/30"
-                    : zone.name === "Cardio"
-                      ? "bg-yellow-500/30"
-                      : "bg-red-500/30"
-              }`}
-            >
-              <Text className={`font-medium ${zone.color}`}>
-                {zone.name} Zone
+        <ScrollView
+          className="flex-1"
+          contentContainerClassName="flex-grow justify-between pb-8"
+          showsVerticalScrollIndicator={false}
+        >
+          {/* Main Stats Display */}
+          <View className="items-center justify-start px-6 pt-6">
+            {/* Heart Rate - Main Focus */}
+            <View className="items-center mb-8">
+              <Animated.View style={heartPulseStyle}>
+                <Heart size={48} className="text-red-500 mb-2" fill="#ef4444" />
+              </Animated.View>
+              <Text className="text-white text-8xl font-bold">
+                {currentHeartRate || "--"}
+              </Text>
+              <Text className="text-white/60 text-xl">BPM</Text>
+              <View
+                className={`px-3 py-1 rounded-full mt-2 ${
+                  zone.name === "Rest"
+                    ? "bg-gray-500/30"
+                    : zone.name === "Fat Burn"
+                      ? "bg-green-500/30"
+                      : zone.name === "Cardio"
+                        ? "bg-yellow-500/30"
+                        : "bg-red-500/30"
+                }`}
+              >
+                <Text className={`font-medium ${zone.color}`}>
+                  {zone.name} Zone
+                </Text>
+              </View>
+            </View>
+
+            {/* Timer */}
+            <View className="items-center mb-8">
+              <View className="flex-row items-center gap-2 mb-1">
+                <Clock size={18} color="#9ca3af" />
+                <Text className="text-gray-400 text-sm">Duration</Text>
+              </View>
+              <Text className="text-white text-4xl font-mono font-bold">
+                {formatTime(elapsedTime)}
               </Text>
             </View>
+
+            {/* Stats Grid */}
+            <View className="flex-row w-full gap-4 mb-8">
+              <View className="flex-1 bg-white/10 rounded-xl p-4 items-center">
+                <Text className="text-gray-400 text-xs mb-1">AVG</Text>
+                <Text className="text-white text-2xl font-bold">
+                  {averageHeartRate || "--"}
+                </Text>
+                <Text className="text-gray-400 text-xs">BPM</Text>
+              </View>
+              <View className="flex-1 bg-white/10 rounded-xl p-4 items-center">
+                <Text className="text-gray-400 text-xs mb-1">MAX</Text>
+                <Text className="text-white text-2xl font-bold">
+                  {maxHeartRate || "--"}
+                </Text>
+                <Text className="text-gray-400 text-xs">BPM</Text>
+              </View>
+              <View className="flex-1 bg-white/10 rounded-xl p-4 items-center">
+                <Text className="text-gray-400 text-xs mb-1">MIN</Text>
+                <Text className="text-white text-2xl font-bold">
+                  {minHeartRate === 999 ? "--" : minHeartRate}
+                </Text>
+                <Text className="text-gray-400 text-xs">BPM</Text>
+              </View>
+            </View>
+
+            {/* Connection Status */}
+            {!isConnected && (
+              <View className="flex-row items-center gap-2 bg-yellow-500/20 px-4 py-2 rounded-full">
+                <AlertCircle size={16} color="#f59e0b" />
+                <Text className="text-yellow-500 text-sm">
+                  Device disconnected - buffering data
+                </Text>
+              </View>
+            )}
           </View>
 
-          {/* Timer */}
-          <View className="items-center mb-8">
-            <View className="flex-row items-center gap-2 mb-1">
-              <Clock size={18} color="#9ca3af" />
-              <Text className="text-gray-400 text-sm">Duration</Text>
-            </View>
-            <Text className="text-white text-4xl font-mono font-bold">
-              {formatTime(elapsedTime)}
-            </Text>
-          </View>
-
-          {/* Stats Grid */}
-          <View className="flex-row w-full gap-4 mb-8">
-            <View className="flex-1 bg-white/10 rounded-xl p-4 items-center">
-              <Text className="text-gray-400 text-xs mb-1">AVG</Text>
-              <Text className="text-white text-2xl font-bold">
-                {averageHeartRate || "--"}
-              </Text>
-              <Text className="text-gray-400 text-xs">BPM</Text>
-            </View>
-            <View className="flex-1 bg-white/10 rounded-xl p-4 items-center">
-              <Text className="text-gray-400 text-xs mb-1">MAX</Text>
-              <Text className="text-white text-2xl font-bold">
-                {maxHeartRate || "--"}
-              </Text>
-              <Text className="text-gray-400 text-xs">BPM</Text>
-            </View>
-            <View className="flex-1 bg-white/10 rounded-xl p-4 items-center">
-              <Text className="text-gray-400 text-xs mb-1">MIN</Text>
-              <Text className="text-white text-2xl font-bold">
-                {minHeartRate === 999 ? "--" : minHeartRate}
-              </Text>
-              <Text className="text-gray-400 text-xs">BPM</Text>
-            </View>
-          </View>
-
-          {/* Event Markers Count */}
-          {eventMarkers.length > 0 && (
-            <View className="flex-row items-center gap-2 mb-4">
-              <Flag size={16} color="#f59e0b" />
-              <Text className="text-yellow-500">
-                {eventMarkers.length} event{eventMarkers.length > 1 ? "s" : ""}{" "}
-                marked
-              </Text>
-            </View>
-          )}
-
-          {/* Connection Status */}
-          {!isConnected && (
-            <View className="flex-row items-center gap-2 bg-yellow-500/20 px-4 py-2 rounded-full">
-              <AlertCircle size={16} color="#f59e0b" />
-              <Text className="text-yellow-500 text-sm">
-                Device disconnected - buffering data
-              </Text>
-            </View>
-          )}
-        </View>
-
-        {/* Control Panel */}
-        <View className="px-6 pb-8">
-          {/* Event Marking Button */}
-          <Pressable
-            onPress={() => handleMarkEvent("user-mark")}
-            className="flex-row items-center justify-center gap-2 bg-yellow-500/20 rounded-xl p-4 mb-4 active:bg-yellow-500/30"
-          >
-            <Flag size={20} color="#f59e0b" />
-            <Text className="text-yellow-500 font-medium">
-              Mark Event / Symptom
-            </Text>
-          </Pressable>
-
-          {/* Main Controls */}
-          <View className="flex-row items-center justify-center gap-6">
-            {/* Pause/Resume Button */}
+          {/* Control Panel */}
+          <View className="px-6">
+            {/* Event Marking Button */}
             <Pressable
-              onPress={handlePauseResume}
-              className={`w-20 h-20 rounded-full items-center justify-center ${
-                sessionStatus === "paused" ? "bg-green-500" : "bg-yellow-500"
-              } active:opacity-80`}
+              onPress={() => handleMarkEvent("user-mark")}
+              className="flex-row items-center justify-center gap-2 bg-yellow-500/20 rounded-xl p-4 mb-4 active:bg-yellow-500/30"
             >
-              {sessionStatus === "paused" ? (
-                <Play size={32} color="white" fill="white" />
-              ) : (
-                <Pause size={32} color="white" />
-              )}
+              <Flag size={20} color="#f59e0b" />
+              <Text className="text-yellow-500 font-medium">
+                Mark Event / Symptom
+              </Text>
             </Pressable>
 
-            {/* End Button */}
-            <AlertDialog>
-              <AlertDialogTrigger asChild>
-                <Pressable className="w-20 h-20 rounded-full items-center justify-center bg-red-500 active:opacity-80">
-                  <Square size={32} color="white" fill="white" />
-                </Pressable>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>End Session?</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    Are you sure you want to end this session? Your data will be
-                    saved and synced to the cloud.
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>
-                    <Text>Continue Session</Text>
-                  </AlertDialogCancel>
-                  <AlertDialogAction onPress={handleEnd}>
-                    <Text className="text-destructive-foreground">
-                      End Session
-                    </Text>
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
-          </View>
+            {/* Event Markers Count */}
+            {eventMarkers.length > 0 && (
+              <Animated.View
+                entering={FadeIn}
+                exiting={FadeOut}
+                className="flex-row items-center justify-center gap-2 mb-4"
+              >
+                <Flag size={16} color="#f59e0b" />
+                <Text className="text-yellow-500">
+                  {eventMarkers.length} event
+                  {eventMarkers.length > 1 ? "s" : ""} marked
+                </Text>
+              </Animated.View>
+            )}
 
-          {/* Status Text */}
-          <Text className="text-gray-400 text-center mt-4">
-            {sessionStatus === "paused" ? "Session Paused" : "Recording..."}
-          </Text>
-        </View>
+            {/* Main Controls */}
+            <View className="flex-row items-center justify-center gap-6">
+              {/* Pause/Resume Button */}
+              <Pressable
+                onPress={handlePauseResume}
+                className={`w-20 h-20 rounded-full items-center justify-center ${
+                  sessionStatus === "paused" ? "bg-green-500" : "bg-yellow-500"
+                } active:opacity-80`}
+              >
+                {sessionStatus === "paused" ? (
+                  <Play size={32} color="white" fill="white" />
+                ) : (
+                  <Pause size={32} color="white" />
+                )}
+              </Pressable>
+
+              {/* End Button */}
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <Pressable className="w-20 h-20 rounded-full items-center justify-center bg-red-500 active:opacity-80">
+                    <Square size={32} color="white" fill="white" />
+                  </Pressable>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>End Session?</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      Are you sure you want to end this session? Your data will
+                      be saved and synced to the cloud.
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>
+                      <Text>Continue Session</Text>
+                    </AlertDialogCancel>
+                    <AlertDialogAction onPress={handleEnd}>
+                      <Text className="text-black">End Session</Text>
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            </View>
+
+            {/* Status Text */}
+            <Text className="text-gray-400 text-center mt-4">
+              {sessionStatus === "paused" ? "Session Paused" : "Recording..."}
+            </Text>
+          </View>
+        </ScrollView>
       </View>
     </SafeAreaView>
   );

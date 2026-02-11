@@ -1,18 +1,18 @@
-import { useEffect, useState } from "react";
 import {
   DarkTheme,
   DefaultTheme,
   ThemeProvider,
 } from "@react-navigation/native";
 import { Stack, router } from "expo-router";
-import { StatusBar } from "expo-status-bar";
 import * as SplashScreen from "expo-splash-screen";
+import { StatusBar } from "expo-status-bar";
+import { useEffect, useState } from "react";
 import "react-native-reanimated";
 import "../global.css";
 
 import { useColorScheme } from "@/hooks/use-color-scheme";
-import { PortalHost } from "@rn-primitives/portal";
 import { useAppStore } from "@/stores/app-store";
+import { PortalHost } from "@rn-primitives/portal";
 
 // Prevent the splash screen from auto-hiding
 SplashScreen.preventAutoHideAsync();
@@ -85,6 +85,13 @@ export default function RootLayout() {
             title: "Session Summary",
             headerShown: false,
             gestureEnabled: false, // Keep user on summary until they tap Done
+          }}
+        />
+        <Stack.Screen
+          name="activity-calendar"
+          options={{
+            title: "Activity Calendar",
+            headerShown: false,
           }}
         />
         <Stack.Screen

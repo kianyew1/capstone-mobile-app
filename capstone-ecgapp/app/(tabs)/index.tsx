@@ -1,17 +1,18 @@
 import { Card, CardContent, Progress, Text } from "@/components/ui";
-import { Ionicons } from "@expo/vector-icons";
-import {
-  Pressable,
-  ScrollView,
-  View,
-  ActivityIndicator,
-  Alert,
-} from "react-native";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { router } from "expo-router";
 import { useBluetoothService } from "@/services/bluetooth-service";
 import { useAppStore } from "@/stores/app-store";
 import { useSessionHistoryStore } from "@/stores/session-store";
+import { Ionicons } from "@expo/vector-icons";
+import { router } from "expo-router";
+import { useMemo } from "react";
+import {
+  ActivityIndicator,
+  Alert,
+  Pressable,
+  ScrollView,
+  View,
+} from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 // Mock data for the health metrics
 const heartRateData = {
@@ -27,15 +28,7 @@ const ecgStatus = {
   nextRecommended: "Tomorrow",
 };
 
-const weeklyActivity = [
-  { day: "M", value: 65 },
-  { day: "T", value: 80 },
-  { day: "W", value: 45 },
-  { day: "T", value: 90 },
-  { day: "F", value: 70 },
-  { day: "S", value: 55 },
-  { day: "S", value: 30 },
-];
+const dayLabels = ["S", "M", "T", "W", "T", "F", "S"];
 
 function MetricCard({
   title,
@@ -201,6 +194,53 @@ export default function HomeScreen() {
   const handleViewHistory = () => {
     router.push("/(tabs)/explore");
   };
+
+  const handleSeeAllActivity = () => {
+    router.push("/activity-calendar");
+  };
+
+  const sessionDayCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+
+    sessions.forEach((session) => {
+      const date = new Date(session.startTime);
+      if (Number.isNaN(date.getTime())) return;
+
+      const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(
+        2,
+        "0",
+      )}-${String(date.getDate()).padStart(2, "0")}`;
+
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    });
+
+    return counts;
+  }, [sessions]);
+
+  const weeklyActivityData = useMemo(() => {
+    const today = new Date();
+    const data = [] as { day: string; value: number; count: number }[];
+    let maxCount = 0;
+
+    for (let offset = 6; offset >= 0; offset -= 1) {
+      const date = new Date(today);
+      date.setDate(today.getDate() - offset);
+
+      const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(
+        2,
+        "0",
+      )}-${String(date.getDate()).padStart(2, "0")}`;
+      const count = sessionDayCounts.get(key) ?? 0;
+
+      maxCount = Math.max(maxCount, count);
+      data.push({ day: dayLabels[date.getDay()], value: 0, count });
+    }
+
+    return data.map((item) => ({
+      ...item,
+      value: maxCount === 0 ? 0 : Math.round((item.count / maxCount) * 100),
+    }));
+  }, [sessionDayCounts]);
 
   const getGreeting = () => {
     const hour = new Date().getHours();
@@ -384,17 +424,22 @@ export default function HomeScreen() {
       <View className="px-5 py-3">
         <View className="flex-row justify-between items-center mb-3">
           <Text className="text-lg font-semibold">Weekly Activity</Text>
-          <Pressable>
+          <Pressable onPress={handleSeeAllActivity}>
             <Text className="text-primary text-sm">See All</Text>
           </Pressable>
         </View>
         <Card>
           <CardContent className="p-4">
             <View className="flex-row gap-2">
-              {weeklyActivity.map((item, index) => (
+              {weeklyActivityData.map((item, index) => (
                 <ActivityBar key={index} value={item.value} day={item.day} />
               ))}
             </View>
+            {weeklyActivityData.every((item) => item.count === 0) && (
+              <Text className="text-muted-foreground text-xs mt-3 text-center">
+                No activity recorded this week
+              </Text>
+            )}
           </CardContent>
         </Card>
       </View>
@@ -443,18 +488,18 @@ export default function HomeScreen() {
         <Text className="text-lg font-semibold mb-3">Quick Actions</Text>
         <View className="flex-row gap-3 mb-3">
           <Pressable
-            className="flex-1 bg-green-500 rounded-xl p-4 items-center active:opacity-80"
+            className="flex-1 bg-secondary rounded-xl p-4 items-center active:opacity-80"
             onPress={handleStartRun}
           >
-            <Ionicons name="play" size={28} color="white" />
-            <Text className="text-white font-medium mt-2">Start Run</Text>
+            <Ionicons name="play" size={28} color="#dcfce7" />
+            <Text className="text-green-100 font-medium mt-2">Start Run</Text>
           </Pressable>
           <Pressable
-            className="flex-1 bg-primary rounded-xl p-4 items-center active:opacity-80"
+            className="flex-1 bg-secondary rounded-xl p-4 items-center active:opacity-80"
             onPress={handleCalibrate}
           >
-            <Ionicons name="pulse" size={28} color="white" />
-            <Text className="text-primary-foreground font-medium mt-2">
+            <Ionicons name="pulse" size={28} color="#fecaca" />
+            <Text className="text-red-200 font-medium mt-2">
               {isCalibrated ? "Re-calibrate" : "Calibrate"}
             </Text>
           </Pressable>
@@ -464,25 +509,17 @@ export default function HomeScreen() {
             className="flex-1 bg-secondary rounded-xl p-4 items-center active:opacity-80"
             onPress={handleViewHistory}
           >
-            <Ionicons
-              name="stats-chart"
-              size={28}
-              className="text-foreground"
-            />
-            <Text className="font-medium mt-2">History</Text>
+            <Ionicons name="stats-chart" size={28} color="#bfdbfe" />
+            <Text className="text-blue-200 font-medium mt-2">History</Text>
             {sessions.length > 0 && (
-              <Text className="text-muted-foreground text-xs">
+              <Text className="text-blue-200/70 text-xs">
                 {sessions.length} sessions
               </Text>
             )}
           </Pressable>
           <Pressable className="flex-1 bg-secondary rounded-xl p-4 items-center active:opacity-80">
-            <Ionicons
-              name="share-outline"
-              size={28}
-              className="text-foreground"
-            />
-            <Text className="font-medium mt-2">Share</Text>
+            <Ionicons name="share-outline" size={28} color="#ffffff" />
+            <Text className="text-white font-medium mt-2">Share</Text>
           </Pressable>
         </View>
       </View>
