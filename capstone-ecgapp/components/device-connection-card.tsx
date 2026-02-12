@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { View, ActivityIndicator } from "react-native";
+import { router } from "expo-router";
 import {
   Bluetooth,
   Check,
@@ -41,7 +42,6 @@ export function DeviceConnectionCard() {
     pairedDevice,
     isScanning,
     error,
-    startScan,
     reconnectToPairedDevice,
     unpairDevice,
   } = useBluetoothService();
@@ -144,7 +144,7 @@ export function DeviceConnectionCard() {
             <Button
               variant="default"
               className="flex-1"
-              onPress={startScan}
+              onPress={() => router.push("/(onboarding)/bluetooth")}
               disabled={isScanning || bluetoothStatus !== "poweredOn"}
             >
               <Bluetooth size={16} className="text-primary-foreground mr-2" />

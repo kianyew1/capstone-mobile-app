@@ -23,8 +23,8 @@ import {
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
-import { Label } from "@/components/ui/label";
 import { DeviceConnectionCard } from "@/components/device-connection-card";
+import { DeveloperToolsCard } from "@/components/developer-tools-card";
 import { useAppStore } from "@/stores/app-store";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 
@@ -77,7 +77,7 @@ function SettingsItem({
 }
 
 export default function SettingsScreen() {
-  const { user, resetOnboarding, pairedDevice } = useAppStore();
+  const { user, resetOnboarding } = useAppStore();
   const colorScheme = useColorScheme();
 
   const handleLogout = () => {
@@ -243,6 +243,8 @@ export default function SettingsScreen() {
             </CardContent>
           </Card>
         </View>
+
+        <DeveloperToolsCard />
 
         {/* App Version */}
         <View className="items-center py-6">

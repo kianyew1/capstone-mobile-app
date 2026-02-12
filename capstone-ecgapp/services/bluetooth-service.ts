@@ -1,27 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Platform, PermissionsAndroid } from "react-native";
-import {
-  BleManager,
-  Device,
-  State,
-  type Subscription,
-} from "react-native-ble-plx";
+import type { BleManager } from "react-native-ble-plx";
+import { Device, State, type Subscription } from "react-native-ble-plx";
 import type { BluetoothStatus, ConnectionStatus, ECGDevice } from "@/types";
 import { useAppStore } from "@/stores/app-store";
+import {
+  getBleManager as getSharedBleManager,
+  resetBleManager as resetSharedBleManager,
+  requestBlePermissions,
+  scanDevices,
+} from "@/features-from-other-repo/ble-stream/bleService";
 
 // Service UUID for ECG device - replace with your actual device's service UUID
 const ECG_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"; // Heart Rate Service UUID
 const ECG_CHARACTERISTIC_UUID = "00002a37-0000-1000-8000-00805f9b34fb"; // Heart Rate Measurement
 
-// Create a singleton BleManager instance
-let bleManagerInstance: BleManager | null = null;
+export const getBleManager = (): BleManager => getSharedBleManager();
 
-const getBleManager = (): BleManager => {
-  if (!bleManagerInstance) {
-    bleManagerInstance = new BleManager();
-  }
-  return bleManagerInstance;
-};
+export const resetBleManager = (): BleManager => resetSharedBleManager();
 
 export function useBluetoothService() {
   const [bluetoothStatus, setBluetoothStatus] =
@@ -38,6 +34,7 @@ export function useBluetoothService() {
   const bleManager = useRef(getBleManager()).current;
   const scanSubscription = useRef<Subscription | null>(null);
   const stateSubscription = useRef<Subscription | null>(null);
+  const stopScanRef = useRef<null | (() => void)>(null);
 
   // Monitor Bluetooth state
   useEffect(() => {
@@ -64,12 +61,8 @@ export function useBluetoothService() {
     };
   }, [bleManager]);
 
-  // Auto-reconnect to paired device
-  useEffect(() => {
-    if (pairedDevice && bluetoothStatus === "poweredOn" && !connectedDevice) {
-      reconnectToPairedDevice();
-    }
-  }, [pairedDevice, bluetoothStatus]);
+  // Auto-reconnect to paired device is intentionally disabled to avoid
+  // conflicts with developer BLE flows.
 
   const mapBleState = (state: State): BluetoothStatus => {
     switch (state) {
@@ -132,7 +125,7 @@ export function useBluetoothService() {
     setError(null);
     setDiscoveredDevices([]);
 
-    const hasPermissions = await requestPermissions();
+    const hasPermissions = await requestBlePermissions();
     if (!hasPermissions) {
       setError("Bluetooth permissions not granted");
       return;
@@ -147,48 +140,32 @@ export function useBluetoothService() {
     setConnectionStatus("scanning");
 
     try {
-      bleManager.startDeviceScan(
-        null, // Scan for all devices, filter by name/service below
-        { allowDuplicates: false },
-        (scanError, device) => {
-          if (scanError) {
-            console.error("Scan error:", scanError);
-            setError(scanError.message);
-            setIsScanning(false);
-            setConnectionStatus("disconnected");
-            return;
-          }
-
-          if (device && device.name) {
-            // Filter for ECG devices - adjust the filter based on your device name
-            const isECGDevice =
-              device.name.toLowerCase().includes("ecg") ||
-              device.name.toLowerCase().includes("heart") ||
-              device.name.toLowerCase().includes("cardio");
-
-            // For development, show all devices with names
-            setDiscoveredDevices((prev) => {
-              const exists = prev.some((d) => d.id === device.id);
-              if (exists) return prev;
-
-              const newDevice: ECGDevice = {
-                id: device.id,
-                name: device.name || "Unknown Device",
-                rssi: device.rssi || -100,
-                isConnected: false,
-                isPaired: false,
-              };
-
-              return [...prev, newDevice];
-            });
-          }
+      if (stopScanRef.current) stopScanRef.current();
+      stopScanRef.current = scanDevices({
+        serviceUUIDs: null,
+        includeUnnamed: true,
+        onDevice: (device) => {
+          setDiscoveredDevices((prev) => {
+            const exists = prev.some((d) => d.id === device.id);
+            if (exists) return prev;
+            const newDevice: ECGDevice = {
+              id: device.id,
+              name: device.name ?? "Unnamed Device",
+              rssi: device.rssi ?? -100,
+              isConnected: false,
+              isPaired: false,
+            };
+            return [...prev, newDevice];
+          });
         },
-      );
-
-      // Stop scanning after 15 seconds
-      setTimeout(() => {
-        stopScan();
-      }, 15000);
+        onError: (err) => {
+          console.error("Scan error:", err);
+          setError(err.message);
+          setIsScanning(false);
+          setConnectionStatus("disconnected");
+        },
+        timeoutMs: 15000,
+      });
     } catch (err) {
       console.error("Failed to start scan:", err);
       setError("Failed to start scanning");
@@ -198,7 +175,10 @@ export function useBluetoothService() {
   }, [isScanning, bluetoothStatus, bleManager]);
 
   const stopScan = useCallback(() => {
-    bleManager.stopDeviceScan();
+    if (stopScanRef.current) {
+      stopScanRef.current();
+      stopScanRef.current = null;
+    }
     setIsScanning(false);
     if (connectionStatus === "scanning") {
       setConnectionStatus("disconnected");
@@ -264,14 +244,19 @@ export function useBluetoothService() {
   const disconnectDevice = useCallback(async (): Promise<void> => {
     try {
       if (connectedDevice) {
-        await connectedDevice.cancelConnection();
+        const isConnected = await bleManager.isDeviceConnected(
+          connectedDevice.id,
+        );
+        if (isConnected) {
+          await connectedDevice.cancelConnection();
+        }
       }
       setConnectedDevice(null);
       setConnectionStatus("disconnected");
     } catch (err) {
       console.error("Disconnect error:", err);
     }
-  }, [connectedDevice]);
+  }, [connectedDevice, bleManager]);
 
   const reconnectToPairedDevice = useCallback(async (): Promise<boolean> => {
     if (!pairedDevice) return false;

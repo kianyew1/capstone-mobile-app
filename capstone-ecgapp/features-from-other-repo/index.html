@@ -1,0 +1,659 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Capstone ECG System Docs</title>
+    <style>
+      :root {
+        --bg: #f6f5f2;
+        --ink: #1d1d1b;
+        --muted: #5a5a55;
+        --panel: #ffffff;
+        --accent: #0f5f6b;
+        --accent-2: #d26a00;
+        --code-bg: #111111;
+        --code-ink: #f2f2f2;
+        --border: #e2e0da;
+        --shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Georgia", "Times New Roman", serif;
+        color: var(--ink);
+        background: linear-gradient(180deg, #f8f6f0 0%, #f0ede6 100%);
+      }
+
+      header {
+        padding: 28px 32px 12px 32px;
+        border-bottom: 1px solid var(--border);
+        background: #faf9f6;
+      }
+
+      header h1 {
+        margin: 0 0 6px 0;
+        font-size: 28px;
+      }
+
+      header p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 280px 1fr;
+        gap: 24px;
+        padding: 24px 32px 40px 32px;
+      }
+
+      nav {
+        position: sticky;
+        top: 16px;
+        align-self: start;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 16px;
+        box-shadow: var(--shadow);
+      }
+
+      nav h2 {
+        margin: 0 0 10px 0;
+        font-size: 16px;
+        color: var(--accent);
+        letter-spacing: 0.2px;
+      }
+
+      nav ul {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+      }
+
+      nav li {
+        margin: 8px 0;
+      }
+
+      nav a {
+        color: var(--ink);
+        text-decoration: none;
+        font-size: 14px;
+      }
+
+      nav a:hover {
+        color: var(--accent-2);
+      }
+
+      main {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 24px 28px 32px 28px;
+        box-shadow: var(--shadow);
+      }
+
+      section {
+        padding: 8px 0 24px 0;
+        border-bottom: 1px solid var(--border);
+      }
+
+      section:last-of-type {
+        border-bottom: none;
+      }
+
+      h2 {
+        margin: 18px 0 10px 0;
+        font-size: 22px;
+      }
+
+      h3 {
+        margin: 16px 0 8px 0;
+        font-size: 18px;
+        color: var(--accent);
+      }
+
+      h4 {
+        margin: 14px 0 6px 0;
+        font-size: 15px;
+      }
+
+      ul {
+        margin: 8px 0 12px 18px;
+      }
+
+      li {
+        margin: 6px 0;
+      }
+
+      code {
+        color: #0b4f6c;
+        font-family: "Fira Code", "JetBrains Mono", "Consolas", "Menlo", monospace;
+        font-size: 0.95em;
+      }
+
+      pre {
+        background: var(--code-bg);
+        color: var(--code-ink);
+        padding: 14px;
+        border-radius: 10px;
+        overflow: auto;
+        font-size: 13px;
+        line-height: 1.4;
+        font-family: "Fira Code", "JetBrains Mono", "Consolas", "Menlo", monospace;
+        tab-size: 2;
+      }
+
+      .tag {
+        display: inline-block;
+        font-size: 12px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #e8f1f2;
+        color: var(--accent);
+        margin-right: 6px;
+      }
+
+      @media (max-width: 920px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+        nav {
+          position: static;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Capstone ECG System Documentation</h1>
+      <p>Single-page index with architecture, data model, API, mobile, BLE, analysis, testing, and dev environment.</p>
+    </header>
+    <div class="layout">
+      <nav>
+        <h2>Contents</h2>
+        <ul>
+          <li><a href="#overview">Overview</a></li>
+          <li><a href="#architecture">Architecture</a></li>
+          <li><a href="#data-model">Data Model</a></li>
+          <li><a href="#api">Backend API</a></li>
+          <li><a href="#mobile">Mobile App</a></li>
+          <li><a href="#bluetooth">Bluetooth</a></li>
+          <li><a href="#analysis">Signal Processing</a></li>
+          <li><a href="#testing">Testing</a></li>
+          <li><a href="#dev-env">Dev Environment</a></li>
+        </ul>
+      </nav>
+      <main>
+        <section id="overview">
+          <h2>Capstone ECG System</h2>
+          <p>
+            End-to-end plan and implementation notes for a capstone system:
+            React Native mobile app, Bluetooth ECG wearable, FastAPI backend, and Supabase
+            with a signal-processing pipeline that compares baseline vs under-load ECG.
+          </p>
+          <h3>Demo Flow (Target)</h3>
+          <ol>
+            <li>Onboard user and pair ECG device.</li>
+            <li>Capture calibration baseline with quality checks.</li>
+            <li>Capture run with live stats and event markers.</li>
+            <li>Upload in chunks, run analysis, and render results.</li>
+          </ol>
+        </section>
+
+        <section id="architecture">
+          <h2>Architecture</h2>
+          <h3>Textual Diagram</h3>
+          <ul>
+            <li>Wearable ECG device (BLE peripheral) streams ECG packets with device timestamp and sequence numbers.</li>
+            <li>React Native app (BLE central) decodes packets, buffers locally, manages session lifecycle.</li>
+            <li>FastAPI backend validates Supabase JWT, ingests chunks, orchestrates analysis jobs.</li>
+            <li>Supabase Postgres stores metadata, features, insights, and job state.</li>
+            <li>Supabase Storage stores raw chunks, processed signals, and plots.</li>
+            <li>Analysis workers fetch data, run signal processing, and write outputs.</li>
+          </ul>
+          <h3>Component Responsibilities</h3>
+          <ul>
+            <li><span class="tag">Wearable</span>Generate ECG, timestamp, packetize, expose BLE service.</li>
+            <li><span class="tag">Mobile</span>Capture, preview quality, buffer offline, upload, display results.</li>
+            <li><span class="tag">Backend</span>Auth, ingestion, idempotency, analysis orchestration, results API.</li>
+            <li><span class="tag">Database</span>Session metadata, feature tables, insights JSON.</li>
+            <li><span class="tag">Storage</span>Raw signals and processed artifacts.</li>
+          </ul>
+          <h3>Data Lifecycle</h3>
+          <ol>
+            <li>Device streams ECG packets over BLE.</li>
+            <li>App decodes packets and writes samples into local SQLite by session and chunk.</li>
+            <li>App uploads chunks with idempotency keys and session metadata.</li>
+            <li>Backend persists chunks to storage, updates session status to uploaded.</li>
+            <li>Analysis job runs on baseline and run sessions and generates plots and insights.</li>
+            <li>App polls job status and fetches insights and plots for display.</li>
+          </ol>
+        </section>
+
+        <section id="data-model">
+          <h2>Data Model and Storage</h2>
+          <h3>Tables (SQL-like)</h3>
+          <pre><code>create table profiles (
+  user_id uuid primary key references auth.users(id),
+  display_name text,
+  created_at timestamptz default now()
+);
+
+create table devices (
+  id uuid primary key,
+  user_id uuid references auth.users(id),
+  device_name text,
+  device_model text,
+  firmware_version text,
+  lead_count int,
+  created_at timestamptz default now()
+);
+
+create table sessions (
+  id uuid primary key,
+  user_id uuid references auth.users(id),
+  device_id uuid references devices(id),
+  session_type text check (session_type in ('calibration','run')),
+  started_at timestamptz,
+  ended_at timestamptz,
+  sampling_rate_hz int,
+  status text check (status in ('created','recording','uploaded','analyzing','complete','failed')),
+  notes text
+);
+
+create table session_chunks (
+  id uuid primary key,
+  session_id uuid references sessions(id),
+  chunk_index int,
+  start_device_ts_ms bigint,
+  end_device_ts_ms bigint,
+  sample_count int,
+  storage_path text,
+  checksum text,
+  created_at timestamptz default now(),
+  unique(session_id, chunk_index)
+);
+
+create table analysis_jobs (
+  id uuid primary key,
+  session_id uuid references sessions(id),
+  baseline_session_id uuid references sessions(id),
+  status text check (status in ('queued','running','succeeded','failed')),
+  started_at timestamptz,
+  ended_at timestamptz,
+  error_message text,
+  trace_id text
+);
+
+create table features (
+  id uuid primary key,
+  session_id uuid references sessions(id),
+  window_index int,
+  window_start_ts_ms bigint,
+  hr_bpm real,
+  rmssd_ms real,
+  sdnn_ms real,
+  pnn50 real,
+  lf_hf real,
+  qrs_ms real,
+  pr_ms real,
+  qtc_ms real,
+  sqi real,
+  missingness real
+);
+
+create table insights (
+  id uuid primary key,
+  session_id uuid references sessions(id),
+  baseline_session_id uuid references sessions(id),
+  insights_json jsonb,
+  summary_text text,
+  plot_paths jsonb,
+  created_at timestamptz default now()
+);</code></pre>
+          <h3>RLS Policies (High-Level)</h3>
+          <ul>
+            <li>Profiles/devices/sessions/session_chunks/features/insights: users can read/write only their rows.</li>
+            <li>Analysis jobs: user can read only their jobs; writes require service role.</li>
+            <li>Storage: buckets are private; signed URLs for access.</li>
+          </ul>
+          <h3>Storage Buckets</h3>
+          <ul>
+            <li><code>raw-ecg/{user_id}/{session_id}/chunk_{index}.bin</code></li>
+            <li><code>processed-ecg/{user_id}/{session_id}/filtered.npy</code></li>
+            <li><code>plots/{user_id}/{session_id}/baseline_run_overlay.png</code></li>
+            <li><code>insights/{user_id}/{session_id}/insights.json</code></li>
+          </ul>
+          <h3>Indexing and Performance</h3>
+          <ul>
+            <li><code>sessions(user_id, status, started_at)</code></li>
+            <li><code>session_chunks(session_id, chunk_index)</code></li>
+            <li><code>features(session_id, window_index)</code></li>
+            <li>Optional GIN on <code>insights(insights_json)</code> for querying flags.</li>
+          </ul>
+        </section>
+
+        <section id="api">
+          <h2>Backend API</h2>
+          <h3>Auth Strategy</h3>
+          <ul>
+            <li>Supabase JWT in <code>Authorization: Bearer &lt;token&gt;</code>.</li>
+            <li>FastAPI validates JWT via Supabase JWKS and maps <code>sub</code> to <code>user_id</code>.</li>
+          </ul>
+          <h3>Endpoints</h3>
+          <h4>Create Session</h4>
+          <pre><code>POST /v1/sessions
+Body:
+{
+  "session_type": "calibration",
+  "device_id": "uuid",
+  "sampling_rate_hz": 250
+}
+Response:
+{
+  "session_id": "uuid",
+  "status": "created"
+}</code></pre>
+          <h4>Upload Chunk</h4>
+          <pre><code>POST /v1/sessions/{session_id}/chunks
+Headers: Idempotency-Key: "uuid"
+Body:
+{
+  "chunk_index": 0,
+  "start_device_ts_ms": 1000,
+  "end_device_ts_ms": 11000,
+  "sample_count": 2500,
+  "checksum": "sha256:...",
+  "data_b64": "..."
+}
+Response:
+{
+  "stored": true
+}</code></pre>
+          <h4>Complete Session</h4>
+          <pre><code>POST /v1/sessions/{session_id}/complete
+Body:
+{
+  "ended_at": "2026-01-28T12:00:00Z",
+  "notes": "Felt normal"
+}
+Response:
+{
+  "status": "uploaded"
+}</code></pre>
+          <h4>Start Analysis</h4>
+          <pre><code>POST /v1/analysis
+Body:
+{
+  "session_id": "run_uuid",
+  "baseline_session_id": "calibration_uuid"
+}
+Response:
+{
+  "job_id": "uuid",
+  "status": "queued"
+}</code></pre>
+          <h4>Job Status</h4>
+          <pre><code>GET /v1/analysis/{job_id}
+Response:
+{
+  "status": "running",
+  "progress": 0.6,
+  "trace_id": "..."
+}</code></pre>
+          <h4>Insights</h4>
+          <pre><code>GET /v1/insights/{session_id}
+Response:
+{
+  "insights": { "...": "..." },
+  "plots": {
+    "overlay": "signed_url",
+    "delta": "signed_url",
+    "features": "signed_url"
+  }
+}</code></pre>
+          <h3>Async Job Strategy</h3>
+          <ul>
+            <li>Queue analysis jobs with Celery/RQ/Arq.</li>
+            <li>Store job status in <code>analysis_jobs</code>.</li>
+            <li>Workers fetch raw chunks, run analysis, and persist outputs.</li>
+          </ul>
+          <h3>Error Handling and Idempotency</h3>
+          <ul>
+            <li>Chunk uploads are idempotent via <code>Idempotency-Key</code>.</li>
+            <li>Invalid payloads return 4xx with explicit error details.</li>
+            <li>Transient failures retry with exponential backoff.</li>
+          </ul>
+        </section>
+
+        <section id="mobile">
+          <h2>Mobile App (React Native)</h2>
+          <h3>Screens and Flow</h3>
+          <ul>
+            <li>Onboarding</li>
+            <li>Permissions (Bluetooth, background, storage)</li>
+            <li>Pairing</li>
+            <li>Calibration</li>
+            <li>Run (live stats + event marker)</li>
+            <li>Stop/Review</li>
+            <li>Upload Progress</li>
+            <li>Results</li>
+            <li>History</li>
+          </ul>
+          <h3>State Machine</h3>
+          <pre><code>idle -&gt; pairing -&gt; calibrated -&gt; running -&gt; stopped -&gt; uploading -&gt; analyzed -&gt; complete
+           |             |            |             |
+         error         error        error         error</code></pre>
+          <h3>Offline Buffering and Retry</h3>
+          <ul>
+            <li>Store chunks in local SQLite by <code>session_id</code> and <code>chunk_index</code>.</li>
+            <li>Upload in background with retries and exponential backoff.</li>
+            <li>Resume uploads by querying missing <code>chunk_index</code> from backend.</li>
+          </ul>
+          <h3>Calibration UX</h3>
+          <ul>
+            <li>Show live signal preview and SQI indicator.</li>
+            <li>Require minimum duration and SQI threshold before success.</li>
+            <li>Provide clear retry guidance if signal is poor.</li>
+          </ul>
+          <h3>Run UX</h3>
+          <ul>
+            <li>Live HR estimate and signal quality badge.</li>
+            <li>Event marker button to tag symptoms or events.</li>
+            <li>Stop action confirms and transitions to upload screen.</li>
+          </ul>
+          <h3>Results UX</h3>
+          <ul>
+            <li>Overlay plot: baseline vs run segment.</li>
+            <li>Delta plot: difference over time.</li>
+            <li>Feature summaries and confidence score.</li>
+            <li>Prominent "Not medical advice" disclaimer.</li>
+          </ul>
+        </section>
+
+        <section id="bluetooth">
+          <h2>Bluetooth ECG Plan</h2>
+          <h3>BLE Services</h3>
+          <ul>
+            <li>ECG data service UUID and characteristic UUIDs (notify).</li>
+            <li>Optional control characteristic for start/stop and device status.</li>
+          </ul>
+          <h3>Packet Format</h3>
+          <ul>
+            <li><code>seq:uint32</code></li>
+            <li><code>device_ts_ms:uint64</code></li>
+            <li><code>fs:uint16</code></li>
+            <li><code>lead_count:uint8</code></li>
+            <li><code>samples:int16[]</code> (N samples per packet)</li>
+            <li><code>device_id:string</code> (sent on connect or metadata characteristic)</li>
+          </ul>
+          <h3>Pairing and Permissions</h3>
+          <ul>
+            <li>iOS: Bluetooth + Background Modes (Audio/BLE if needed).</li>
+            <li>Android: Bluetooth + Location (legacy) or Bluetooth Scan/Connect (API 31+).</li>
+          </ul>
+          <h3>Reconnect Logic</h3>
+          <ul>
+            <li>Auto-reconnect with backoff.</li>
+            <li>Fallback to manual retry after N failures.</li>
+            <li>Resume from last <code>seq</code> to detect missing packets.</li>
+          </ul>
+          <h3>Disconnections and Resync</h3>
+          <ul>
+            <li>Mark missing sequences as gaps.</li>
+            <li>Estimate clock drift between device timestamp and phone clock.</li>
+            <li>Provide SQI penalties for high missingness windows.</li>
+          </ul>
+        </section>
+
+        <section id="analysis">
+          <h2>Signal Processing and Analysis</h2>
+          <h3>Baseline Calibration Protocol</h3>
+          <ul>
+            <li>Duration: 2-3 minutes, seated and still.</li>
+            <li>Acceptance: SQI &gt;= 0.8 for at least 90 seconds, missingness &lt; 2%.</li>
+            <li>Quality checks: baseline wander, powerline noise, peak detectability.</li>
+          </ul>
+          <h3>Under-Load Cleaning</h3>
+          <ul>
+            <li>Bandpass 0.5-40 Hz, notch 50/60 Hz.</li>
+            <li>Motion artifact detection via signal variance and SQI.</li>
+            <li>Segment selection: prioritize clean windows for morphology metrics.</li>
+          </ul>
+          <h3>Beat Detection</h3>
+          <ul>
+            <li>Pan-Tompkins variant or NeuroKit2 pipeline.</li>
+            <li>Refractory period checks and local maxima refinement.</li>
+          </ul>
+          <h3>Feature Extraction (Baseline and Run)</h3>
+          <ul>
+            <li>HR and HRV: HR, RMSSD, SDNN, pNN50, LF/HF (if sufficient clean data).</li>
+            <li>Morphology: QRS width, PR, QT/QTc (when wave detection reliable).</li>
+            <li>Quality: SQI, missingness, noise scores.</li>
+            <li>Event markers: align with user taps for context.</li>
+          </ul>
+          <h3>Comparison Strategy</h3>
+          <ul>
+            <li>Normalize amplitude and align by R-peaks.</li>
+            <li>Compute deltas: HR increase, HRV decrease, morphology shifts.</li>
+            <li>Segment-level comparison: pick top clean windows and flag low-confidence areas.</li>
+            <li>Confidence score: weighted by SQI, missingness, and alignment quality.</li>
+          </ul>
+          <h3>Graphing Requirements</h3>
+          <ul>
+            <li>Overlay plot: baseline vs run aligned window.</li>
+            <li>Feature trend plot: HR, HRV, SQI across run.</li>
+            <li>Delta plot: differences over time.</li>
+            <li>Annotate event markers and low-quality segments.</li>
+          </ul>
+          <h3>Insights JSON Contract</h3>
+          <pre><code>{
+  "session_id":"run_uuid",
+  "baseline_session_id":"calibration_uuid",
+  "confidence":0.82,
+  "summary":"HR increased and HRV decreased during load; morphology stable.",
+  "metrics":{
+    "baseline":{"hr_mean":65,"rmssd":45,"sdnn":60,"qrs_ms":90,"qtc_ms":410,"sqi":0.9},
+    "run":{"hr_mean":145,"rmssd":18,"sdnn":25,"qrs_ms":92,"qtc_ms":420,"sqi":0.7}
+  },
+  "deltas":{"hr_mean":80,"rmssd":-27,"sdnn":-35,"qtc_ms":10},
+  "flags":["low_quality_segments","motion_artifacts"],
+  "plots":{"overlay":"path","delta":"path","features":"path"}
+}</code></pre>
+          <h3>Limitations and Disclaimers</h3>
+          <ul>
+            <li>Not medical advice; educational/demonstration use only.</li>
+            <li>Consumer-grade signals are susceptible to motion artifacts.</li>
+          </ul>
+        </section>
+
+        <section id="testing">
+          <h2>Testing and Validation</h2>
+          <h3>Unit Tests</h3>
+          <ul>
+            <li>Filters: bandpass, notch, smoothing.</li>
+            <li>R-peak detection on synthetic ECG.</li>
+            <li>HRV metrics (RMSSD, SDNN, pNN50) with known inputs.</li>
+          </ul>
+          <h3>Integration Tests</h3>
+          <ul>
+            <li>Chunk upload idempotency and retries.</li>
+            <li>Analysis job flow from upload to insights creation.</li>
+            <li>Supabase RLS policy checks.</li>
+          </ul>
+          <h3>End-to-End Scenarios</h3>
+          <ul>
+            <li>Pair device -&gt; calibrate -&gt; run -&gt; upload -&gt; analysis -&gt; results.</li>
+            <li>Offline capture -&gt; reconnection -&gt; upload resume.</li>
+          </ul>
+          <h3>Performance Tests</h3>
+          <ul>
+            <li>Upload throughput for typical session sizes.</li>
+            <li>Analysis runtime &lt; 25 minutes for typical run.</li>
+            <li>Memory bounds on worker during filtering and plotting.</li>
+          </ul>
+          <h3>Demo Acceptance Criteria</h3>
+          <ul>
+            <li>Baseline captured with SQI gate.</li>
+            <li>Run captured and uploaded.</li>
+            <li>Plots rendered (overlay, delta, features).</li>
+            <li>Insights JSON displayed with confidence and flags.</li>
+          </ul>
+        </section>
+
+        <section id="dev-env">
+          <h2>Development Environment</h2>
+          <h3>Goals</h3>
+          <ul>
+            <li>Fast local iteration with hot reload.</li>
+            <li>Mobile UI preview in emulator with HMR.</li>
+            <li>Optional web UI using Vite for dashboards or analysis previews.</li>
+          </ul>
+          <h3>Recommended Tooling</h3>
+          <ul>
+            <li>Node.js 20+</li>
+            <li>Python 3.11+</li>
+            <li>Supabase CLI (local Postgres + Auth + Storage)</li>
+            <li>Android Studio and/or Xcode for emulators</li>
+          </ul>
+          <h3>Mobile App (React Native)</h3>
+          <ul>
+            <li>Prefer Expo for fast iteration and HMR (Fast Refresh).</li>
+            <li>Use <code>expo start</code> for device/emulator preview.</li>
+            <li>For native modules not supported by Expo, use RN CLI with Metro HMR.</li>
+          </ul>
+          <h3>Web UI (Optional)</h3>
+          <ul>
+            <li>Use Vite for any web dashboards or internal analysis tooling.</li>
+            <li>Example flow: Vite dev server + API proxy to FastAPI.</li>
+          </ul>
+          <h3>Backend</h3>
+          <ul>
+            <li>FastAPI with <code>uvicorn --reload</code> for hot reload.</li>
+            <li>Background worker process for analysis jobs.</li>
+          </ul>
+          <h3>Local Supabase</h3>
+          <ul>
+            <li>Use Supabase CLI to run local Postgres and Auth.</li>
+            <li>Keep a local <code>.env</code> with Supabase keys and URLs.</li>
+          </ul>
+          <h3>Suggested Dev Workflow</h3>
+          <ol>
+            <li>Start Supabase local stack.</li>
+            <li>Start FastAPI server with reload.</li>
+            <li>Start analysis worker.</li>
+            <li>Start RN app with HMR on emulator.</li>
+            <li>Optionally start Vite for web dashboards.</li>
+          </ol>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

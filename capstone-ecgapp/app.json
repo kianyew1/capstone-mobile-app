@@ -15,7 +15,9 @@
         "NSBluetoothAlwaysUsageDescription": "This app uses Bluetooth to connect to your ECG monitoring device for real-time heart data collection.",
         "NSBluetoothPeripheralUsageDescription": "This app uses Bluetooth to connect to your ECG monitoring device.",
         "NSLocationWhenInUseUsageDescription": "Location access is required for Bluetooth device scanning. We do not track or store your location.",
-        "UIBackgroundModes": ["bluetooth-central"]
+        "UIBackgroundModes": [
+          "bluetooth-central"
+        ]
       }
     },
     "android": {
@@ -66,10 +68,14 @@
         "react-native-ble-plx",
         {
           "isBackgroundEnabled": true,
-          "modes": ["peripheral", "central"],
+          "modes": [
+            "peripheral",
+            "central"
+          ],
           "bluetoothAlwaysPermission": "Allow $(PRODUCT_NAME) to connect to your ECG device"
         }
-      ]
+      ],
+      "expo-sqlite"
     ],
     "experiments": {
       "typedRoutes": true,
