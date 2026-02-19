@@ -3,7 +3,7 @@ create table public.ecg_recordings (
   user_id text not null,
   created_at timestamp with time zone null default now(),
   bucket text not null default 'YOUR_BUCKET_NAME'::text,
-  object_key text not null,
+  session_object_key text not null,
   encoding text not null default 'int16_le'::text,
   sample_rate_hz integer not null default 500,
   channels smallint not null default 1,
@@ -16,6 +16,7 @@ create table public.ecg_recordings (
   device_id text null,
   firmware_version text null,
   notes text null,
+  calibration_object_key text not null,
   constraint ecg_recordings_pkey primary key (id)
 ) TABLESPACE pg_default;
 

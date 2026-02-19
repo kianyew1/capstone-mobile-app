@@ -50,7 +50,11 @@ import { Text } from "@/components/ui/text";
 import { ENABLE_MOCK_MODE } from "@/config/mock-config";
 import { generateMockHeartRate } from "@/services/api-service";
 import { useBluetoothService } from "@/services/bluetooth-service";
-import { uploadLatestCalibration, uploadSessionRecording } from "@/services/supabase-ecg";
+import {
+  createSessionRecordAtStart,
+  finalizeSessionRecording,
+  uploadCalibrationFile,
+} from "@/services/supabase-ecg";
 import { useAppStore } from "@/stores/app-store";
 import { useSessionStore } from "@/stores/session-store";
 
@@ -88,7 +92,9 @@ export default function RunSessionScreen() {
   const sessionPacketsRef = useRef<Uint8Array[]>([]);
   const sessionStartRef = useRef<Date | null>(null);
   const isStreamingRef = useRef(false);
-  const hasUploadedCalibrationRef = useRef(false);
+  const hasPreparedUploadRef = useRef(false);
+  const recordIdRef = useRef<string | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
 
   // Heart pulse animation
   const heartScale = useSharedValue(1);
@@ -126,17 +132,39 @@ export default function RunSessionScreen() {
   useEffect(() => {
     if (sessionStatus !== "running") return;
 
-    if (!hasUploadedCalibrationRef.current) {
-      hasUploadedCalibrationRef.current = true;
-      uploadLatestCalibration(userId).catch((error) => {
-        console.error("Failed to upload calibration:", error);
-      });
+    if (!sessionStartRef.current) {
+      sessionStartRef.current = new Date();
+    }
+
+    if (!hasPreparedUploadRef.current) {
+      hasPreparedUploadRef.current = true;
+
+      const sessionId = currentSession?.id ?? `session_${Date.now()}`;
+      sessionIdRef.current = sessionId;
+
+      uploadCalibrationFile()
+        .then((calibration) => {
+          if (!calibration) {
+            throw new Error("No calibration available to upload.");
+          }
+          return createSessionRecordAtStart({
+            userId,
+            sessionId,
+            calibrationObjectKey: calibration.objectKey,
+            startTime: sessionStartRef.current,
+          });
+        })
+        .then((record) => {
+          recordIdRef.current = record.recordId ?? null;
+        })
+        .catch((error) => {
+          console.error("Failed to prepare session upload:", error);
+        });
     }
 
     if (isStreamingRef.current) return;
     isStreamingRef.current = true;
     sessionPacketsRef.current = [];
-    sessionStartRef.current = new Date();
 
     startEcgNotifications((payloadBase64) => {
       if (!isStreamingRef.current) return;
@@ -149,8 +177,11 @@ export default function RunSessionScreen() {
 
   useEffect(() => {
     if (sessionStatus === "idle" || sessionStatus === "completed") {
-      hasUploadedCalibrationRef.current = false;
+      hasPreparedUploadRef.current = false;
       isStreamingRef.current = false;
+      recordIdRef.current = null;
+      sessionIdRef.current = null;
+      sessionStartRef.current = null;
       stopEcgNotifications();
     }
   }, [sessionStatus, stopEcgNotifications]);
@@ -252,14 +283,20 @@ export default function RunSessionScreen() {
 
     if (chunks.length > 0) {
       const bytes = concatUint8Arrays(chunks);
-      const sessionId = currentSession?.id ?? `session_${Date.now()}`;
+      const sessionId = sessionIdRef.current ?? currentSession?.id ?? `session_${Date.now()}`;
+      const recordId = recordIdRef.current;
       try {
-        await uploadSessionRecording(
-          userId,
-          sessionId,
-          bytes,
-          sessionStartRef.current,
-        );
+        if (recordId) {
+          await finalizeSessionRecording({
+            recordId,
+            userId,
+            sessionId,
+            bytes,
+            startTime: sessionStartRef.current,
+          });
+        } else {
+          console.warn("No Supabase record id available; session upload skipped.");
+        }
       } catch (error) {
         console.error("Failed to upload session recording:", error);
       }
