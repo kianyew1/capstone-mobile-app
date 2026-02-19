@@ -1,11 +1,18 @@
+import os
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
+from dotenv import load_dotenv
 from fastapi import Body, FastAPI, HTTPException, Query
 
 from services import supabase as supabase_service
 
+load_dotenv()
+
 app = FastAPI()
+
+DEFAULT_BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = os.getenv("BASE_URL") or DEFAULT_BASE_URL
 
 TEST_CREATE_PAYLOAD: Dict[str, Any] = {
     # Minimal example. Update keys to match your table schema.
@@ -46,7 +53,7 @@ def _derive_update_payload(created: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.get("/health")
 def health() -> Dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "base_url": BASE_URL}
 
 
 @app.get("/ecg")
