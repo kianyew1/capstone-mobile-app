@@ -2,11 +2,12 @@ import base64
 import json
 import os
 from math import sqrt
-from typing import Dict, Union
+from typing import Dict, List, Optional, Union
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
@@ -20,6 +21,77 @@ LAST_CALIBRATION_META = {
     "byte_length": 0,
     "sample_count": 0,
 }
+
+
+# ----------------------------
+# Placeholder data models
+# ----------------------------
+class SessionAnalysisRequest(BaseModel):
+    """
+    Placeholder request for session analysis.
+    Preferred input is storage object keys (large signals should not be sent inline).
+    """
+
+    user_id: str = Field(..., description="User identifier (email string).")
+    session_object_key: str = Field(
+        ..., description="Supabase Storage key for the session .bin file."
+    )
+    calibration_object_key: str = Field(
+        ..., description="Supabase Storage key for the calibration .bin file."
+    )
+    sample_rate_hz: int = Field(500, description="Sampling rate in Hz.")
+    channels: int = Field(1, description="Number of signal channels.")
+    window_seconds: int = Field(20, description="Window length in seconds.")
+    # Optional: if you ever want to send raw data instead of object keys.
+    # raw_signal_base64: Optional[str] = Field(
+    #     None, description="Raw session bytes (base64). Avoid for large payloads."
+    # )
+
+
+class CleanWindow(BaseModel):
+    start_index: int
+    end_index: int
+    duration_ms: int
+    score: float
+    reason: Optional[str] = None
+
+
+class HeartMetrics(BaseModel):
+    average_hr_bpm: Optional[float] = None
+    min_hr_bpm: Optional[float] = None
+    max_hr_bpm: Optional[float] = None
+    hrv_ms: Optional[float] = None
+    pr_interval_ms: Optional[float] = None
+    qrs_duration_ms: Optional[float] = None
+    qt_interval_ms: Optional[float] = None
+
+
+class Insight(BaseModel):
+    type: str
+    title: str
+    detail: str
+
+
+class SessionAnalysisResponse(BaseModel):
+    clean_windows: List[CleanWindow]
+    metrics: HeartMetrics
+    insights: List[Insight]
+    summary: str
+    calibration_comparison: Optional["CalibrationComparison"] = None
+
+
+class CalibrationComparison(BaseModel):
+    """
+    Placeholder for advanced comparison between resting (calibration)
+    and exercise (session) ECG signals.
+    """
+
+    overall_score: float
+    deviations: List[str]
+    morphology_changes: List[str]
+    timing_shifts_ms: Dict[str, float]
+    anomaly_flags: List[str]
+    notes: Optional[str] = None
 
 
 @app.get("/health")
@@ -162,3 +234,179 @@ async def calibration_signal_quality_check(
         "quality_percentage": round(quality, 2),
         "signal_suitable": signal_suitable,
     }
+
+
+@app.post("/session_signal_quality_check")
+async def session_signal_quality_check(
+    request: Request,
+) -> Dict[str, Union[float, bool]]:
+    data = await request.body()
+    byte_length = len(data)
+    sample_count = byte_length // 2
+    remainder = byte_length % 2
+
+    decoded_samples = [
+        int.from_bytes(data[i : i + 2], "little", signed=True)
+        for i in range(0, sample_count * 2, 2)
+    ]
+    request_dump = {
+        "method": request.method,
+        "url": str(request.url),
+        "headers": dict(request.headers),
+        "byte_length": byte_length,
+        "samples": decoded_samples,
+    }
+    dump_path = os.path.join(os.path.dirname(__file__), "session_request.json")
+    with open(dump_path, "w", encoding="utf-8") as handle:
+        json.dump(request_dump, handle, indent=2)
+
+    print("[SESSION] Received session signal")
+    print(f"[SESSION] byte_length={byte_length} sample_count={sample_count}")
+    if remainder:
+        print(f"[SESSION] WARNING: odd byte count (remainder={remainder})")
+
+    if sample_count == 0:
+        print("[SESSION] No samples received -> quality=0, suitable=False")
+        return {"quality_percentage": 0.0, "signal_suitable": False}
+
+    sum_sq = 0.0
+    min_val = None
+    max_val = None
+    for value in decoded_samples:
+        sum_sq += float(value * value)
+        if min_val is None or value < min_val:
+            min_val = value
+        if max_val is None or value > max_val:
+            max_val = value
+
+    rms = sqrt(sum_sq / sample_count)
+    quality = max(0.0, min(100.0, (rms / 1000.0) * 100.0))
+    signal_suitable = quality >= 70.0
+
+    print(
+        "[SESSION] Computation details:"
+        f" min={min_val} max={max_val} rms={rms:.2f}"
+    )
+    print(
+        "[SESSION] Quality mapping:"
+        f" quality_percentage={quality:.2f} threshold=70.0"
+    )
+    print(
+        "[SESSION] Result:"
+        f" signal_suitable={signal_suitable}"
+    )
+
+    return {
+        "quality_percentage": round(quality, 2),
+        "signal_suitable": signal_suitable,
+    }
+
+
+# ----------------------------
+# Placeholder analysis endpoints
+# ----------------------------
+@app.post("/session_analysis", response_model=SessionAnalysisResponse)
+async def session_analysis(payload: SessionAnalysisRequest) -> SessionAnalysisResponse:
+    """
+    Placeholder endpoint for full session analysis pipeline:
+    1) Load session + calibration signals (by object keys)
+    2) Find clean 20s windows
+    3) Compare windows to calibration (advanced morphology + timing analysis)
+    4) Compute heart metrics
+    5) Produce insights + summary
+    """
+
+    # TODO: Load binary data from storage using object keys.
+    # TODO: Segment into windows and score for signal quality.
+    # TODO: Compare selected windows against calibration template.
+    # TODO: Compute metrics and insights.
+
+    return SessionAnalysisResponse(
+        clean_windows=[
+            CleanWindow(
+                start_index=0,
+                end_index=payload.sample_rate_hz * payload.window_seconds,
+                duration_ms=payload.window_seconds * 1000,
+                score=0.0,
+                reason="placeholder",
+            )
+        ],
+        metrics=HeartMetrics(),
+        insights=[
+            Insight(
+                type="info",
+                title="Placeholder",
+                detail="Session analysis not implemented yet.",
+            )
+        ],
+        summary="Placeholder response. Analysis pipeline not implemented.",
+        calibration_comparison=CalibrationComparison(
+            overall_score=0.0,
+            deviations=["placeholder"],
+            morphology_changes=["placeholder"],
+            timing_shifts_ms={"pr": 0.0, "qrs": 0.0, "qt": 0.0},
+            anomaly_flags=["placeholder"],
+            notes="Detailed comparison not implemented.",
+        ),
+    )
+
+
+@app.post("/session_find_clean_windows", response_model=List[CleanWindow])
+async def session_find_clean_windows(
+    payload: SessionAnalysisRequest,
+) -> List[CleanWindow]:
+    """
+    Placeholder endpoint: identify clean 20s windows from session signal.
+    Input should include session_object_key and sampling metadata.
+    """
+    return [
+        CleanWindow(
+            start_index=0,
+            end_index=payload.sample_rate_hz * payload.window_seconds,
+            duration_ms=payload.window_seconds * 1000,
+            score=0.0,
+            reason="placeholder",
+        )
+    ]
+
+
+@app.post("/session_compare_to_calibration", response_model=CalibrationComparison)
+async def session_compare_to_calibration(
+    payload: SessionAnalysisRequest,
+) -> CalibrationComparison:
+    """
+    Placeholder endpoint: compare clean windows against calibration signal.
+    This is the core of the project: detect subtle deviations between
+    resting (calibration) and exercise (session) ECG signals that are
+    not visible via standard 12-lead ECG snapshots.
+    """
+    return CalibrationComparison(
+        overall_score=0.0,
+        deviations=["placeholder"],
+        morphology_changes=["placeholder"],
+        timing_shifts_ms={"pr": 0.0, "qrs": 0.0, "qt": 0.0},
+        anomaly_flags=["placeholder"],
+        notes="Advanced comparison not implemented.",
+    )
+
+
+@app.post("/session_metrics", response_model=HeartMetrics)
+async def session_metrics(payload: SessionAnalysisRequest) -> HeartMetrics:
+    """
+    Placeholder endpoint: compute heart metrics from selected clean windows.
+    """
+    return HeartMetrics()
+
+
+@app.post("/session_insights", response_model=List[Insight])
+async def session_insights(payload: SessionAnalysisRequest) -> List[Insight]:
+    """
+    Placeholder endpoint: compute insights based on metrics and comparison.
+    """
+    return [
+        Insight(
+            type="info",
+            title="Placeholder",
+            detail="Insights not implemented.",
+        )
+    ]
