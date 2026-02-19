@@ -32,6 +32,7 @@ function concatUint8Arrays(chunks: Uint8Array[]): Uint8Array {
 async function uploadToStorage(objectKey: string, bytes: Uint8Array) {
   assertSupabaseConfig();
   const url = `${SUPABASE_URL}/storage/v1/object/${SUPABASE_STORAGE_BUCKET}/${objectKey}`;
+  console.log(`LOG ${url}`);
 
   const response = await fetch(url, {
     method: "POST",
@@ -80,8 +81,10 @@ export async function createSessionRecordAtStart(params: {
 }) {
   assertSupabaseConfig();
   const sessionObjectKey = `session/${params.sessionId}.bin`;
+  const url = `${SUPABASE_URL}/rest/v1/ecg_recordings`;
+  console.log(`LOG ${url}`);
 
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/ecg_recordings`, {
+  const response = await fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
@@ -133,28 +136,25 @@ export async function finalizeSessionRecording(params: {
     (sampleCount / DEFAULT_SAMPLE_RATE_HZ) * 1000,
   );
 
-  const response = await fetch(
-    `${SUPABASE_URL}/rest/v1/ecg_recordings?id=eq.${params.recordId}`,
-    {
-      method: "PATCH",
-      headers: {
-        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-        apikey: SUPABASE_ANON_KEY,
-        "Content-Type": "application/json",
-        Prefer: "return=minimal",
-      },
-      body: JSON.stringify({
-        user_id: params.userId,
-        session_object_key: sessionObjectKey,
-        sample_count: sampleCount,
-        duration_ms: durationMs,
-        start_time: params.startTime
-          ? params.startTime.toISOString()
-          : null,
-        byte_length: params.bytes.length,
-      }),
+  const updateUrl = `${SUPABASE_URL}/rest/v1/ecg_recordings?id=eq.${params.recordId}`;
+  console.log(`LOG ${updateUrl}`);
+  const response = await fetch(updateUrl, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      apikey: SUPABASE_ANON_KEY,
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
     },
-  );
+    body: JSON.stringify({
+      user_id: params.userId,
+      session_object_key: sessionObjectKey,
+      sample_count: sampleCount,
+      duration_ms: durationMs,
+      start_time: params.startTime ? params.startTime.toISOString() : null,
+      byte_length: params.bytes.length,
+    }),
+  });
 
   if (!response.ok) {
     const text = await response.text();

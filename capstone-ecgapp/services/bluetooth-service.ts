@@ -22,6 +22,11 @@ const ECG_CHARACTERISTIC_UUID = "87654321-4321-4321-4321-abcdefabcdef";
 
 // Create a singleton BleManager instance
 let bleManagerInstance: BleManager | null = null;
+let ecgSubscription: Subscription | null = null;
+let ecgListener: ((payloadBase64: string) => void) | null = null;
+let lastEcgPacketAtMs = 0;
+let lastEcgPayload: string | null = null;
+const MIN_ECG_PACKET_INTERVAL_MS = 10;
 
 const getBleManager = (): BleManager => {
   if (!bleManagerInstance) {
@@ -52,10 +57,6 @@ export function useBluetoothService() {
   const autoReconnectRef = useRef(false);
   const scanSubscription = useRef<Subscription | null>(null);
   const stateSubscription = useRef<Subscription | null>(null);
-  const ecgSubscription = useRef<Subscription | null>(null);
-  const ecgListenerRef = useRef<((payloadBase64: string) => void) | null>(
-    null,
-  );
 
   // Initialize mock mode
   useEffect(() => {
@@ -354,7 +355,7 @@ export function useBluetoothService() {
 
   const disconnectDevice = useCallback(async (): Promise<void> => {
     try {
-      ecgListenerRef.current = null;
+      ecgListener = null;
 
       // Mock mode: Simulate disconnection
       if (ENABLE_MOCK_MODE) {
@@ -412,14 +413,14 @@ export function useBluetoothService() {
   }, [pairedDevice, bleManager, connectToDevice]);
 
   const unpairDevice = useCallback(async (): Promise<void> => {
-    ecgListenerRef.current = null;
+    ecgListener = null;
     await disconnectDevice();
     setPairedDevice(null);
     setDiscoveredDevices([]);
   }, [disconnectDevice, setPairedDevice]);
 
   const stopEcgNotifications = useCallback(() => {
-    ecgListenerRef.current = null;
+    ecgListener = null;
   }, []);
 
   const startEcgNotifications = useCallback(
@@ -462,25 +463,36 @@ export function useBluetoothService() {
         return false;
       }
 
-      ecgListenerRef.current = onData;
+      ecgListener = onData;
 
-      if (ecgSubscription.current) {
+      if (ecgSubscription) {
         return true;
       }
 
-      ecgSubscription.current = device.monitorCharacteristicForService(
+      ecgSubscription = device.monitorCharacteristicForService(
         ECG_SERVICE_UUID,
         ECG_CHARACTERISTIC_UUID,
         (monitorError, characteristic) => {
           if (monitorError) {
             console.error("ECG monitor error:", monitorError);
             setError(monitorError.message);
-            ecgSubscription.current = null;
+            ecgSubscription = null;
             return;
           }
 
           if (characteristic?.value) {
-            ecgListenerRef.current?.(characteristic.value);
+            const now = Date.now();
+            const payload = characteristic.value;
+            const delta = now - lastEcgPacketAtMs;
+            if (
+              delta < MIN_ECG_PACKET_INTERVAL_MS &&
+              lastEcgPayload === payload
+            ) {
+              return;
+            }
+            lastEcgPacketAtMs = now;
+            lastEcgPayload = payload;
+            ecgListener?.(payload);
           }
         },
       );

@@ -26,6 +26,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Text } from "@/components/ui/text";
 import { ENABLE_MOCK_MODE } from "@/config/mock-config";
+import { getCalibrationSignalQuality } from "@/services/calibration-quality";
 import { useBluetoothService } from "@/services/bluetooth-service";
 import {
   getLatestCalibrationRunId,
@@ -190,6 +191,11 @@ export default function CalibrationScreen() {
       setElapsedMs(endedAt - startedAt);
 
       try {
+        const bytes = concatUint8Arrays(
+          packetsRef.current.map((packet) => packet.data),
+        );
+        const quality = await getCalibrationSignalQuality(bytes);
+
         await saveCalibrationRun(
           runId,
           startedAt,
@@ -197,22 +203,28 @@ export default function CalibrationScreen() {
           packetsRef.current,
         );
 
-        const message = `Saved ${packetsRef.current.length} packets to local storage (run id: ${runId}).`;
-        setSignalQuality(100);
+        const message = quality.signalSuitable
+          ? `Signal quality ${quality.qualityPercentage}%. Calibration successful.`
+          : `Signal quality ${quality.qualityPercentage}%. Calibration failed. Please adjust device placement.`;
+
+        setSignalQuality(quality.qualityPercentage);
         setProgress(100);
         setResultMessage(message);
-        setCalibrationStatus("success");
+        setCalibrationStatus(quality.signalSuitable ? "success" : "failed");
         setLastRunId(runId);
         setCalibrationResult({
-          status: "success",
+          status: quality.signalSuitable ? "success" : "failed",
           message,
           timestamp: new Date(),
-          signalQuality: 100,
+          signalQuality: quality.qualityPercentage,
         });
       } catch (error) {
         console.error("Failed to save calibration packets:", error);
         setCalibrationStatus("failed");
-        setResultMessage("Failed to save calibration packets.");
+        setSignalQuality(0);
+        setResultMessage(
+          "Calibration failed while checking signal quality. Please try again.",
+        );
       } finally {
         setStep("result");
       }
@@ -319,6 +331,17 @@ export default function CalibrationScreen() {
     const hours = String(date.getHours()).padStart(2, "0");
     const minutes = String(date.getMinutes()).padStart(2, "0");
     return `calibration_${day}${month}${year}_${hours}${minutes}H`;
+  };
+
+  const concatUint8Arrays = (chunks: Uint8Array[]) => {
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const result = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return result;
   };
 
   const buildWavePath = (
