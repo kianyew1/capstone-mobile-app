@@ -7,7 +7,7 @@
  * Set ENABLE_MOCK_MODE to false when you have actual hardware.
  */
 
-export const ENABLE_MOCK_MODE = true;
+export const ENABLE_MOCK_MODE = false;
 
 /**
  * Mock device configuration

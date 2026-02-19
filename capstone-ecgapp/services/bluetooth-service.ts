@@ -14,9 +14,10 @@ import {
   type Subscription,
 } from "react-native-ble-plx";
 
-// Service UUID for ECG device - replace with your actual device's service UUID
-const ECG_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"; // Heart Rate Service UUID
-const ECG_CHARACTERISTIC_UUID = "00002a37-0000-1000-8000-00805f9b34fb"; // Heart Rate Measurement
+// Service/Characteristic UUIDs for the XIAO nRF52840 ECG firmware
+// Keep in sync with nrf52480.ino
+const ECG_SERVICE_UUID = "12345678-1234-1234-1234-1234567890ab";
+const ECG_CHARACTERISTIC_UUID = "87654321-4321-4321-4321-abcdefabcdef";
 
 // Create a singleton BleManager instance
 let bleManagerInstance: BleManager | null = null;
