@@ -8,7 +8,7 @@ import {
   X,
   Zap,
 } from "lucide-react-native";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, ScrollView, View } from "react-native";
 import Animated, {
   Easing,
@@ -25,15 +25,18 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Text } from "@/components/ui/text";
 import { ENABLE_MOCK_MODE } from "@/config/mock-config";
-import { submitCalibrationData } from "@/services/api-service";
+import { useBluetoothService } from "@/services/bluetooth-service";
+import { saveCalibrationRun } from "@/services/ecg-storage";
 import { useAppStore } from "@/stores/app-store";
 import type { CalibrationStatus } from "@/types";
+import { toByteArray } from "base64-js";
 
 type CalibrationStep = "guidance" | "ready" | "calibrating" | "result";
 
 export default function CalibrationScreen() {
   const params = useLocalSearchParams<{ fromOnboarding?: string }>();
   const isFromOnboarding = params.fromOnboarding === "true";
+  const targetPacketCount = 1000;
 
   const [step, setStep] = useState<CalibrationStep>("guidance");
   const [calibrationStatus, setCalibrationStatus] =
@@ -42,8 +45,20 @@ export default function CalibrationScreen() {
   const [resultMessage, setResultMessage] = useState("");
   const [signalQuality, setSignalQuality] = useState(0);
   const [recommendations, setRecommendations] = useState<string[]>([]);
+  const [packetCount, setPacketCount] = useState(0);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const [lastPacketBytes, setLastPacketBytes] = useState<Uint8Array | null>(
+    null,
+  );
 
-  const { pairedDevice, setCalibrationResult, isCalibrated } = useAppStore();
+  const { setCalibrationResult } = useAppStore();
+  const { startEcgNotifications, stopEcgNotifications } = useBluetoothService();
+  const packetCountRef = useRef(0);
+  const packetsRef = useRef<Array<{ data: Uint8Array; receivedAt: number }>>(
+    [],
+  );
+  const calibrationStartRef = useRef<number | null>(null);
+  const isFinishingRef = useRef(false);
 
   // Pulse animation for the device indicator
   const pulseAnim = useSharedValue(1);
@@ -63,6 +78,12 @@ export default function CalibrationScreen() {
     }
   }, [step]);
 
+  useEffect(() => {
+    return () => {
+      stopEcgNotifications();
+    };
+  }, [stopEcgNotifications]);
+
   const pulseStyle = useAnimatedStyle(() => ({
     transform: [{ scale: pulseAnim.value }],
   }));
@@ -75,80 +96,113 @@ export default function CalibrationScreen() {
     setStep("calibrating");
     setCalibrationStatus("in-progress");
     setProgress(0);
+    setResultMessage("");
+    setRecommendations([]);
+    setSignalQuality(0);
+    setPacketCount(0);
+    setElapsedMs(0);
+    setLastPacketBytes(null);
+    packetCountRef.current = 0;
+    packetsRef.current = [];
+    calibrationStartRef.current = Date.now();
+    isFinishingRef.current = false;
 
-    // Simulate calibration progress
-    const progressInterval = setInterval(() => {
-      setProgress((prev) => {
-        if (prev >= 100) {
-          clearInterval(progressInterval);
-          return 100;
-        }
-        return prev + 2;
-      });
-    }, 60);
+    const runId = `calibration_${Date.now()}`;
+    const startedAt = calibrationStartRef.current ?? Date.now();
 
-    try {
-      // Mock signal data - in production this would come from the BLE device
-      const mockSignalData = Array.from(
-        { length: 100 },
-        () => Math.random() * 100,
-      );
+    const finishSuccess = async () => {
+      if (isFinishingRef.current) return;
+      isFinishingRef.current = true;
+      stopEcgNotifications();
 
-      const response = await submitCalibrationData(
-        pairedDevice?.id || "mock_device",
-        mockSignalData,
-      );
+      const endedAt = Date.now();
+      setElapsedMs(endedAt - startedAt);
 
-      clearInterval(progressInterval);
+      try {
+        await saveCalibrationRun(
+          runId,
+          startedAt,
+          endedAt,
+          packetsRef.current,
+        );
+
+      const message = `Saved ${packetsRef.current.length} packets to local storage (run id: ${runId}).`;
+      setSignalQuality(100);
       setProgress(100);
-
-      if (response.success && response.data) {
-        const { isCalibrated, signalQuality, message, recommendations } =
-          response.data;
-
-        setSignalQuality(signalQuality);
         setResultMessage(message);
-        setRecommendations(recommendations || []);
-
-        if (isCalibrated) {
-          setCalibrationStatus("success");
-          setCalibrationResult({
-            status: "success",
-            message,
-            timestamp: new Date(),
-            signalQuality,
-          });
-        } else {
-          setCalibrationStatus("failed");
-          setCalibrationResult({
-            status: "failed",
-            message,
-            timestamp: new Date(),
-            signalQuality,
-          });
-        }
-      } else {
+        setCalibrationStatus("success");
+        setCalibrationResult({
+          status: "success",
+          message,
+          timestamp: new Date(),
+          signalQuality: 100,
+        });
+      } catch (error) {
+        console.error("Failed to save calibration packets:", error);
         setCalibrationStatus("failed");
-        setResultMessage("Calibration failed. Please try again.");
+        setResultMessage("Failed to save calibration packets.");
+      } finally {
+        setStep("result");
       }
+    };
 
-      setStep("result");
-    } catch (error) {
-      clearInterval(progressInterval);
+    const finishFailure = (message: string) => {
+      if (isFinishingRef.current) return;
+      isFinishingRef.current = true;
+      stopEcgNotifications();
       setCalibrationStatus("failed");
-      setResultMessage(
-        "An error occurred during calibration. Please try again.",
-      );
+      setResultMessage(message);
       setStep("result");
+    };
+
+    const started = await startEcgNotifications((payloadBase64) => {
+      if (isFinishingRef.current) return;
+
+      const bytes = toByteArray(payloadBase64);
+      const receivedAt = Date.now();
+
+      packetsRef.current.push({ data: bytes, receivedAt });
+      packetCountRef.current += 1;
+      const count = packetCountRef.current;
+      setPacketCount(count);
+      setLastPacketBytes(bytes);
+      if (calibrationStartRef.current) {
+        setElapsedMs(receivedAt - calibrationStartRef.current);
+      }
+      const pct = Math.min(
+        100,
+        Math.round((count / targetPacketCount) * 100),
+      );
+      setProgress(pct);
+
+      if (count >= targetPacketCount) {
+        void finishSuccess();
+      }
+    });
+
+    if (!started) {
+      finishFailure(
+        "Failed to start ECG stream. Make sure the device is connected.",
+      );
+      return;
     }
+
   };
 
   const handleRetry = () => {
+    stopEcgNotifications();
     setStep("guidance");
     setCalibrationStatus("not-started");
     setProgress(0);
     setResultMessage("");
     setRecommendations([]);
+    setSignalQuality(0);
+    setPacketCount(0);
+    setLastPacketBytes(null);
+    packetCountRef.current = 0;
+    packetsRef.current = [];
+    calibrationStartRef.current = null;
+    isFinishingRef.current = false;
   };
 
   const handleContinue = () => {
@@ -163,6 +217,7 @@ export default function CalibrationScreen() {
     if (step === "guidance" || step === "result") {
       router.back();
     } else {
+      stopEcgNotifications();
       setStep("guidance");
     }
   };
@@ -174,6 +229,11 @@ export default function CalibrationScreen() {
       router.back();
     }
   };
+
+  const formatPacketBytes = (bytes: Uint8Array) =>
+    `Uint8Array(${bytes.length}) [${Array.from(bytes).join(", ")}]`;
+
+  const formatSeconds = (ms: number) => (ms / 1000).toFixed(1);
 
   const renderGuidance = () => (
     <ScrollView className="flex-1" showsVerticalScrollIndicator={false}>
@@ -342,6 +402,19 @@ export default function CalibrationScreen() {
         <Progress value={progress} className="h-3" />
       </View>
       <Text className="text-muted-foreground">{Math.round(progress)}%</Text>
+      <View className="mt-4 items-center">
+        <Text className="text-muted-foreground text-sm">
+          Packets received: {packetCount} / {targetPacketCount}
+        </Text>
+        <Text className="text-muted-foreground text-sm mt-1">
+          Time: {formatSeconds(elapsedMs)}s
+        </Text>
+        {lastPacketBytes && (
+          <Text className="text-muted-foreground text-xs mt-1">
+            Last packet bytes: {formatPacketBytes(lastPacketBytes)}
+          </Text>
+        )}
+      </View>
     </View>
   );
 

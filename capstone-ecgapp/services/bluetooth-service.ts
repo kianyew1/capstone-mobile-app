@@ -49,6 +49,10 @@ export function useBluetoothService() {
   const autoReconnectRef = useRef(false);
   const scanSubscription = useRef<Subscription | null>(null);
   const stateSubscription = useRef<Subscription | null>(null);
+  const ecgSubscription = useRef<Subscription | null>(null);
+  const ecgListenerRef = useRef<((payloadBase64: string) => void) | null>(
+    null,
+  );
 
   // Initialize mock mode
   useEffect(() => {
@@ -346,6 +350,8 @@ export function useBluetoothService() {
 
   const disconnectDevice = useCallback(async (): Promise<void> => {
     try {
+      ecgListenerRef.current = null;
+
       // Mock mode: Simulate disconnection
       if (ENABLE_MOCK_MODE) {
         setConnectedDevice(null);
@@ -402,10 +408,89 @@ export function useBluetoothService() {
   }, [pairedDevice, bleManager, connectToDevice]);
 
   const unpairDevice = useCallback(async (): Promise<void> => {
+    ecgListenerRef.current = null;
     await disconnectDevice();
     setPairedDevice(null);
     setDiscoveredDevices([]);
   }, [disconnectDevice, setPairedDevice]);
+
+  const stopEcgNotifications = useCallback(() => {
+    ecgListenerRef.current = null;
+  }, []);
+
+  const startEcgNotifications = useCallback(
+    async (onData: (payloadBase64: string) => void): Promise<boolean> => {
+      if (ENABLE_MOCK_MODE) {
+        setError("Mock mode is enabled. Disable it to use real hardware.");
+        return false;
+      }
+
+      setError(null);
+
+      let device = connectedDevice;
+
+      if (!device && pairedDevice) {
+        const reconnected = await reconnectToPairedDevice();
+        if (reconnected) {
+          const isConnected = await bleManager.isDeviceConnected(
+            pairedDevice.id,
+          );
+          if (isConnected) {
+            const devices = await bleManager.devices([pairedDevice.id]);
+            device = devices[0] ?? null;
+            if (device) {
+              setConnectedDevice(device);
+            }
+          }
+        }
+      }
+
+      if (!device) {
+        setError("No connected device available");
+        return false;
+      }
+
+      try {
+        await device.discoverAllServicesAndCharacteristics();
+      } catch (err) {
+        console.error("Service discovery error:", err);
+        setError("Failed to discover services");
+        return false;
+      }
+
+      ecgListenerRef.current = onData;
+
+      if (ecgSubscription.current) {
+        return true;
+      }
+
+      ecgSubscription.current = device.monitorCharacteristicForService(
+        ECG_SERVICE_UUID,
+        ECG_CHARACTERISTIC_UUID,
+        (monitorError, characteristic) => {
+          if (monitorError) {
+            console.error("ECG monitor error:", monitorError);
+            setError(monitorError.message);
+            ecgSubscription.current = null;
+            return;
+          }
+
+          if (characteristic?.value) {
+            ecgListenerRef.current?.(characteristic.value);
+          }
+        },
+      );
+
+      return true;
+    },
+    [
+      bleManager,
+      connectedDevice,
+      pairedDevice,
+      reconnectToPairedDevice,
+      setConnectedDevice,
+    ],
+  );
 
   return {
     // State
@@ -425,5 +510,7 @@ export function useBluetoothService() {
     reconnectToPairedDevice,
     unpairDevice,
     requestPermissions,
+    startEcgNotifications,
+    stopEcgNotifications,
   };
 }
