@@ -19,6 +19,7 @@ import Animated, {
   withTiming,
 } from "react-native-reanimated";
 import { SafeAreaView } from "react-native-safe-area-context";
+import Svg, { Path } from "react-native-svg";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -26,7 +27,11 @@ import { Progress } from "@/components/ui/progress";
 import { Text } from "@/components/ui/text";
 import { ENABLE_MOCK_MODE } from "@/config/mock-config";
 import { useBluetoothService } from "@/services/bluetooth-service";
-import { saveCalibrationRun } from "@/services/ecg-storage";
+import {
+  getLatestCalibrationRunId,
+  getPacketsForRun,
+  saveCalibrationRun,
+} from "@/services/ecg-storage";
 import { useAppStore } from "@/stores/app-store";
 import type { CalibrationStatus } from "@/types";
 import { toByteArray } from "base64-js";
@@ -37,6 +42,7 @@ export default function CalibrationScreen() {
   const params = useLocalSearchParams<{ fromOnboarding?: string }>();
   const isFromOnboarding = params.fromOnboarding === "true";
   const targetPacketCount = 1000;
+  const SHOW_CALIBRATION_GRAPH = true;
 
   const [step, setStep] = useState<CalibrationStep>("guidance");
   const [calibrationStatus, setCalibrationStatus] =
@@ -50,6 +56,10 @@ export default function CalibrationScreen() {
   const [lastPacketBytes, setLastPacketBytes] = useState<Uint8Array | null>(
     null,
   );
+  const [lastRunId, setLastRunId] = useState<string | null>(null);
+  const [graphPoints, setGraphPoints] = useState<number[]>([]);
+  const [graphError, setGraphError] = useState<string | null>(null);
+  const [isGraphLoading, setIsGraphLoading] = useState(false);
 
   const { setCalibrationResult } = useAppStore();
   const { startEcgNotifications, stopEcgNotifications } = useBluetoothService();
@@ -77,6 +87,66 @@ export default function CalibrationScreen() {
       pulseAnim.value = 1;
     }
   }, [step]);
+
+  useEffect(() => {
+    const loadGraph = async () => {
+      if (!SHOW_CALIBRATION_GRAPH) return;
+      if (step !== "result" || calibrationStatus !== "success") return;
+
+      setIsGraphLoading(true);
+      setGraphError(null);
+      setGraphPoints([]);
+
+      try {
+        const runId = lastRunId ?? (await getLatestCalibrationRunId());
+        if (!runId) {
+          setGraphError("No calibration run found.");
+          return;
+        }
+
+        const packets = await getPacketsForRun(runId);
+        if (packets.length === 0) {
+          setGraphError("No packets found for the latest run.");
+          return;
+        }
+
+        const samples: number[] = [];
+        for (const packet of packets) {
+          for (let i = 0; i + 1 < packet.length; i += 2) {
+            const raw = packet[i] | (packet[i + 1] << 8);
+            const signed = raw & 0x8000 ? raw - 0x10000 : raw;
+            samples.push(signed);
+          }
+        }
+
+        const maxPoints = 800;
+        const stepSize = Math.max(1, Math.ceil(samples.length / maxPoints));
+        const sampled: number[] = [];
+        for (let i = 0; i < samples.length; i += stepSize) {
+          sampled.push(samples[i]);
+        }
+
+        const mean =
+          sampled.reduce((sum, value) => sum + value, 0) / sampled.length;
+        let maxAbs = 0;
+        for (const v of sampled) {
+          const delta = Math.abs(v - mean);
+          if (delta > maxAbs) maxAbs = delta;
+        }
+        const scale = maxAbs || 1;
+        const normalized = sampled.map((v) => (v - mean) / scale);
+
+        setGraphPoints(normalized);
+      } catch (error) {
+        console.error("Failed to load calibration graph:", error);
+        setGraphError("Failed to load calibration graph.");
+      } finally {
+        setIsGraphLoading(false);
+      }
+    };
+
+    void loadGraph();
+  }, [SHOW_CALIBRATION_GRAPH, calibrationStatus, lastRunId, step]);
 
   useEffect(() => {
     return () => {
@@ -126,11 +196,12 @@ export default function CalibrationScreen() {
           packetsRef.current,
         );
 
-      const message = `Saved ${packetsRef.current.length} packets to local storage (run id: ${runId}).`;
-      setSignalQuality(100);
-      setProgress(100);
+        const message = `Saved ${packetsRef.current.length} packets to local storage (run id: ${runId}).`;
+        setSignalQuality(100);
+        setProgress(100);
         setResultMessage(message);
         setCalibrationStatus("success");
+        setLastRunId(runId);
         setCalibrationResult({
           status: "success",
           message,
@@ -198,7 +269,11 @@ export default function CalibrationScreen() {
     setRecommendations([]);
     setSignalQuality(0);
     setPacketCount(0);
+    setElapsedMs(0);
     setLastPacketBytes(null);
+    setLastRunId(null);
+    setGraphPoints([]);
+    setGraphError(null);
     packetCountRef.current = 0;
     packetsRef.current = [];
     calibrationStartRef.current = null;
@@ -234,6 +309,22 @@ export default function CalibrationScreen() {
     `Uint8Array(${bytes.length}) [${Array.from(bytes).join(", ")}]`;
 
   const formatSeconds = (ms: number) => (ms / 1000).toFixed(1);
+
+  const buildWavePath = (
+    points: number[],
+    height: number,
+    stepX: number,
+  ) => {
+    if (points.length === 0) return "";
+    const mid = height / 2;
+    let d = "";
+    for (let i = 0; i < points.length; i += 1) {
+      const x = i * stepX;
+      const y = mid - points[i] * mid;
+      d += i === 0 ? `M ${x} ${y}` : ` L ${x} ${y}`;
+    }
+    return d;
+  };
 
   const renderGuidance = () => (
     <ScrollView className="flex-1" showsVerticalScrollIndicator={false}>
@@ -476,6 +567,45 @@ export default function CalibrationScreen() {
           </Text>
         </CardContent>
       </Card>
+
+      {calibrationStatus === "success" && SHOW_CALIBRATION_GRAPH && (
+        <Card className="mb-4">
+          <CardHeader>
+            <CardTitle>Calibration Preview</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {isGraphLoading && (
+              <Text className="text-muted-foreground text-sm">
+                Loading graph...
+              </Text>
+            )}
+            {graphError && (
+              <Text className="text-destructive text-sm">{graphError}</Text>
+            )}
+            {!isGraphLoading && !graphError && graphPoints.length > 0 && (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                className="mt-2"
+              >
+                <View style={{ height: 140 }}>
+                  <Svg
+                    width={Math.max(graphPoints.length * 3, 320)}
+                    height={120}
+                  >
+                    <Path
+                      d={buildWavePath(graphPoints, 120, 3)}
+                      stroke="#22c55e"
+                      strokeWidth={2}
+                      fill="none"
+                    />
+                  </Svg>
+                </View>
+              </ScrollView>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* Recommendations (if failed) */}
       {calibrationStatus === "failed" && recommendations.length > 0 && (

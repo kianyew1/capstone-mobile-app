@@ -2,7 +2,7 @@
 #include <math.h>
 
 // ======================================================
-// LED STATUS
+// LED STATUS (production-safe)
 // ======================================================
 #ifndef LED_BUILTIN
   #define LED_BUILTIN 2
@@ -29,7 +29,7 @@ void blinkNonBlocking(unsigned long intervalMs) {
 }
 
 // ======================================================
-// BLE SETUP
+// BLE CONFIGURATION (KEEP FOR FINAL PRODUCT)
 // ======================================================
 const char* SERVICE_UUID = "12345678-1234-1234-1234-1234567890ab";
 const char* CHAR_UUID    = "87654321-4321-4321-4321-abcdefabcdef";
@@ -38,61 +38,109 @@ BLEService ecgService(SERVICE_UUID);
 BLECharacteristic ecgChar(CHAR_UUID);
 
 // ======================================================
-// ECG SIMULATION (Single Channel @ 500 Hz)
+// STREAMING CONFIG (KEEP FOR FINAL PRODUCT)
 // ======================================================
-float phase = 0.0f;
 
-const float sampleRateHz = 500.0f;
-const float baseFreqHz   = 1.2f;      // ~72 bpm
-const float amplitude    = 1200.0f;
-const int16_t noiseAmp   = 80;
+// Desired real sampling rate
+static const float sampleRateHz = 500.0f;
 
-const float phaseStep =
-  2.0f * 3.1415926f * baseFreqHz / sampleRateHz;
+// 10 samples per BLE packet
+static const int SAMPLES_PER_PACKET = 10;
 
-const int SAMPLES_PER_PACKET = 10;    // 10 samples per BLE notify
-const uint32_t packetIntervalUs =
-  (uint32_t)(1000000.0f * SAMPLES_PER_PACKET / sampleRateHz); // 20000 us
+// 50 packets/sec -> 20ms interval
+static const uint32_t packetIntervalUs =
+  (uint32_t)(1000000.0f * SAMPLES_PER_PACKET / sampleRateHz);
 
 uint32_t lastSendUs = 0;
 
 // ======================================================
-// DEBUG / VERIFICATION COUNTERS
+// DEBUG / RATE VERIFICATION (optional for production)
 // ======================================================
+uint32_t packetsThisSecond = 0;
+uint32_t lastStatsMs = 0;
 uint32_t notifyOk = 0;
 uint32_t notifyFail = 0;
 
-uint32_t packetsThisSecond = 0;
-uint32_t lastStatsMs = 0;
+
+// ======================================================
+// 🔵🔵🔵 MOCK ECG SECTION (REMOVE FOR REAL SENSOR) 🔵🔵🔵
+// ======================================================
+// EVERYTHING INSIDE THIS BLOCK IS SIMULATION ONLY.
+// Replace getNextSample() with real ADC sampling later.
+// ======================================================
+
+static float phase = 0.0f;
+static float bpm = 72.0f;
+static const float amplitude = 1200.0f;
+static const int16_t noiseAmp = 40;
+
+float syntheticECG(float t) {
+  float p  =  0.12f * expf(-powf((t - 0.18f) / 0.035f, 2.0f));
+  float q  = -0.15f * expf(-powf((t - 0.40f) / 0.010f, 2.0f));
+  float r  =  1.20f * expf(-powf((t - 0.42f) / 0.012f, 2.0f));
+  float s  = -0.25f * expf(-powf((t - 0.45f) / 0.012f, 2.0f));
+  float tw =  0.35f * expf(-powf((t - 0.70f) / 0.060f, 2.0f));
+  return p + q + r + s + tw;
+}
+
+// 🔵 THIS FUNCTION IS THE ONLY THING YOU REPLACE LATER
+int16_t getNextSample() {
+
+  float baseFreqHz = bpm / 60.0f;
+  float phaseStep =
+    2.0f * 3.1415926f * baseFreqHz / sampleRateHz;
+
+  float t = phase / (2.0f * 3.1415926f);
+  float ecg = syntheticECG(t);
+
+  phase += phaseStep;
+  if (phase >= 2.0f * 3.1415926f)
+    phase -= 2.0f * 3.1415926f;
+
+  int16_t noise = random(-noiseAmp, noiseAmp + 1);
+
+  int32_t val = (int32_t)(amplitude * ecg) + noise;
+
+  if (val > 32767) val = 32767;
+  if (val < -32768) val = -32768;
+
+  return (int16_t)val;
+}
+
+// ======================================================
+// END OF MOCK SECTION
+// ======================================================
+
+
 
 // ======================================================
 // SETUP
 // ======================================================
 void setup() {
+
   pinMode(LED_BUILTIN, OUTPUT);
   ledOff();
 
   Serial.begin(115200);
   while (!Serial) {}
 
-  Serial.println("\n[XIAO-ECG 500Hz TEST] Boot");
-
-  randomSeed(analogRead(A0));
+  Serial.println("\n[ECG STREAMER] Boot");
 
   if (!Bluefruit.begin()) {
-    Serial.println("[BLE] ERROR: start failed");
     while (1) blinkNonBlocking(FAIL_BLINK_MS);
   }
 
-  Bluefruit.setName("XIAO-ECG");
+  // BLE throughput optimizations (KEEP)
+  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
+  Bluefruit.Periph.setConnInterval(6, 12);
   Bluefruit.setTxPower(4);
-  Bluefruit.autoConnLed(false);
+  Bluefruit.setName("XIAO-ECG");
 
   ecgService.begin();
 
   ecgChar.setProperties(CHR_PROPS_NOTIFY);
   ecgChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  ecgChar.setFixedLen(SAMPLES_PER_PACKET * 2); // 20 bytes
+  ecgChar.setFixedLen(SAMPLES_PER_PACKET * 2);
   ecgChar.begin();
 
   Bluefruit.Advertising.addService(ecgService);
@@ -102,6 +150,7 @@ void setup() {
 
   Serial.println("[BLE] Advertising...");
 }
+
 
 // ======================================================
 // LOOP
@@ -123,38 +172,24 @@ void loop() {
 
   lastSendUs += packetIntervalUs;
 
-  // --------------------------------------------------
-  // Generate 10 ECG samples (single channel)
-  // --------------------------------------------------
+  // ==================================================
+  // PACKET BUILD (THIS STAYS FOR FINAL PRODUCT)
+  // ==================================================
   uint8_t packet[SAMPLES_PER_PACKET * 2];
 
   for (int i = 0; i < SAMPLES_PER_PACKET; i++) {
 
-    float s  = sinf(phase);
-    float s2 = sinf(phase * 2.0f);
+    // 🔵 CURRENTLY MOCK
+    int16_t sample = getNextSample();
 
-    phase += phaseStep;
-    if (phase >= 2.0f * 3.1415926f)
-      phase -= 2.0f * 3.1415926f;
-
-    int16_t noise =
-      (int16_t)random(-noiseAmp, noiseAmp + 1);
-
-    int32_t val =
-      (int32_t)(amplitude * (s + 0.15f * s2)) + noise;
-
-    if (val > 32767) val = 32767;
-    if (val < -32768) val = -32768;
-
-    int16_t sample = (int16_t)val;
-
+    // Pack little-endian
     packet[i * 2]     = (uint8_t)(sample & 0xFF);
     packet[i * 2 + 1] = (uint8_t)((sample >> 8) & 0xFF);
   }
 
-  // --------------------------------------------------
-  // Send via BLE and track actual throughput
-  // --------------------------------------------------
+  // ==================================================
+  // BLE SEND (KEEP FOR FINAL PRODUCT)
+  // ==================================================
   bool sent = ecgChar.notify(packet, sizeof(packet));
 
   if (sent) {
@@ -164,21 +199,14 @@ void loop() {
     notifyFail++;
   }
 
-  // --------------------------------------------------
-  // Print true throughput every second
-  // --------------------------------------------------
+  // Optional runtime verification
   uint32_t nowMs = millis();
   if (nowMs - lastStatsMs >= 1000) {
-
-    uint32_t samplesPerSec =
-      packetsThisSecond * SAMPLES_PER_PACKET;
 
     Serial.print("[STATS] packets/sec=");
     Serial.print(packetsThisSecond);
     Serial.print(" samples/sec=");
-    Serial.print(samplesPerSec);
-    Serial.print(" notify ok=");
-    Serial.print(notifyOk);
+    Serial.print(packetsThisSecond * SAMPLES_PER_PACKET);
     Serial.print(" fail=");
     Serial.println(notifyFail);
 
