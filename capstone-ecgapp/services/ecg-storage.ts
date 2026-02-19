@@ -45,8 +45,11 @@ export async function saveCalibrationRun(
   const db = await getDb();
 
   await db.withExclusiveTransactionAsync(async (tx) => {
+    await tx.execAsync("DELETE FROM ecg_packets;");
+    await tx.execAsync("DELETE FROM ecg_runs;");
+
     await tx.runAsync(
-      "INSERT OR REPLACE INTO ecg_runs (id, started_at, ended_at, packet_count) VALUES (?, ?, ?, ?)",
+      "INSERT INTO ecg_runs (id, started_at, ended_at, packet_count) VALUES (?, ?, ?, ?)",
       runId,
       startedAt,
       endedAt,

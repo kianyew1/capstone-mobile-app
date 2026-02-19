@@ -177,7 +177,8 @@ export default function CalibrationScreen() {
     calibrationStartRef.current = Date.now();
     isFinishingRef.current = false;
 
-    const runId = `calibration_${Date.now()}`;
+    const runTimestamp = Date.now();
+    const runId = formatRunId(runTimestamp);
     const startedAt = calibrationStartRef.current ?? Date.now();
 
     const finishSuccess = async () => {
@@ -309,6 +310,16 @@ export default function CalibrationScreen() {
     `Uint8Array(${bytes.length}) [${Array.from(bytes).join(", ")}]`;
 
   const formatSeconds = (ms: number) => (ms / 1000).toFixed(1);
+
+  const formatRunId = (timestamp: number) => {
+    const date = new Date(timestamp);
+    const day = String(date.getDate()).padStart(2, "0");
+    const month = date.toLocaleString("en-US", { month: "short" });
+    const year = String(date.getFullYear()).slice(-2);
+    const hours = String(date.getHours()).padStart(2, "0");
+    const minutes = String(date.getMinutes()).padStart(2, "0");
+    return `calibration_${day}${month}${year}_${hours}${minutes}H`;
+  };
 
   const buildWavePath = (
     points: number[],
