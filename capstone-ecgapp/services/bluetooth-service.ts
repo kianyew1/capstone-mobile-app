@@ -5,7 +5,7 @@ import {
 } from "@/config/mock-config";
 import { useAppStore } from "@/stores/app-store";
 import type { BluetoothStatus, ConnectionStatus, ECGDevice } from "@/types";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { PermissionsAndroid, Platform } from "react-native";
 import {
   BleManager,
@@ -13,6 +13,7 @@ import {
   State,
   type Subscription,
 } from "react-native-ble-plx";
+import { useBluetoothStore } from "@/stores/bluetooth-store";
 
 // Service/Characteristic UUIDs for the XIAO nRF52840 ECG firmware
 // Keep in sync with nrf52480.ino
@@ -30,18 +31,20 @@ const getBleManager = (): BleManager => {
 };
 
 export function useBluetoothService() {
-  const [bluetoothStatus, setBluetoothStatus] = useState<BluetoothStatus>(
-    ENABLE_MOCK_MODE ? "poweredOn" : "unknown",
-  );
-  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>(
-    ENABLE_MOCK_MODE ? "connected" : "disconnected",
-  );
-  const [discoveredDevices, setDiscoveredDevices] = useState<ECGDevice[]>(
-    ENABLE_MOCK_MODE ? [MOCK_DEVICE] : [],
-  );
-  const [connectedDevice, setConnectedDevice] = useState<Device | null>(null);
-  const [isScanning, setIsScanning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const {
+    bluetoothStatus,
+    connectionStatus,
+    discoveredDevices,
+    connectedDevice,
+    isScanning,
+    error,
+    setBluetoothStatus,
+    setConnectionStatus,
+    setDiscoveredDevices,
+    setConnectedDevice,
+    setIsScanning,
+    setError,
+  } = useBluetoothStore();
 
   const { pairedDevice, setPairedDevice } = useAppStore();
 
@@ -60,9 +63,10 @@ export function useBluetoothService() {
       setPairedDevice(MOCK_DEVICE);
       setBluetoothStatus("poweredOn");
       setConnectionStatus("connected");
+      setDiscoveredDevices([MOCK_DEVICE]);
       console.log("🎭 Mock Mode Enabled - Using simulated ECG device");
     }
-  }, [setPairedDevice]);
+  }, [setPairedDevice, setBluetoothStatus, setConnectionStatus, setDiscoveredDevices]);
 
   // Monitor Bluetooth state
   useEffect(() => {

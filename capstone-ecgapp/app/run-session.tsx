@@ -31,6 +31,7 @@ import Animated, {
   withTiming,
 } from "react-native-reanimated";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { toByteArray } from "base64-js";
 
 import {
   AlertDialog,
@@ -49,6 +50,8 @@ import { Text } from "@/components/ui/text";
 import { ENABLE_MOCK_MODE } from "@/config/mock-config";
 import { generateMockHeartRate } from "@/services/api-service";
 import { useBluetoothService } from "@/services/bluetooth-service";
+import { uploadLatestCalibration, uploadSessionRecording } from "@/services/supabase-ecg";
+import { useAppStore } from "@/stores/app-store";
 import { useSessionStore } from "@/stores/session-store";
 
 export default function RunSessionScreen() {
@@ -59,6 +62,7 @@ export default function RunSessionScreen() {
   const heartRateRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const {
+    currentSession,
     sessionStatus,
     currentHeartRate,
     elapsedTime,
@@ -75,8 +79,16 @@ export default function RunSessionScreen() {
     updateElapsedTime,
   } = useSessionStore();
 
-  const { connectionStatus, pairedDevice } = useBluetoothService();
+  const { connectionStatus, pairedDevice, startEcgNotifications, stopEcgNotifications } =
+    useBluetoothService();
+  const { user } = useAppStore();
   const isConnected = connectionStatus === "connected";
+  const userId = user?.email ?? "unknown@local";
+
+  const sessionPacketsRef = useRef<Uint8Array[]>([]);
+  const sessionStartRef = useRef<Date | null>(null);
+  const isStreamingRef = useRef(false);
+  const hasUploadedCalibrationRef = useRef(false);
 
   // Heart pulse animation
   const heartScale = useSharedValue(1);
@@ -109,6 +121,46 @@ export default function RunSessionScreen() {
       subscription.remove();
     };
   }, []);
+
+  // Start BLE stream and upload latest calibration when session begins
+  useEffect(() => {
+    if (sessionStatus !== "running") return;
+
+    if (!hasUploadedCalibrationRef.current) {
+      hasUploadedCalibrationRef.current = true;
+      uploadLatestCalibration(userId).catch((error) => {
+        console.error("Failed to upload calibration:", error);
+      });
+    }
+
+    if (isStreamingRef.current) return;
+    isStreamingRef.current = true;
+    sessionPacketsRef.current = [];
+    sessionStartRef.current = new Date();
+
+    startEcgNotifications((payloadBase64) => {
+      if (!isStreamingRef.current) return;
+      const bytes = toByteArray(payloadBase64);
+      sessionPacketsRef.current.push(bytes);
+    }).catch((error) => {
+      console.error("Failed to start ECG stream:", error);
+    });
+  }, [sessionStatus, startEcgNotifications, userId]);
+
+  useEffect(() => {
+    if (sessionStatus === "idle" || sessionStatus === "completed") {
+      hasUploadedCalibrationRef.current = false;
+      isStreamingRef.current = false;
+      stopEcgNotifications();
+    }
+  }, [sessionStatus, stopEcgNotifications]);
+
+  useEffect(() => {
+    return () => {
+      isStreamingRef.current = false;
+      stopEcgNotifications();
+    };
+  }, [stopEcgNotifications]);
 
   // Timer logic
   useEffect(() => {
@@ -180,7 +232,39 @@ export default function RunSessionScreen() {
     }
   };
 
-  const handleEnd = () => {
+  const concatUint8Arrays = (chunks: Uint8Array[]) => {
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const result = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return result;
+  };
+
+  const handleEnd = async () => {
+    isStreamingRef.current = false;
+    stopEcgNotifications();
+
+    const chunks = sessionPacketsRef.current;
+    sessionPacketsRef.current = [];
+
+    if (chunks.length > 0) {
+      const bytes = concatUint8Arrays(chunks);
+      const sessionId = currentSession?.id ?? `session_${Date.now()}`;
+      try {
+        await uploadSessionRecording(
+          userId,
+          sessionId,
+          bytes,
+          sessionStartRef.current,
+        );
+      } catch (error) {
+        console.error("Failed to upload session recording:", error);
+      }
+    }
+
     endSession();
     // Use replace to avoid re-rendering the current screen during navigation
     // and a small delay to ensure state updates are processed
