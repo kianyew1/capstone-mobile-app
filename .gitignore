@@ -39,3 +39,7 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+backend/.env
+backend/__pycache__/app.cpython-38.pyc
+backend/calibration_request.json
+capstone-ecgapp/.env
