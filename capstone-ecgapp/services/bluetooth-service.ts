@@ -1,10 +1,12 @@
 import {
   ENABLE_MOCK_MODE,
   MOCK_DEVICE,
+  MOCK_HEART_RATE_CONFIG,
   MOCK_TIMING,
 } from "@/config/mock-config";
 import { useAppStore } from "@/stores/app-store";
 import type { BluetoothStatus, ConnectionStatus, ECGDevice } from "@/types";
+import { fromByteArray } from "base64-js";
 import { useCallback, useEffect, useRef } from "react";
 import { PermissionsAndroid, Platform } from "react-native";
 import {
@@ -27,6 +29,60 @@ let ecgListener: ((payloadBase64: string) => void) | null = null;
 let lastEcgPacketAtMs = 0;
 let lastEcgPayload: string | null = null;
 const MIN_ECG_PACKET_INTERVAL_MS = 10;
+let mockEcgInterval: ReturnType<typeof setInterval> | null = null;
+
+const MOCK_SAMPLE_RATE_HZ = 500;
+const MOCK_SAMPLES_PER_PACKET = 10;
+const MOCK_PACKET_INTERVAL_MS = Math.round(
+  (1000 * MOCK_SAMPLES_PER_PACKET) / MOCK_SAMPLE_RATE_HZ,
+);
+const MOCK_ECG_AMPLITUDE = 1200;
+const MOCK_ECG_NOISE_AMPLITUDE = 40;
+let mockPhase = 0;
+
+const syntheticEcg = (t: number) => {
+  const p = 0.12 * Math.exp(-Math.pow((t - 0.18) / 0.035, 2));
+  const q = -0.15 * Math.exp(-Math.pow((t - 0.4) / 0.01, 2));
+  const r = 1.2 * Math.exp(-Math.pow((t - 0.42) / 0.012, 2));
+  const s = -0.25 * Math.exp(-Math.pow((t - 0.45) / 0.012, 2));
+  const tw = 0.35 * Math.exp(-Math.pow((t - 0.7) / 0.06, 2));
+  return p + q + r + s + tw;
+};
+
+const nextMockSample = () => {
+  const baseFreqHz = MOCK_HEART_RATE_CONFIG.baseHeartRate / 60;
+  const phaseStep =
+    (2 * Math.PI * baseFreqHz) / MOCK_SAMPLE_RATE_HZ;
+
+  const t = mockPhase / (2 * Math.PI);
+  const ecg = syntheticEcg(t);
+
+  mockPhase += phaseStep;
+  if (mockPhase >= 2 * Math.PI) {
+    mockPhase -= 2 * Math.PI;
+  }
+
+  const noise =
+    Math.floor(Math.random() * (MOCK_ECG_NOISE_AMPLITUDE * 2 + 1)) -
+    MOCK_ECG_NOISE_AMPLITUDE;
+  let value = Math.round(MOCK_ECG_AMPLITUDE * ecg + noise);
+
+  if (value > 32767) value = 32767;
+  if (value < -32768) value = -32768;
+
+  return value;
+};
+
+const buildMockPacket = () => {
+  const packet = new Uint8Array(MOCK_SAMPLES_PER_PACKET * 2);
+  for (let i = 0; i < MOCK_SAMPLES_PER_PACKET; i += 1) {
+    const sample = nextMockSample();
+    const unsigned = sample < 0 ? 0x10000 + sample : sample;
+    packet[i * 2] = unsigned & 0xff;
+    packet[i * 2 + 1] = (unsigned >> 8) & 0xff;
+  }
+  return packet;
+};
 
 const getBleManager = (): BleManager => {
   if (!bleManagerInstance) {
@@ -421,13 +477,32 @@ export function useBluetoothService() {
 
   const stopEcgNotifications = useCallback(() => {
     ecgListener = null;
+    if (mockEcgInterval) {
+      clearInterval(mockEcgInterval);
+      mockEcgInterval = null;
+      console.log("🎭 Mock ECG stream stopped");
+    }
   }, []);
 
   const startEcgNotifications = useCallback(
     async (onData: (payloadBase64: string) => void): Promise<boolean> => {
       if (ENABLE_MOCK_MODE) {
-        setError("Mock mode is enabled. Disable it to use real hardware.");
-        return false;
+        setError(null);
+        ecgListener = onData;
+
+        if (mockEcgInterval) {
+          return true;
+        }
+
+        mockEcgInterval = setInterval(() => {
+          if (!ecgListener) return;
+          const packet = buildMockPacket();
+          const payload = fromByteArray(packet);
+          ecgListener(payload);
+        }, MOCK_PACKET_INTERVAL_MS);
+
+        console.log("🎭 Mock ECG stream started");
+        return true;
       }
 
       setError(null);

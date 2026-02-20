@@ -6,23 +6,22 @@ Mock Mode allows you to develop and test the entire ECG monitoring flow without 
 
 ## Enabling/Disabling Mock Mode
 
-Mock mode is controlled by a single configuration flag in:
+Mock mode is controlled by an environment flag:
 
-```typescript
-config / mock - config.ts;
+```bash
+# .env
+EXPO_PUBLIC_MOCK_MODE=DEV
 ```
 
-To enable mock mode:
+Supported values:
 
-```typescript
-export const ENABLE_MOCK_MODE = true;
-```
+- `DEV` (default): mock mode is enabled in development builds and disabled in production builds.
+- `PROD`: mock mode is enabled in production builds and disabled in development builds.
 
-To disable mock mode (when you have real hardware):
+To disable mock mode for real hardware:
 
-```typescript
-export const ENABLE_MOCK_MODE = false;
-```
+- In development builds, set `EXPO_PUBLIC_MOCK_MODE=PROD`.
+- In production builds, set `EXPO_PUBLIC_MOCK_MODE=DEV`.
 
 ## What Mock Mode Provides
 
@@ -136,7 +135,7 @@ MOCK_TIMING.scanDuration = 5000; // 5 seconds
 
 **Issue**: Mock mode not activating
 
-- **Solution**: Verify `ENABLE_MOCK_MODE = true` in config/mock-config.ts
+- **Solution**: Verify `EXPO_PUBLIC_MOCK_MODE=DEV` in `.env`
 - Restart the development server after changing the flag
 
 **Issue**: Real hardware interfering

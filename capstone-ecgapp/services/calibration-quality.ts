@@ -1,10 +1,9 @@
-const BACKEND_URL =
-  process.env.EXPO_PUBLIC_BACKEND_URL ?? "http://127.0.0.1:8001";
+import { BACKEND_BASE_URL } from "@/config/runtime-config";
 
 export async function getCalibrationSignalQuality(
   bytes: Uint8Array,
 ): Promise<{ qualityPercentage: number; signalSuitable: boolean }> {
-  const url = `${BACKEND_URL}/calibration_signal_quality_check`;
+  const url = `${BACKEND_BASE_URL}/calibration_signal_quality_check`;
   console.log(`LOG ${url}`);
   const response = await fetch(url, {
     method: "POST",

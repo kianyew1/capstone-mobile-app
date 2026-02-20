@@ -4,10 +4,19 @@
  * Enable mock mode to use simulated Bluetooth devices and ECG data
  * for development and prototyping without physical hardware.
  *
- * Set ENABLE_MOCK_MODE to false when you have actual hardware.
+ * Use EXPO_PUBLIC_MOCK_MODE=DEV|PROD to control when mock mode is enabled.
  */
 
-export const ENABLE_MOCK_MODE = false;
+const MOCK_MODE_TARGET = (process.env.EXPO_PUBLIC_MOCK_MODE ?? "DEV")
+  .toUpperCase()
+  .trim();
+
+export const ENABLE_MOCK_MODE =
+  MOCK_MODE_TARGET === "PROD"
+    ? !__DEV__
+    : MOCK_MODE_TARGET === "DEV"
+      ? __DEV__
+      : false;
 
 /**
  * Mock device configuration
