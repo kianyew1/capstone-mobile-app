@@ -1,0 +1,23 @@
+create table public.ecg_recordings (
+  id uuid not null default gen_random_uuid (),
+  user_id text not null,
+  created_at timestamp with time zone null default now(),
+  bucket text not null default 'YOUR_BUCKET_NAME'::text,
+  session_object_key text not null,
+  encoding text not null default 'int16_le'::text,
+  sample_rate_hz integer not null default 500,
+  channels smallint not null default 1,
+  sample_count integer not null,
+  duration_ms integer not null,
+  start_time timestamp with time zone null,
+  device_time_us bigint null,
+  byte_length integer null,
+  sha256 text null,
+  device_id text null,
+  firmware_version text null,
+  notes text null,
+  calibration_object_key text not null,
+  constraint ecg_recordings_pkey primary key (id)
+) TABLESPACE pg_default;
+
+create index IF not exists ecg_recordings_user_created_idx on public.ecg_recordings using btree (user_id, created_at desc) TABLESPACE pg_default;

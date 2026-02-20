@@ -1,0 +1,13 @@
+[project]
+name = "capstone-ecgapp-backend"
+version = "0.1.0"
+description = "FastAPI backend for capstone ECG app"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi[standard]",
+]
+
+[tool.fastapi]
+# Entrypoint for FastAPI CLI and FastAPI Cloud.
+entrypoint = "app:app"
