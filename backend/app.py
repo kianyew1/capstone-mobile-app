@@ -212,9 +212,72 @@ def _compute_window_qualities(
     return qualities
 
 
+def _compute_metrics(
+    samples: List[int],
+    sample_rate_hz: int,
+) -> Dict[str, Optional[float]]:
+    metrics: Dict[str, Optional[float]] = {
+        "avg_hr_bpm": None,
+        "min_hr_bpm": None,
+        "max_hr_bpm": None,
+        "hrv_rmssd_ms": None,
+        "hrv_sdnn_ms": None,
+        "hrv_meannn_ms": None,
+        "r_peak_count": None,
+    }
+    if not samples:
+        return metrics
+
+    try:
+        with warnings.catch_warnings():
+            try:
+                from pandas.errors import ChainedAssignmentError
+            except Exception:  # pragma: no cover - pandas compatibility
+                ChainedAssignmentError = Warning  # type: ignore
+            warnings.filterwarnings("ignore", category=ChainedAssignmentError)
+            warnings.filterwarnings(
+                "ignore",
+                message=".*ChainedAssignmentError.*",
+            )
+            cleaned = nk.ecg_clean(samples, sampling_rate=sample_rate_hz)
+            peaks, info = nk.ecg_peaks(cleaned, sampling_rate=sample_rate_hz)
+
+        r_peaks = info.get("ECG_R_Peaks", [])
+        metrics["r_peak_count"] = float(len(r_peaks)) if r_peaks is not None else 0.0
+
+        if r_peaks is not None and len(r_peaks) > 1:
+            rate = nk.ecg_rate(
+                r_peaks,
+                sampling_rate=sample_rate_hz,
+                desired_length=len(cleaned),
+            )
+            if hasattr(rate, "__len__") and len(rate) > 0:
+                metrics["avg_hr_bpm"] = float(sum(rate) / len(rate))
+                metrics["min_hr_bpm"] = float(min(rate))
+                metrics["max_hr_bpm"] = float(max(rate))
+
+            hrv = nk.hrv_time(info, sampling_rate=sample_rate_hz)
+            if not hrv.empty:
+                row = hrv.iloc[0]
+                metrics["hrv_rmssd_ms"] = (
+                    float(row["RMSSD"]) if "RMSSD" in row else None
+                )
+                metrics["hrv_sdnn_ms"] = (
+                    float(row["SDNN"]) if "SDNN" in row else None
+                )
+                metrics["hrv_meannn_ms"] = (
+                    float(row["MeanNN"]) if "MeanNN" in row else None
+                )
+    except Exception as exc:  # pragma: no cover - safeguard
+        logger.error("[METRICS] failed error=%s", exc)
+
+    return metrics
+
+
 def _select_top_windows(
     samples: List[int],
     qualities: List[Dict[str, Any]],
+    sample_rate_hz: int,
     top_k: int = 3,
     max_points: int = 800,
 ) -> List[Dict[str, Any]]:
@@ -228,12 +291,14 @@ def _select_top_windows(
         start = int(item["start_index"])
         end = int(item["end_index"])
         window = samples[start:end]
+        metrics = _compute_metrics(window, sample_rate_hz=sample_rate_hz)
         results.append(
             {
                 "start_index": start,
                 "end_index": end,
                 "quality": item["quality"],
                 "data": _decimate(window, max_points=max_points),
+                "metrics": metrics,
             }
         )
     return results
@@ -512,8 +577,13 @@ def _session_analysis_job(job_id: str, record_id: str) -> None:
         best_windows = _select_top_windows(
             session_samples,
             quality_windows,
+            sample_rate_hz=sample_rate_hz,
             top_k=3,
             max_points=800,
+        )
+        calibration_metrics = _compute_metrics(
+            calibration_samples,
+            sample_rate_hz=sample_rate_hz,
         )
 
         LAST_ANALYSIS_PLOT["session"] = {
@@ -530,6 +600,7 @@ def _session_analysis_job(job_id: str, record_id: str) -> None:
             "byte_length": len(calibration_bytes),
             "sample_count": len(calibration_samples),
             "data": _decimate(calibration_samples),
+            "metrics": calibration_metrics,
         }
 
         _set_job(job_id, status="decoded")
@@ -722,6 +793,30 @@ def root() -> str:
     has_session = bool(session_plot and session_plot.get("data"))
     has_best_windows = bool(session_plot and session_plot.get("best_windows"))
     best_windows = session_plot.get("best_windows") if session_plot else []
+
+    def _format_metric(label: str, value: Optional[float], unit: str = "") -> str:
+        if value is None:
+            return f"<li>{label}: n/a</li>"
+        return f"<li>{label}: {value:.2f}{unit}</li>"
+
+    def _metrics_html(metrics: Optional[Dict[str, Optional[float]]]) -> str:
+        if not metrics:
+            return "<div>No metrics available.</div>"
+        items = [
+            _format_metric("Avg HR", metrics.get("avg_hr_bpm"), " bpm"),
+            _format_metric("Min HR", metrics.get("min_hr_bpm"), " bpm"),
+            _format_metric("Max HR", metrics.get("max_hr_bpm"), " bpm"),
+            _format_metric("HRV RMSSD", metrics.get("hrv_rmssd_ms"), " ms"),
+            _format_metric("HRV SDNN", metrics.get("hrv_sdnn_ms"), " ms"),
+            _format_metric("HRV MeanNN", metrics.get("hrv_meannn_ms"), " ms"),
+            _format_metric("R Peaks", metrics.get("r_peak_count"), ""),
+        ]
+        return "<ul class='metrics'>" + "".join(items) + "</ul>"
+
+    calibration_metrics_html = _metrics_html(
+        calibration_plot.get("metrics") if calibration_plot else None
+    )
+
     best_windows_html = "".join(
         [
             (
@@ -729,6 +824,7 @@ def root() -> str:
                 f"{item['start_index']}-{item['end_index']}</div>"
                 f"<canvas class='mini-canvas' id='window-{i}' "
                 f"width='360' height='160'></canvas>"
+                f"{_metrics_html(item.get('metrics'))}"
             )
             for i, item in enumerate(best_windows)
         ]
@@ -748,6 +844,7 @@ def root() -> str:
       .left {{ flex: 2; min-width: 0; }}
       .right {{ flex: 1; min-width: 280px; }}
       .mini-canvas {{ width: 100%; height: 160px; }}
+      .metrics {{ margin: 8px 0 16px; padding-left: 18px; color: #cbd5f5; }}
     </style>
   </head>
   <body>
@@ -774,6 +871,11 @@ def root() -> str:
       </div>
 
       <div class="right">
+        <div class="panel">
+          <h2>Calibration Metrics</h2>
+          {calibration_metrics_html}
+        </div>
+
         <div class="panel">
           <h2>Top 3 Windows (20s)</h2>
           {"<div>No top windows computed yet.</div>" if not has_best_windows else ""}
