@@ -2,12 +2,14 @@ import base64
 import json
 import logging
 import os
+import warnings
 from math import sqrt
 from typing import Any, Dict, List, Optional, Union
 from uuid import uuid4
 
 from dotenv import load_dotenv
 import httpx
+import neurokit2 as nk
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -155,6 +157,86 @@ def _decimate(samples: List[int], max_points: int = 2000) -> List[int]:
         return samples
     step = max(1, len(samples) // max_points)
     return samples[::step]
+
+
+def _compute_window_qualities(
+    samples: List[int],
+    sample_rate_hz: int,
+    window_seconds: int = 20,
+) -> List[Dict[str, Any]]:
+    window_size = sample_rate_hz * window_seconds
+    if window_size <= 0:
+        return []
+    window_count = len(samples) // window_size
+    qualities: List[Dict[str, Any]] = []
+    for index in range(window_count):
+        start = index * window_size
+        end = start + window_size
+        window = samples[start:end]
+        quality_value = None
+        try:
+            with warnings.catch_warnings():
+                try:
+                    from pandas.errors import ChainedAssignmentError
+                except Exception:  # pragma: no cover - pandas compatibility
+                    ChainedAssignmentError = Warning  # type: ignore
+                warnings.filterwarnings("ignore", category=ChainedAssignmentError)
+                warnings.filterwarnings(
+                    "ignore",
+                    message=".*ChainedAssignmentError.*",
+                )
+                cleaned = nk.ecg_clean(window, sampling_rate=sample_rate_hz)
+                quality = nk.ecg_quality(
+                    cleaned,
+                    sampling_rate=sample_rate_hz,
+                    method="averageQRS",
+                )
+            if hasattr(quality, "__len__") and len(quality) > 0:
+                quality_value = float(sum(quality) / len(quality))
+        except Exception as exc:  # pragma: no cover - safeguard
+            logger.error(
+                "[QUALITY] window_failed index=%s error=%s",
+                index,
+                exc,
+            )
+        qualities.append(
+            {
+                "index": index,
+                "start_index": start,
+                "end_index": end,
+                "start_sec": index * window_seconds,
+                "end_sec": (index + 1) * window_seconds,
+                "quality": quality_value,
+            }
+        )
+    return qualities
+
+
+def _select_top_windows(
+    samples: List[int],
+    qualities: List[Dict[str, Any]],
+    top_k: int = 3,
+    max_points: int = 800,
+) -> List[Dict[str, Any]]:
+    ranked = [
+        item for item in qualities if item.get("quality") is not None
+    ]
+    ranked.sort(key=lambda item: float(item["quality"]), reverse=True)
+    selected = ranked[:top_k]
+    results: List[Dict[str, Any]] = []
+    for item in selected:
+        start = int(item["start_index"])
+        end = int(item["end_index"])
+        window = samples[start:end]
+        results.append(
+            {
+                "start_index": start,
+                "end_index": end,
+                "quality": item["quality"],
+                "data": _decimate(window, max_points=max_points),
+            }
+        )
+    return results
 
 
 def _set_job(job_id: str, **fields: Any) -> None:
@@ -420,6 +502,19 @@ def _session_analysis_job(job_id: str, record_id: str) -> None:
         calibration_bytes = _fetch_storage_bytes(calibration_key)
         session_samples = _decode_int16_le(session_bytes)
         calibration_samples = _decode_int16_le(calibration_bytes)
+        sample_rate_hz = int(record.get("sample_rate_hz") or 500)
+
+        quality_windows = _compute_window_qualities(
+            session_samples,
+            sample_rate_hz=sample_rate_hz,
+            window_seconds=20,
+        )
+        best_windows = _select_top_windows(
+            session_samples,
+            quality_windows,
+            top_k=3,
+            max_points=800,
+        )
 
         LAST_ANALYSIS_PLOT["session"] = {
             "object_key": session_key,
@@ -427,6 +522,7 @@ def _session_analysis_job(job_id: str, record_id: str) -> None:
             "byte_length": len(session_bytes),
             "sample_count": len(session_samples),
             "data": _decimate(session_samples),
+            "best_windows": best_windows,
         }
         LAST_ANALYSIS_PLOT["calibration"] = {
             "object_key": calibration_key,
@@ -442,6 +538,11 @@ def _session_analysis_job(job_id: str, record_id: str) -> None:
             job_id,
             len(session_samples),
             len(calibration_samples),
+        )
+        logger.info(
+            "[JOB] best_windows job_id=%s count=%s",
+            job_id,
+            len(best_windows),
         )
     except HTTPException as exc:
         _set_job(job_id, status="error", error=exc.detail)
@@ -619,6 +720,19 @@ def root() -> str:
 
     has_calibration = bool(calibration_plot and calibration_plot.get("data"))
     has_session = bool(session_plot and session_plot.get("data"))
+    has_best_windows = bool(session_plot and session_plot.get("best_windows"))
+    best_windows = session_plot.get("best_windows") if session_plot else []
+    best_windows_html = "".join(
+        [
+            (
+                f"<div class='meta'>Window {i + 1}: samples "
+                f"{item['start_index']}-{item['end_index']}</div>"
+                f"<canvas class='mini-canvas' id='window-{i}' "
+                f"width='360' height='160'></canvas>"
+            )
+            for i, item in enumerate(best_windows)
+        ]
+    )
 
     return f"""<!doctype html>
 <html>
@@ -630,13 +744,19 @@ def root() -> str:
       .meta {{ margin-bottom: 12px; color: #a3a3a3; }}
       canvas {{ background: #111827; border: 1px solid #1f2937; }}
       .panel {{ margin-bottom: 24px; }}
+      .layout {{ display: flex; gap: 24px; align-items: flex-start; }}
+      .left {{ flex: 2; min-width: 0; }}
+      .right {{ flex: 1; min-width: 280px; }}
+      .mini-canvas {{ width: 100%; height: 160px; }}
     </style>
   </head>
   <body>
     <h1>ECG Session Verification</h1>
     {"<div>No analysis data received yet.</div>" if not (has_calibration or has_session) else ""}
 
-    <div class="panel">
+    <div class="layout">
+      <div class="left">
+        <div class="panel">
       <h2>Calibration Signal</h2>
       <div class="meta">filepath={(calibration_plot["bucket"] + "/" + calibration_plot["object_key"]) if calibration_plot else "n/a"}</div>
       <div class="meta">byte_length={calibration_plot["byte_length"] if calibration_plot else 0} | sample_count={calibration_plot["sample_count"] if calibration_plot else 0}</div>
@@ -651,9 +771,20 @@ def root() -> str:
       {"<div>No session data received yet.</div>" if not has_session else ""}
       <canvas id="session" width="1200" height="300"></canvas>
     </div>
+      </div>
+
+      <div class="right">
+        <div class="panel">
+          <h2>Top 3 Windows (20s)</h2>
+          {"<div>No top windows computed yet.</div>" if not has_best_windows else ""}
+          {best_windows_html}
+        </div>
+      </div>
+    </div>
     <script>
       const calibrationData = {calibration_plot["data"] if calibration_plot else []};
       const sessionData = {session_plot["data"] if session_plot else []};
+      const bestWindows = {best_windows};
 
       function drawSignal(canvasId, data, color) {{
         const canvas = document.getElementById(canvasId);
@@ -687,6 +818,11 @@ def root() -> str:
 
       drawSignal("calibration", calibrationData, "#22c55e");
       drawSignal("session", sessionData, "#38bdf8");
+
+      for (let i = 0; i < bestWindows.length; i += 1) {{
+        const data = bestWindows[i]?.data ?? [];
+        drawSignal("window-" + i, data, "#f59e0b");
+      }}
     </script>
   </body>
 </html>"""
