@@ -91,6 +91,11 @@ const getBleManager = (): BleManager => {
   return bleManagerInstance;
 };
 
+type MockEcgOptions = {
+  mockPacketIntervalMs?: number;
+  mockPacketsPerTick?: number;
+};
+
 export function useBluetoothService() {
   const {
     bluetoothStatus,
@@ -485,7 +490,10 @@ export function useBluetoothService() {
   }, []);
 
   const startEcgNotifications = useCallback(
-    async (onData: (payloadBase64: string) => void): Promise<boolean> => {
+    async (
+      onData: (payloadBase64: string) => void,
+      options?: MockEcgOptions,
+    ): Promise<boolean> => {
       if (ENABLE_MOCK_MODE) {
         setError(null);
         ecgListener = onData;
@@ -494,12 +502,21 @@ export function useBluetoothService() {
           return true;
         }
 
+        const intervalMs =
+          options?.mockPacketIntervalMs ?? MOCK_PACKET_INTERVAL_MS;
+        const packetsPerTick = Math.max(
+          1,
+          options?.mockPacketsPerTick ?? 1,
+        );
+
         mockEcgInterval = setInterval(() => {
           if (!ecgListener) return;
-          const packet = buildMockPacket();
-          const payload = fromByteArray(packet);
-          ecgListener(payload);
-        }, MOCK_PACKET_INTERVAL_MS);
+          for (let i = 0; i < packetsPerTick; i += 1) {
+            const packet = buildMockPacket();
+            const payload = fromByteArray(packet);
+            ecgListener(payload);
+          }
+        }, intervalMs);
 
         console.log("🎭 Mock ECG stream started");
         return true;

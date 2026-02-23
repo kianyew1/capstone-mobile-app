@@ -43,6 +43,7 @@ export default function CalibrationScreen() {
   const params = useLocalSearchParams<{ fromOnboarding?: string }>();
   const isFromOnboarding = params.fromOnboarding === "true";
   const targetPacketCount = 1000;
+  const calibrationSeconds = ENABLE_MOCK_MODE ? 5 : 30;
   const SHOW_CALIBRATION_GRAPH = true;
 
   const [step, setStep] = useState<CalibrationStep>("guidance");
@@ -239,7 +240,8 @@ export default function CalibrationScreen() {
       setStep("result");
     };
 
-    const started = await startEcgNotifications((payloadBase64) => {
+    const started = await startEcgNotifications(
+      (payloadBase64) => {
       if (isFinishingRef.current) return;
 
       const bytes = toByteArray(payloadBase64);
@@ -262,7 +264,9 @@ export default function CalibrationScreen() {
       if (count >= targetPacketCount) {
         void finishSuccess();
       }
-    });
+      },
+      ENABLE_MOCK_MODE ? { mockPacketsPerTick: 4 } : undefined,
+    );
 
     if (!started) {
       finishFailure(
@@ -490,7 +494,7 @@ export default function CalibrationScreen() {
       </Text>
       <Text className="text-muted-foreground text-center mb-8">
         Make sure your device is positioned correctly and you're comfortable.
-        The calibration will take about 30 seconds.
+        The calibration will take about {calibrationSeconds} seconds.
       </Text>
 
       <View className="w-full gap-3">
@@ -520,7 +524,7 @@ export default function CalibrationScreen() {
       </Text>
       <Text className="text-muted-foreground text-center mb-8">
         Please remain still while we calibrate your device. This will take about
-        30 seconds.
+        {calibrationSeconds} seconds.
       </Text>
 
       <View className="w-full mb-4">

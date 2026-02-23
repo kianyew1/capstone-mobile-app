@@ -55,6 +55,7 @@ import {
   finalizeSessionRecording,
   uploadCalibrationFile,
 } from "@/services/supabase-ecg";
+import { startSessionAnalysis } from "@/services/session-analysis";
 import { useAppStore } from "@/stores/app-store";
 import { useSessionStore } from "@/stores/session-store";
 
@@ -156,6 +157,11 @@ export default function RunSessionScreen() {
         })
         .then((record) => {
           recordIdRef.current = record.recordId ?? null;
+          if (recordIdRef.current) {
+            console.log(
+              `[SESSION] Supabase record created record_id=${recordIdRef.current}`,
+            );
+          }
         })
         .catch((error) => {
           console.error("Failed to prepare session upload:", error);
@@ -287,6 +293,9 @@ export default function RunSessionScreen() {
       const recordId = recordIdRef.current;
       try {
         if (recordId) {
+          console.log(
+            `[SESSION] finalize upload record_id=${recordId} bytes=${bytes.length}`,
+          );
           await finalizeSessionRecording({
             recordId,
             userId,
@@ -294,12 +303,22 @@ export default function RunSessionScreen() {
             bytes,
             startTime: sessionStartRef.current,
           });
+          console.log(
+            `[SESSION] finalize complete record_id=${recordId} bytes=${bytes.length}`,
+          );
+          try {
+            await startSessionAnalysis(recordId);
+          } catch (error) {
+            console.error("Failed to start session analysis:", error);
+          }
         } else {
           console.warn("No Supabase record id available; session upload skipped.");
         }
       } catch (error) {
         console.error("Failed to upload session recording:", error);
       }
+    } else {
+      console.warn("No session bytes captured; analysis not started.");
     }
 
     endSession();

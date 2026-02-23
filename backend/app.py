@@ -1,17 +1,26 @@
 import base64
 import json
+import logging
 import os
 from math import sqrt
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
+from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+import httpx
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 load_dotenv()
 
 app = FastAPI()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s %(message)s",
+)
+logger = logging.getLogger("ecg-backend")
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8001"
 BASE_URL = os.getenv("BASE_URL") or DEFAULT_BASE_URL
@@ -21,6 +30,80 @@ LAST_CALIBRATION_META = {
     "byte_length": 0,
     "sample_count": 0,
 }
+
+ANALYSIS_JOBS: Dict[str, Dict[str, Any]] = {}
+
+
+def _get_supabase_config() -> Dict[str, str]:
+    url = os.getenv("EXPO_PUBLIC_SUPABASE_URL") or os.getenv("SUPABASE_URL")
+    key = (
+        os.getenv("EXPO_PUBLIC_SUPABASE_ANON_KEY")
+        or os.getenv("SUPABASE_ANON_KEY")
+    )
+    if not url or not key:
+        raise HTTPException(
+            status_code=500,
+            detail="Missing Supabase env vars: EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.",
+        )
+    return {"url": url, "key": key}
+
+
+def _fetch_recording_by_id(record_id: str) -> Dict[str, Any]:
+    config = _get_supabase_config()
+    logger.info("[FETCH] start record_id=%s", record_id)
+    select_fields = ",".join(
+        [
+            "id",
+            "user_id",
+            "bucket",
+            "session_object_key",
+            "calibration_object_key",
+            "encoding",
+            "sample_rate_hz",
+            "channels",
+            "sample_count",
+            "duration_ms",
+            "byte_length",
+            "created_at",
+        ]
+    )
+    url = f"{config['url']}/rest/v1/ecg_recordings"
+    params = {
+        "id": f"eq.{record_id}",
+        "select": select_fields,
+    }
+    headers = {
+        "apikey": config["key"],
+        "Authorization": f"Bearer {config['key']}",
+        "Accept": "application/json",
+    }
+    try:
+        with httpx.Client(timeout=30) as client:
+            response = client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase REST error: {exc.response.status_code} {exc.response.text}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase REST unreachable: {exc}",
+        ) from exc
+
+    if not data:
+        logger.warning("[FETCH] not_found record_id=%s", record_id)
+        raise HTTPException(status_code=404, detail="Recording not found.")
+    logger.info("[FETCH] success record_id=%s", record_id)
+    return data[0]
+
+
+def _set_job(job_id: str, **fields: Any) -> None:
+    job = ANALYSIS_JOBS.get(job_id, {})
+    job.update(fields)
+    ANALYSIS_JOBS[job_id] = job
 
 
 # ----------------------------
@@ -46,6 +129,17 @@ class SessionAnalysisRequest(BaseModel):
     # raw_signal_base64: Optional[str] = Field(
     #     None, description="Raw session bytes (base64). Avoid for large payloads."
     # )
+
+class SessionAnalysisStartRequest(BaseModel):
+    record_id: str = Field(..., description="Supabase ecg_recordings.id")
+
+
+class SessionAnalysisJob(BaseModel):
+    job_id: str
+    status: str
+    record_id: str
+    details: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
 
 
 class CleanWindow(BaseModel):
@@ -300,6 +394,77 @@ async def session_signal_quality_check(
         "quality_percentage": round(quality, 2),
         "signal_suitable": signal_suitable,
     }
+
+def _session_analysis_job(job_id: str, record_id: str) -> None:
+    logger.info("[JOB] start job_id=%s record_id=%s", job_id, record_id)
+    _set_job(job_id, status="running")
+    try:
+        record = _fetch_recording_by_id(record_id)
+        _set_job(job_id, status="fetched", details=record)
+        logger.info(
+            "[JOB] fetched job_id=%s record_id=%s session_object_key=%s calibration_object_key=%s",
+            job_id,
+            record_id,
+            record.get("session_object_key"),
+            record.get("calibration_object_key"),
+        )
+    except HTTPException as exc:
+        _set_job(job_id, status="error", error=exc.detail)
+        logger.error(
+            "[JOB] error job_id=%s record_id=%s detail=%s",
+            job_id,
+            record_id,
+            exc.detail,
+        )
+    except Exception as exc:  # pragma: no cover - safeguard
+        _set_job(job_id, status="error", error=str(exc))
+        logger.exception(
+            "[JOB] unexpected_error job_id=%s record_id=%s",
+            job_id,
+            record_id,
+        )
+
+
+@app.post("/session_analysis/start", response_model=SessionAnalysisJob)
+async def session_analysis_start(
+    payload: SessionAnalysisStartRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+) -> SessionAnalysisJob:
+    job_id = uuid4().hex
+    _set_job(job_id, status="queued", record_id=payload.record_id)
+    background_tasks.add_task(_session_analysis_job, job_id, payload.record_id)
+    logger.info(
+        "[API] %s record_id=%s job_id=%s",
+        request.url.path,
+        payload.record_id,
+        job_id,
+    )
+    return SessionAnalysisJob(
+        job_id=job_id,
+        status="queued",
+        record_id=payload.record_id,
+    )
+
+
+@app.get("/session_analysis/status/{job_id}", response_model=SessionAnalysisJob)
+async def session_analysis_status(job_id: str) -> SessionAnalysisJob:
+    job = ANALYSIS_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    logger.info(
+        "[API] /session_analysis/status record_id=%s job_id=%s status=%s",
+        job.get("record_id", ""),
+        job_id,
+        job.get("status", "unknown"),
+    )
+    return SessionAnalysisJob(
+        job_id=job_id,
+        status=job.get("status", "unknown"),
+        record_id=job.get("record_id", ""),
+        details=job.get("details"),
+        error=job.get("error"),
+    )
 
 
 # ----------------------------
