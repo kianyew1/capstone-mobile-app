@@ -56,9 +56,22 @@ interface SessionState {
   setSyncing: (isSyncing: boolean) => void;
   setSyncProgress: (progress: number) => void;
 
+  // Pending upload
+  pendingUpload: PendingUpload | null;
+  setPendingUpload: (payload: PendingUpload | null) => void;
+  clearPendingUpload: () => void;
+
   // Reset
   resetSession: () => void;
 }
+
+type PendingUpload = {
+  recordId: string;
+  sessionId: string;
+  startTimeIso: string | null;
+  packets: Uint8Array[];
+  useMock: boolean;
+};
 
 const initialState = {
   currentSession: null,
@@ -77,6 +90,7 @@ const initialState = {
   isSyncing: false,
   syncProgress: 0,
   lastSyncTime: null,
+  pendingUpload: null,
 };
 
 export const useSessionStore = create<SessionState>((set, get) => ({
@@ -202,6 +216,14 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   setSyncProgress: (progress: number) => {
     set({ syncProgress: progress });
+  },
+
+  setPendingUpload: (payload: PendingUpload | null) => {
+    set({ pendingUpload: payload });
+  },
+
+  clearPendingUpload: () => {
+    set({ pendingUpload: null });
   },
 
   resetSession: () => {

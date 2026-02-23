@@ -52,10 +52,8 @@ import { generateMockHeartRate } from "@/services/api-service";
 import { useBluetoothService } from "@/services/bluetooth-service";
 import {
   createSessionRecordAtStart,
-  finalizeSessionRecording,
   uploadCalibrationFile,
 } from "@/services/supabase-ecg";
-import { startSessionAnalysis } from "@/services/session-analysis";
 import { useAppStore } from "@/stores/app-store";
 import { useSessionStore } from "@/stores/session-store";
 
@@ -82,6 +80,7 @@ export default function RunSessionScreen() {
     addHeartRateData,
     addEventMarker,
     updateElapsedTime,
+    setPendingUpload,
   } = useSessionStore();
 
   const { connectionStatus, pairedDevice, startEcgNotifications, stopEcgNotifications } =
@@ -140,7 +139,9 @@ export default function RunSessionScreen() {
     if (!hasPreparedUploadRef.current) {
       hasPreparedUploadRef.current = true;
 
-      const sessionId = currentSession?.id ?? `session_${Date.now()}`;
+      const sessionId = formatSessionId(
+        sessionStartRef.current ?? new Date(),
+      );
       sessionIdRef.current = sessionId;
 
       uploadCalibrationFile()
@@ -256,6 +257,15 @@ export default function RunSessionScreen() {
     return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
   };
 
+  const formatSessionId = (timestamp: Date) => {
+    const day = String(timestamp.getDate()).padStart(2, "0");
+    const month = timestamp.toLocaleString("en-US", { month: "short" });
+    const year = String(timestamp.getFullYear()).slice(-2);
+    const hours = String(timestamp.getHours()).padStart(2, "0");
+    const minutes = String(timestamp.getMinutes()).padStart(2, "0");
+    return `session_${day}${month}${year}_${hours}${minutes}H`;
+  };
+
   const handleStart = () => {
     startSession();
     setShowBackgroundTip(true);
@@ -269,61 +279,32 @@ export default function RunSessionScreen() {
     }
   };
 
-  const concatUint8Arrays = (chunks: Uint8Array[]) => {
-    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const result = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return result;
-  };
-
   const handleEnd = async () => {
     isStreamingRef.current = false;
     stopEcgNotifications();
 
     const chunks = sessionPacketsRef.current;
     sessionPacketsRef.current = [];
+    const recordId = recordIdRef.current;
+    const sessionId = sessionIdRef.current;
 
-    if (chunks.length > 0) {
-      const bytes = concatUint8Arrays(chunks);
-      const sessionId = sessionIdRef.current ?? currentSession?.id ?? `session_${Date.now()}`;
-      const recordId = recordIdRef.current;
-      try {
-        if (recordId) {
-          console.log(
-            `[SESSION] finalize upload record_id=${recordId} bytes=${bytes.length}`,
-          );
-          await finalizeSessionRecording({
-            recordId,
-            userId,
-            sessionId,
-            bytes,
-            startTime: sessionStartRef.current,
-          });
-          console.log(
-            `[SESSION] finalize complete record_id=${recordId} bytes=${bytes.length}`,
-          );
-          try {
-            await startSessionAnalysis(recordId);
-          } catch (error) {
-            console.error("Failed to start session analysis:", error);
-          }
-        } else {
-          console.warn("No Supabase record id available; session upload skipped.");
-        }
-      } catch (error) {
-        console.error("Failed to upload session recording:", error);
-      }
+    if (!recordId || !sessionId) {
+      console.warn("Missing session identifiers; upload will be skipped.");
     } else {
-      console.warn("No session bytes captured; analysis not started.");
+      if (chunks.length === 0 && !ENABLE_MOCK_MODE) {
+        console.warn("No session bytes captured; upload will be skipped.");
+      }
+
+      setPendingUpload({
+        recordId,
+        sessionId,
+        startTimeIso: sessionStartRef.current?.toISOString() ?? null,
+        packets: chunks,
+        useMock: ENABLE_MOCK_MODE,
+      });
     }
 
     endSession();
-    // Use replace to avoid re-rendering the current screen during navigation
-    // and a small delay to ensure state updates are processed
     setTimeout(() => {
       router.replace("/run-summary");
     }, 100);

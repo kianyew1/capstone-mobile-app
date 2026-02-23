@@ -32,6 +32,10 @@ LAST_CALIBRATION_META = {
 }
 
 ANALYSIS_JOBS: Dict[str, Dict[str, Any]] = {}
+LAST_ANALYSIS_PLOT: Dict[str, Any] = {
+    "calibration": None,
+    "session": None,
+}
 
 
 def _get_supabase_config() -> Dict[str, str]:
@@ -40,12 +44,21 @@ def _get_supabase_config() -> Dict[str, str]:
         os.getenv("EXPO_PUBLIC_SUPABASE_ANON_KEY")
         or os.getenv("SUPABASE_ANON_KEY")
     )
+    bucket = (
+        os.getenv("EXPO_PUBLIC_SUPABASE_STORAGE_BUCKET")
+        or os.getenv("SUPABASE_STORAGE_BUCKET")
+    )
     if not url or not key:
         raise HTTPException(
             status_code=500,
             detail="Missing Supabase env vars: EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.",
         )
-    return {"url": url, "key": key}
+    if not bucket:
+        raise HTTPException(
+            status_code=500,
+            detail="Missing Supabase env var: EXPO_PUBLIC_SUPABASE_STORAGE_BUCKET.",
+        )
+    return {"url": url, "key": key, "bucket": bucket}
 
 
 def _fetch_recording_by_id(record_id: str) -> Dict[str, Any]:
@@ -98,6 +111,50 @@ def _fetch_recording_by_id(record_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="Recording not found.")
     logger.info("[FETCH] success record_id=%s", record_id)
     return data[0]
+
+
+def _fetch_storage_bytes(object_key: str) -> bytes:
+    config = _get_supabase_config()
+    url = f"{config['url']}/storage/v1/object/{config['bucket']}/{object_key}"
+    headers = {
+        "apikey": config["key"],
+        "Authorization": f"Bearer {config['key']}",
+    }
+    logger.info("[FETCH] storage object_key=%s", object_key)
+    try:
+        with httpx.Client(timeout=60) as client:
+            response = client.get(url, headers=headers)
+            response.raise_for_status()
+            return response.content
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase Storage error: {exc.response.status_code} {exc.response.text}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase Storage unreachable: {exc}",
+        ) from exc
+
+
+def _decode_int16_le(payload: bytes) -> List[int]:
+    if len(payload) % 2 != 0:
+        logger.warning("[DECODE] odd byte count len=%s", len(payload))
+    sample_count = len(payload) // 2
+    return [
+        int.from_bytes(payload[i : i + 2], "little", signed=True)
+        for i in range(0, sample_count * 2, 2)
+    ]
+
+
+def _decimate(samples: List[int], max_points: int = 2000) -> List[int]:
+    if not samples:
+        return []
+    if len(samples) <= max_points:
+        return samples
+    step = max(1, len(samples) // max_points)
+    return samples[::step]
 
 
 def _set_job(job_id: str, **fields: Any) -> None:
@@ -193,65 +250,6 @@ def health() -> Dict[str, str]:
     return {"status": "ok", "base_url": BASE_URL}
 
 
-@app.get("/", response_class=HTMLResponse)
-def root() -> str:
-    sample_count = LAST_CALIBRATION_META["sample_count"]
-    byte_length = LAST_CALIBRATION_META["byte_length"]
-    data = LAST_CALIBRATION_SAMPLES
-    has_data = sample_count > 0 and len(data) == sample_count
-
-    return f"""<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>ECG Calibration Preview</title>
-    <style>
-      body {{ font-family: Arial, sans-serif; padding: 16px; background: #0b0b0b; color: #e5e5e5; }}
-      .meta {{ margin-bottom: 12px; color: #a3a3a3; }}
-      canvas {{ background: #111827; border: 1px solid #1f2937; }}
-    </style>
-  </head>
-  <body>
-    <h1>Calibration Signal</h1>
-    <div class="meta">byte_length={byte_length} | sample_count={sample_count}</div>
-    {"<div>No calibration data received yet.</div>" if not has_data else ""}
-    <canvas id="ecg" width="1200" height="300"></canvas>
-    <script>
-      const data = {data};
-      const canvas = document.getElementById("ecg");
-      const ctx = canvas.getContext("2d");
-      if (!data || data.length === 0) {{
-        ctx.fillStyle = "#9ca3af";
-        ctx.fillText("No data", 10, 20);
-      }} else {{
-        const maxPoints = 2000;
-        const step = Math.max(1, Math.ceil(data.length / maxPoints));
-        const sampled = [];
-        for (let i = 0; i < data.length; i += step) sampled.push(data[i]);
-
-        const mean = sampled.reduce((s, v) => s + v, 0) / sampled.length;
-        let maxAbs = 0;
-        for (const v of sampled) maxAbs = Math.max(maxAbs, Math.abs(v - mean));
-        const scale = maxAbs || 1;
-
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.strokeStyle = "#22c55e";
-        ctx.lineWidth = 1.5;
-        const mid = canvas.height / 2;
-        const stepX = canvas.width / (sampled.length - 1);
-
-        ctx.beginPath();
-        for (let i = 0; i < sampled.length; i++) {{
-          const x = i * stepX;
-          const y = mid - ((sampled[i] - mean) / scale) * mid;
-          if (i === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        }}
-        ctx.stroke();
-      }}
-    </script>
-  </body>
-</html>"""
 
 @app.post("/calibration_signal_quality_check")
 async def calibration_signal_quality_check(
@@ -407,6 +405,43 @@ def _session_analysis_job(job_id: str, record_id: str) -> None:
             record_id,
             record.get("session_object_key"),
             record.get("calibration_object_key"),
+        )
+
+        session_key = record.get("session_object_key")
+        calibration_key = record.get("calibration_object_key")
+        bucket = record.get("bucket") or _get_supabase_config()["bucket"]
+        if not session_key or not calibration_key:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing session_object_key or calibration_object_key in record.",
+            )
+
+        session_bytes = _fetch_storage_bytes(session_key)
+        calibration_bytes = _fetch_storage_bytes(calibration_key)
+        session_samples = _decode_int16_le(session_bytes)
+        calibration_samples = _decode_int16_le(calibration_bytes)
+
+        LAST_ANALYSIS_PLOT["session"] = {
+            "object_key": session_key,
+            "bucket": bucket,
+            "byte_length": len(session_bytes),
+            "sample_count": len(session_samples),
+            "data": _decimate(session_samples),
+        }
+        LAST_ANALYSIS_PLOT["calibration"] = {
+            "object_key": calibration_key,
+            "bucket": bucket,
+            "byte_length": len(calibration_bytes),
+            "sample_count": len(calibration_samples),
+            "data": _decimate(calibration_samples),
+        }
+
+        _set_job(job_id, status="decoded")
+        logger.info(
+            "[JOB] decoded job_id=%s session_samples=%s calibration_samples=%s",
+            job_id,
+            len(session_samples),
+            len(calibration_samples),
         )
     except HTTPException as exc:
         _set_job(job_id, status="error", error=exc.detail)
@@ -575,3 +610,83 @@ async def session_insights(payload: SessionAnalysisRequest) -> List[Insight]:
             detail="Insights not implemented.",
         )
     ]
+
+
+@app.get("/", response_class=HTMLResponse)
+def root() -> str:
+    calibration_plot = LAST_ANALYSIS_PLOT.get("calibration")
+    session_plot = LAST_ANALYSIS_PLOT.get("session")
+
+    has_calibration = bool(calibration_plot and calibration_plot.get("data"))
+    has_session = bool(session_plot and session_plot.get("data"))
+
+    return f"""<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>ECG Session Verification</title>
+    <style>
+      body {{ font-family: Arial, sans-serif; padding: 16px; background: #0b0b0b; color: #e5e5e5; }}
+      .meta {{ margin-bottom: 12px; color: #a3a3a3; }}
+      canvas {{ background: #111827; border: 1px solid #1f2937; }}
+      .panel {{ margin-bottom: 24px; }}
+    </style>
+  </head>
+  <body>
+    <h1>ECG Session Verification</h1>
+    {"<div>No analysis data received yet.</div>" if not (has_calibration or has_session) else ""}
+
+    <div class="panel">
+      <h2>Calibration Signal</h2>
+      <div class="meta">filepath={(calibration_plot["bucket"] + "/" + calibration_plot["object_key"]) if calibration_plot else "n/a"}</div>
+      <div class="meta">byte_length={calibration_plot["byte_length"] if calibration_plot else 0} | sample_count={calibration_plot["sample_count"] if calibration_plot else 0}</div>
+      {"<div>No calibration data received yet.</div>" if not has_calibration else ""}
+      <canvas id="calibration" width="1200" height="300"></canvas>
+    </div>
+
+    <div class="panel">
+      <h2>Session Signal</h2>
+      <div class="meta">filepath={(session_plot["bucket"] + "/" + session_plot["object_key"]) if session_plot else "n/a"}</div>
+      <div class="meta">byte_length={session_plot["byte_length"] if session_plot else 0} | sample_count={session_plot["sample_count"] if session_plot else 0}</div>
+      {"<div>No session data received yet.</div>" if not has_session else ""}
+      <canvas id="session" width="1200" height="300"></canvas>
+    </div>
+    <script>
+      const calibrationData = {calibration_plot["data"] if calibration_plot else []};
+      const sessionData = {session_plot["data"] if session_plot else []};
+
+      function drawSignal(canvasId, data, color) {{
+        const canvas = document.getElementById(canvasId);
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        if (!data || data.length === 0) {{
+          ctx.fillStyle = "#9ca3af";
+          ctx.fillText("No data", 10, 20);
+          return;
+        }}
+
+        let maxAbs = 0;
+        for (const v of data) maxAbs = Math.max(maxAbs, Math.abs(v));
+        const scale = maxAbs || 1;
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        const mid = canvas.height / 2;
+        const stepX = canvas.width / (data.length - 1);
+
+        ctx.beginPath();
+        for (let i = 0; i < data.length; i++) {{
+          const x = i * stepX;
+          const y = mid - (data[i] / scale) * mid;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }}
+        ctx.stroke();
+      }}
+
+      drawSignal("calibration", calibrationData, "#22c55e");
+      drawSignal("session", sessionData, "#38bdf8");
+    </script>
+  </body>
+</html>"""

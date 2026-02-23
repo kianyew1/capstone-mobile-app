@@ -33,8 +33,14 @@ import {
   useSessionStore,
   useSessionHistoryStore,
 } from "@/stores/session-store";
+import { useAppStore } from "@/stores/app-store";
 import {
-  uploadSessionData,
+  concatUint8Arrays,
+  generateMockSessionBytes,
+} from "@/services/ecg-utils";
+import { finalizeSessionRecording } from "@/services/supabase-ecg";
+import { startSessionAnalysis } from "@/services/session-analysis";
+import {
   getSessionAnalysis,
   type SessionInsight,
   type HeartRateZone,
@@ -60,7 +66,11 @@ export default function RunSummaryScreen() {
     eventMarkers,
     heartRateHistory,
     resetSession,
+    pendingUpload,
+    clearPendingUpload,
   } = useSessionStore();
+
+  const { user } = useAppStore();
 
   const { addSession } = useSessionHistoryStore();
 
@@ -72,20 +82,42 @@ export default function RunSummaryScreen() {
     if (!currentSession) return;
 
     try {
-      // Step 1: Upload session data
       setSyncStatus("syncing");
-      for (let i = 0; i <= 100; i += 10) {
-        await new Promise((resolve) => setTimeout(resolve, 150));
-        setSyncProgress(i);
+      setSyncProgress(5);
+
+      if (!pendingUpload) {
+        throw new Error("No pending upload data found.");
       }
 
-      const uploadResponse = await uploadSessionData(currentSession);
+      const { recordId, sessionId, packets, startTimeIso, useMock } =
+        pendingUpload;
+      const userId = user?.email ?? "unknown@local";
 
-      if (!uploadResponse.success) {
-        throw new Error("Failed to upload session data");
+      let bytes: Uint8Array;
+      if (useMock) {
+        console.log("[SUMMARY] mock mode: generating 10-minute ECG stream");
+        bytes = generateMockSessionBytes();
+      } else {
+        bytes = concatUint8Arrays(packets);
       }
 
-      // Step 2: Get analysis from cloud
+      if (bytes.length === 0) {
+        throw new Error("No session bytes available for upload.");
+      }
+
+      setSyncProgress(40);
+      await finalizeSessionRecording({
+        recordId,
+        userId,
+        sessionId,
+        bytes,
+        startTime: startTimeIso ? new Date(startTimeIso) : null,
+      });
+      setSyncProgress(70);
+
+      await startSessionAnalysis(recordId);
+      setSyncProgress(100);
+
       setSyncStatus("analyzing");
       setSyncProgress(0);
 
@@ -101,10 +133,12 @@ export default function RunSummaryScreen() {
       addSession(currentSession);
 
       setSyncStatus("complete");
+      clearPendingUpload();
     } catch (err) {
       console.error("Sync error:", err);
       setError("Failed to sync session. Data saved locally.");
       setSyncStatus("error");
+      clearPendingUpload();
 
       // Still save locally even if cloud sync fails
       if (currentSession) {
