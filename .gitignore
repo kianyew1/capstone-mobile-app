@@ -47,3 +47,5 @@ capstone-ecgapp/.env
 backend/.env
 capstone-ecgapp/.env
 backend/calibration_request.json
+/backend/.venv
+/backend/tests/__pycache__
