@@ -232,23 +232,6 @@ export default function HomeScreen() {
                   </View>
                 </View>
               </View>
-              <Pressable
-                className={`px-3 py-1.5 rounded-full ${
-                  isConnected ? "bg-red-500" : "bg-primary"
-                }`}
-                onPress={handleDeviceAction}
-                disabled={isConnecting}
-              >
-                <Text className="text-white text-xs font-medium">
-                  {isConnected
-                    ? "Take ECG"
-                    : isConnecting
-                      ? "Connecting..."
-                      : pairedDevice
-                        ? "Reconnect"
-                        : "Pair Device"}
-                </Text>
-              </Pressable>
             </View>
 
             {!isConnected && !isConnecting && (

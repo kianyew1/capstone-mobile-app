@@ -63,7 +63,8 @@ export default function CalibrationScreen() {
   const [graphError, setGraphError] = useState<string | null>(null);
   const [isGraphLoading, setIsGraphLoading] = useState(false);
 
-  const { setCalibrationResult } = useAppStore();
+  const { setCalibrationResult, completeOnboarding, isOnboardingComplete } =
+    useAppStore();
   const { startEcgNotifications, stopEcgNotifications } = useBluetoothService();
   const packetCountRef = useRef(0);
   const packetsRef = useRef<Array<{ data: Uint8Array; receivedAt: number }>>(
@@ -301,6 +302,9 @@ export default function CalibrationScreen() {
 
   const handleContinue = () => {
     if (isFromOnboarding) {
+      if (!isOnboardingComplete) {
+        completeOnboarding();
+      }
       router.replace("/(tabs)");
     } else {
       navigateBackOrTabs();
@@ -318,6 +322,9 @@ export default function CalibrationScreen() {
 
   const handleSkip = () => {
     if (isFromOnboarding) {
+      if (!isOnboardingComplete) {
+        completeOnboarding();
+      }
       router.replace("/(tabs)");
     } else {
       navigateBackOrTabs();

@@ -14,7 +14,9 @@ import {
 } from "lucide-react-native";
 import { useEffect, useRef, useState } from "react";
 import {
+  Alert,
   AppState,
+  InteractionManager,
   Pressable,
   ScrollView,
   View,
@@ -33,17 +35,6 @@ import Animated, {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { toByteArray } from "base64-js";
 
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Text } from "@/components/ui/text";
@@ -83,8 +74,12 @@ export default function RunSessionScreen() {
     setPendingUpload,
   } = useSessionStore();
 
-  const { connectionStatus, pairedDevice, startEcgNotifications, stopEcgNotifications } =
-    useBluetoothService();
+  const {
+    connectionStatus,
+    pairedDevice,
+    startEcgNotifications,
+    stopEcgNotifications,
+  } = useBluetoothService();
   const { user } = useAppStore();
   const isConnected = connectionStatus === "connected";
   const userId = user?.email ?? "unknown@local";
@@ -139,9 +134,7 @@ export default function RunSessionScreen() {
     if (!hasPreparedUploadRef.current) {
       hasPreparedUploadRef.current = true;
 
-      const sessionId = formatSessionId(
-        sessionStartRef.current ?? new Date(),
-      );
+      const sessionId = formatSessionId(sessionStartRef.current ?? new Date());
       sessionIdRef.current = sessionId;
 
       uploadCalibrationFile()
@@ -305,13 +298,34 @@ export default function RunSessionScreen() {
     }
 
     endSession();
-    setTimeout(() => {
-      router.replace("/run-summary");
-    }, 100);
+
+    InteractionManager.runAfterInteractions(() => {
+      requestAnimationFrame(() => {
+        router.replace("/run-summary");
+      });
+    });
   };
 
   const handleMarkEvent = (type: "symptom" | "episode" | "user-mark") => {
     addEventMarker(type);
+  };
+
+  const handleConfirmEnd = () => {
+    Alert.alert(
+      "End Session?",
+      "Are you sure you want to end this session? Your data will be saved and synced to the cloud.",
+      [
+        { text: "Continue Session", style: "cancel" },
+        {
+          text: "End Session",
+          style: "destructive",
+          onPress: () => {
+            void handleEnd();
+          },
+        },
+      ],
+      { cancelable: true },
+    );
   };
 
   const handleBack = () => {
@@ -583,30 +597,12 @@ export default function RunSessionScreen() {
               </Pressable>
 
               {/* End Button */}
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Pressable className="w-20 h-20 rounded-full items-center justify-center bg-red-500 active:opacity-80">
-                    <Square size={32} color="white" fill="white" />
-                  </Pressable>
-                </AlertDialogTrigger>
-                <AlertDialogContent>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>End Session?</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      Are you sure you want to end this session? Your data will
-                      be saved and synced to the cloud.
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>
-                      <Text>Continue Session</Text>
-                    </AlertDialogCancel>
-                    <AlertDialogAction onPress={handleEnd}>
-                      <Text className="text-black">End Session</Text>
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
+              <Pressable
+                onPress={handleConfirmEnd}
+                className="w-20 h-20 rounded-full items-center justify-center bg-red-500 active:opacity-80"
+              >
+                <Square size={32} color="white" fill="white" />
+              </Pressable>
             </View>
 
             {/* Status Text */}
