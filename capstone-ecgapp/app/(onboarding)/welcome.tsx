@@ -36,16 +36,16 @@ export default function WelcomeScreen() {
 
   return (
     <SafeAreaView className="bg-background flex-1">
-      <View className="flex-1 px-6 pt-12">
+      <View className="flex-1 px-6 pt-6">
         {/* Header */}
-        <View className="items-center mb-12">
-          <View className="bg-primary/10 w-24 h-24 rounded-full items-center justify-center mb-6">
-            <Heart size={48} className="text-primary" strokeWidth={1.5} />
-          </View>
-          <Text variant="h1" className="text-center mb-2">
-            Welcome to ECG App
+        <View className="items-center mb-8">
+          {/* <View className="bg-primary/10 w-20 h-20 rounded-full items-center justify-center mb-4">
+            <Heart size={40} className="text-primary" strokeWidth={1.5} />
+          </View> */}
+          <Text variant="h2" className="text-center mb-1">
+            Welcome to PulseSense!
           </Text>
-          <Text className="text-muted-foreground text-center text-lg">
+          <Text className="text-muted-foreground text-center text-base">
             Your personal heart health companion
           </Text>
         </View>

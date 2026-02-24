@@ -99,7 +99,7 @@ export default function RootLayout() {
           options={{ presentation: "modal", title: "Modal", headerShown: true }}
         />
       </Stack>
-      <StatusBar style="auto" />
+      <StatusBar style={colorScheme === "dark" ? "light" : "dark"} />
       <PortalHost />
     </ThemeProvider>
   );

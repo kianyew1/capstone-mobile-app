@@ -30,31 +30,31 @@ This service is a minimal FastAPI app with a `/health` endpoint.
 4. Run the dev server:
 
    ```bash
-   fastapi dev
+   fastapi dev app.py --host 0.0.0.0 --port 8001
    ```
 
    ```powershell
-   fastapi dev
+   fastapi dev app.py --host 0.0.0.0 --port 8001
    ```
 
    Or, if you prefer specifying the module directly:
 
    ```bash
-   fastapi dev app.py
+   fastapi dev app.py --host 0.0.0.0 --port 8001
    ```
 
    ```powershell
-   fastapi dev app.py
+   fastapi dev app.py --host 0.0.0.0 --port 8001
    ```
 
 5. Verify the health check:
 
    ```bash
-   curl http://127.0.0.1:8000/health
+   curl http://127.0.0.1:8001/health
    ```
 
    ```powershell
-   Invoke-RestMethod http://127.0.0.1:8000/health
+   Invoke-RestMethod http://127.0.0.1:8001/health
    ```
 
 ## Deploy to FastAPI Cloud
