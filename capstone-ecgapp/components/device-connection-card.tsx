@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { View, ActivityIndicator } from "react-native";
+import { router } from "expo-router";
 import {
   Bluetooth,
   Check,
@@ -170,6 +171,14 @@ export function DeviceConnectionCard() {
                   </Text>
                 </Button>
               )}
+
+              <Button
+                variant="outline"
+                className={isConnected ? "flex-1" : ""}
+                onPress={() => router.push("/calibration")}
+              >
+                <Text className="font-medium">Recalibrate</Text>
+              </Button>
 
               <AlertDialog>
                 <AlertDialogTrigger asChild>

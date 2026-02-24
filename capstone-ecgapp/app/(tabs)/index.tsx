@@ -175,7 +175,7 @@ export default function HomeScreen() {
       showsVerticalScrollIndicator={false}
     >
       {/* Header */}
-      <View className="px-5 pt-4 pb-2">
+      <View className="px-5 pb-2" style={{ paddingTop: insets.top + 8 }}>
         <View className="flex-row justify-between items-center">
           <View>
             <Text className="text-muted-foreground text-sm">
@@ -189,18 +189,6 @@ export default function HomeScreen() {
             <Ionicons name="person" size={20} className="text-foreground" />
           </Pressable>
         </View>
-      </View>
-
-      <View className="px-5 pb-2">
-        <Pressable
-          className="bg-primary rounded-xl py-3 px-4 flex-row items-center justify-center gap-2 active:opacity-80"
-          onPress={handleStartRun}
-        >
-          <Ionicons name="play" size={18} color="#ffffff" />
-          <Text className="text-primary-foreground font-semibold">
-            Start Run
-          </Text>
-        </Pressable>
       </View>
 
       {/* ECG Device Status Card */}
@@ -272,6 +260,27 @@ export default function HomeScreen() {
                 </Text>
               </View>
             )}
+
+            <View className="flex-row gap-2 mt-2">
+              <Pressable
+                className="flex-1 bg-red-500 rounded-lg py-2.5 px-3 items-center active:opacity-80"
+                onPress={handleDeviceAction}
+                disabled={isConnecting}
+              >
+                <Text className="text-white text-xs font-medium">
+                  Take Resting ECG
+                </Text>
+              </Pressable>
+              <Pressable
+                className="flex-1 bg-primary rounded-lg py-2.5 px-3 items-center active:opacity-80"
+                onPress={handleStartRun}
+                disabled={isConnecting}
+              >
+                <Text className="text-primary-foreground text-xs font-medium">
+                  Start Run
+                </Text>
+              </Pressable>
+            </View>
 
             {isConnected && (
               <View className="flex-row justify-between mt-3 pt-3 border-t border-border">

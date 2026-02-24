@@ -26,7 +26,7 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { DeviceConnectionCard } from "@/components/device-connection-card";
 import { useAppStore } from "@/stores/app-store";
-import { useColorScheme } from "@/hooks/use-color-scheme";
+import { useThemeController } from "@/hooks/use-color-scheme";
 
 interface SettingsItemProps {
   icon: React.ComponentType<{
@@ -78,7 +78,7 @@ function SettingsItem({
 
 export default function SettingsScreen() {
   const { user, resetOnboarding, pairedDevice } = useAppStore();
-  const colorScheme = useColorScheme();
+  const { colorScheme, setColorScheme } = useThemeController();
 
   const handleLogout = () => {
     Alert.alert(
@@ -187,7 +187,12 @@ export default function SettingsScreen() {
                     </Text>
                   </View>
                 </View>
-                <Switch checked={colorScheme === "dark"} disabled />
+                <Switch
+                  checked={colorScheme === "dark"}
+                  onCheckedChange={(checked) =>
+                    setColorScheme(checked ? "dark" : "light")
+                  }
+                />
               </View>
             </CardContent>
           </Card>
