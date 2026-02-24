@@ -2,8 +2,6 @@ import { View, ScrollView, Pressable, Alert } from "react-native";
 import { router } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import {
-  User,
-  Bluetooth,
   Bell,
   Shield,
   HelpCircle,
@@ -23,7 +21,6 @@ import {
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
-import { Label } from "@/components/ui/label";
 import { DeviceConnectionCard } from "@/components/device-connection-card";
 import { useAppStore } from "@/stores/app-store";
 import { useThemeController } from "@/hooks/use-color-scheme";
@@ -48,7 +45,7 @@ function SettingsItem({
   rightElement,
 }: SettingsItemProps) {
   const content = (
-    <View className="flex-row items-center py-3">
+    <View className="flex-row items-center py-2.5">
       <View className="bg-primary/10 w-10 h-10 rounded-full items-center justify-center mr-3">
         <Icon size={20} className="text-primary" strokeWidth={1.5} />
       </View>
@@ -77,7 +74,7 @@ function SettingsItem({
 }
 
 export default function SettingsScreen() {
-  const { user, resetOnboarding, pairedDevice } = useAppStore();
+  const { user, resetOnboarding } = useAppStore();
   const { colorScheme, setColorScheme } = useThemeController();
 
   const handleLogout = () => {
@@ -120,14 +117,14 @@ export default function SettingsScreen() {
     <SafeAreaView className="flex-1 bg-background">
       <ScrollView className="flex-1" showsVerticalScrollIndicator={false}>
         {/* Header */}
-        <View className="px-5 pt-4 pb-6">
+        <View className="px-5 pt-4 pb-4">
           <Text className="text-2xl font-bold">Settings</Text>
         </View>
 
         {/* Profile Section */}
-        <View className="px-5 mb-6">
+        <View className="px-5 mb-4">
           <Card>
-            <CardContent className="p-4">
+            <CardContent className="p-3">
               <View className="flex-row items-center gap-4">
                 <View className="w-16 h-16 rounded-full bg-primary items-center justify-center">
                   <Text className="text-primary-foreground text-2xl font-bold">
@@ -151,27 +148,27 @@ export default function SettingsScreen() {
         </View>
 
         {/* Device Section */}
-        <View className="px-5 mb-6">
-          <Text className="text-sm font-medium text-muted-foreground mb-3 uppercase tracking-wide">
+        <View className="px-5 mb-4">
+          <Text className="text-sm font-medium text-muted-foreground mb-2 uppercase tracking-wide">
             Device
           </Text>
           <DeviceConnectionCard />
         </View>
 
         {/* App Settings */}
-        <View className="px-5 mb-6">
-          <Text className="text-sm font-medium text-muted-foreground mb-3 uppercase tracking-wide">
+        <View className="px-5 mb-2">
+          <Text className="text-sm font-medium text-muted-foreground mb-2 uppercase tracking-wide">
             App Settings
           </Text>
           <Card>
-            <CardContent className="px-4 py-2 divide-y divide-border">
+            <CardContent className="px-3 py-1.5 divide-y divide-border">
               <SettingsItem
                 icon={Bell}
                 title="Notifications"
                 subtitle="Manage alerts and reminders"
                 onPress={() => {}}
               />
-              <View className="flex-row items-center justify-between py-3">
+              <View className="flex-row items-center justify-between py-2.5">
                 <View className="flex-row items-center">
                   <View className="bg-primary/10 w-10 h-10 rounded-full items-center justify-center mr-3">
                     <Moon
@@ -199,12 +196,12 @@ export default function SettingsScreen() {
         </View>
 
         {/* Support */}
-        <View className="px-5 mb-6">
-          <Text className="text-sm font-medium text-muted-foreground mb-3 uppercase tracking-wide">
+        <View className="px-5 mb-2">
+          <Text className="text-sm font-medium text-muted-foreground mb-2 uppercase tracking-wide">
             Support
           </Text>
           <Card>
-            <CardContent className="px-4 py-2 divide-y divide-border">
+            <CardContent className="px-3 py-1.5 divide-y divide-border">
               <SettingsItem
                 icon={HelpCircle}
                 title="Help Center"
@@ -221,12 +218,12 @@ export default function SettingsScreen() {
         </View>
 
         {/* Danger Zone */}
-        <View className="px-5 mb-6">
-          <Text className="text-sm font-medium text-muted-foreground mb-3 uppercase tracking-wide">
+        <View className="px-5 mb-2">
+          <Text className="text-sm font-medium text-muted-foreground mb-2 uppercase tracking-wide">
             Account
           </Text>
           <Card>
-            <CardContent className="px-4 py-2 divide-y divide-border">
+            <CardContent className="px-3 py-1.5 divide-y divide-border">
               <SettingsItem
                 icon={RefreshCw}
                 title="Reset Setup"
@@ -234,7 +231,7 @@ export default function SettingsScreen() {
                 onPress={handleResetOnboarding}
               />
               <Pressable onPress={handleLogout} className="active:opacity-70">
-                <View className="flex-row items-center py-3">
+                <View className="flex-row items-center py-2.5">
                   <View className="bg-destructive/10 w-10 h-10 rounded-full items-center justify-center mr-3">
                     <LogOut
                       size={20}
@@ -250,7 +247,7 @@ export default function SettingsScreen() {
         </View>
 
         {/* App Version */}
-        <View className="items-center py-6">
+        <View className="items-center py-4">
           <Text className="text-muted-foreground text-sm">ECG App v1.0.0</Text>
         </View>
       </ScrollView>

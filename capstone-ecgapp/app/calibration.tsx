@@ -9,7 +9,7 @@ import {
   Zap,
 } from "lucide-react-native";
 import { useEffect, useRef, useState } from "react";
-import { ActivityIndicator, ScrollView, View } from "react-native";
+import { ActivityIndicator, Image, ScrollView, View } from "react-native";
 import Animated, {
   Easing,
   useAnimatedStyle,
@@ -291,17 +291,25 @@ export default function CalibrationScreen() {
     isFinishingRef.current = false;
   };
 
+  const navigateBackOrTabs = () => {
+    if (typeof router.canGoBack === "function" && router.canGoBack()) {
+      router.back();
+      return;
+    }
+    router.replace("/(tabs)");
+  };
+
   const handleContinue = () => {
     if (isFromOnboarding) {
       router.replace("/(tabs)");
     } else {
-      router.back();
+      navigateBackOrTabs();
     }
   };
 
   const handleBack = () => {
     if (step === "guidance" || step === "result") {
-      router.back();
+      navigateBackOrTabs();
     } else {
       stopEcgNotifications();
       setStep("guidance");
@@ -312,7 +320,7 @@ export default function CalibrationScreen() {
     if (isFromOnboarding) {
       router.replace("/(tabs)");
     } else {
-      router.back();
+      navigateBackOrTabs();
     }
   };
 
@@ -365,20 +373,13 @@ export default function CalibrationScreen() {
         </Text>
       </View>
 
-      {/* Placeholder for device placement image */}
+      {/* Device placement image */}
       <View className="bg-muted rounded-2xl h-64 items-center justify-center mb-4 overflow-hidden">
-        {/* Replace with actual asset image */}
-        <View className="items-center">
-          <View className="w-32 h-32 rounded-full bg-primary/20 items-center justify-center mb-4">
-            <Zap size={64} className="text-primary" strokeWidth={1} />
-          </View>
-          <Text className="text-muted-foreground text-sm">
-            Device Placement Illustration
-          </Text>
-          <Text className="text-muted-foreground text-xs mt-0">
-            (Your asset image here)
-          </Text>
-        </View>
+        <Image
+          source={require("../assets/images/calibration_example.png")}
+          className="w-full h-full"
+          resizeMode="cover"
+        />
       </View>
 
       {/* Instructions */}

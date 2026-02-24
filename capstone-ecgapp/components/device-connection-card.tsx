@@ -85,9 +85,9 @@ export function DeviceConnectionCard() {
         </CardTitle>
         <CardDescription>Manage your ECG device connection</CardDescription>
       </CardHeader>
-      <CardContent className="gap-4">
+      <CardContent className="gap-3">
         {/* Device Status */}
-        <View className="bg-muted/50 rounded-xl p-4">
+        <View className="bg-muted/50 rounded-xl p-3">
           <View className="flex-row items-center justify-between">
             <View className="flex-row items-center gap-3">
               <View
@@ -122,7 +122,7 @@ export function DeviceConnectionCard() {
 
           {/* Signal Strength */}
           {isConnected && connectedDevice && (
-            <View className="flex-row items-center gap-2 mt-3 pt-3 border-t border-border">
+            <View className="flex-row items-center gap-2 mt-2 pt-2 border-t border-border">
               <Signal size={14} className="text-green-500" />
               <Text className="text-sm text-muted-foreground">
                 Signal: {connectedDevice.rssi || "N/A"} dBm
@@ -133,14 +133,14 @@ export function DeviceConnectionCard() {
 
         {/* Error Message */}
         {error && (
-          <View className="flex-row items-center gap-2 bg-destructive/10 rounded-lg p-3">
+          <View className="flex-row items-center gap-2 bg-destructive/10 rounded-lg p-2.5">
             <AlertCircle size={16} className="text-destructive" />
             <Text className="text-sm text-destructive flex-1">{error}</Text>
           </View>
         )}
 
         {/* Actions */}
-        <View className="flex-row gap-3">
+        <View className="flex-row gap-2">
           {!pairedDevice ? (
             <Button
               variant="default"

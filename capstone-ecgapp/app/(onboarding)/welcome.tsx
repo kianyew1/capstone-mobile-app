@@ -43,7 +43,7 @@ export default function WelcomeScreen() {
             <Heart size={40} className="text-primary" strokeWidth={1.5} />
           </View> */}
           <Text variant="h2" className="text-center mb-1">
-            Welcome to HeartLine!
+            Welcome to PulseSense!
           </Text>
           <Text className="text-muted-foreground text-center text-base">
             Your personal heart health companion
