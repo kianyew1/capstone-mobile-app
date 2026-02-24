@@ -7,7 +7,7 @@ function Card({ className, ...props }: ViewProps & React.RefAttributes<View>) {
     <TextClassContext.Provider value="text-card-foreground">
       <View
         className={cn(
-          "bg-card border-border flex flex-col gap-6 rounded-xl border py-6 shadow-sm shadow-black/5",
+          "bg-card border-border flex flex-col gap-3 rounded-xl border py-4 shadow-sm shadow-black/5",
           className,
         )}
         {...props}
@@ -21,7 +21,7 @@ function CardHeader({
   ...props
 }: ViewProps & React.RefAttributes<View>) {
   return (
-    <View className={cn("flex flex-col gap-1.5 px-6", className)} {...props} />
+    <View className={cn("flex flex-col gap-1 px-4", className)} {...props} />
   );
 }
 
@@ -55,7 +55,7 @@ function CardContent({
   className,
   ...props
 }: ViewProps & React.RefAttributes<View>) {
-  return <View className={cn("px-6", className)} {...props} />;
+  return <View className={cn("px-4", className)} {...props} />;
 }
 
 function CardFooter({
@@ -64,7 +64,7 @@ function CardFooter({
 }: ViewProps & React.RefAttributes<View>) {
   return (
     <View
-      className={cn("flex flex-row items-center px-6", className)}
+      className={cn("flex flex-row items-center px-4", className)}
       {...props}
     />
   );

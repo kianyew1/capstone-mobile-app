@@ -30,74 +30,6 @@ const ecgStatus = {
 
 const dayLabels = ["S", "M", "T", "W", "T", "F", "S"];
 
-function MetricCard({
-  title,
-  value,
-  unit,
-  subtitle,
-  icon,
-  iconColor = "text-primary",
-  children,
-}: {
-  title: string;
-  value?: string | number;
-  unit?: string;
-  subtitle?: string;
-  icon: keyof typeof Ionicons.glyphMap;
-  iconColor?: string;
-  children?: React.ReactNode;
-}) {
-  return (
-    <Card className="flex-1">
-      <CardContent className="p-4">
-        <View className="flex-row items-center gap-2 mb-2">
-          <Ionicons name={icon} size={20} className={iconColor} />
-          <Text className="text-muted-foreground text-sm font-medium">
-            {title}
-          </Text>
-        </View>
-        {value !== undefined && (
-          <View className="flex-row items-baseline gap-1">
-            <Text className="text-3xl font-bold">{value}</Text>
-            {unit && (
-              <Text className="text-muted-foreground text-sm">{unit}</Text>
-            )}
-          </View>
-        )}
-        {subtitle && (
-          <Text className="text-muted-foreground text-xs mt-1">{subtitle}</Text>
-        )}
-        {children}
-      </CardContent>
-    </Card>
-  );
-}
-
-function ECGWaveform() {
-  // Simplified ECG waveform visualization
-  return (
-    <View className="h-16 flex-row items-center justify-center gap-0.5 overflow-hidden">
-      {[...Array(40)].map((_, i) => {
-        // Create a simplified ECG pattern
-        const isQRS = i % 10 === 5;
-        const isPWave = i % 10 === 3;
-        const isTWave = i % 10 === 7;
-        let height = 8;
-        if (isQRS) height = 32;
-        else if (isPWave || isTWave) height = 16;
-
-        return (
-          <View
-            key={i}
-            className="bg-red-500 w-1 rounded-full"
-            style={{ height, opacity: 0.4 + (i / 40) * 0.6 }}
-          />
-        );
-      })}
-    </View>
-  );
-}
-
 function ActivityBar({ value, day }: { value: number; day: string }) {
   return (
     <View className="items-center gap-1 flex-1">
@@ -114,13 +46,8 @@ function ActivityBar({ value, day }: { value: number; day: string }) {
 
 export default function HomeScreen() {
   const insets = useSafeAreaInsets();
-  const {
-    connectionStatus,
-    pairedDevice,
-    reconnectToPairedDevice,
-    isScanning,
-    startScan,
-  } = useBluetoothService();
+  const { connectionStatus, pairedDevice, reconnectToPairedDevice } =
+    useBluetoothService();
   const { user, isCalibrated } = useAppStore();
   const { sessions } = useSessionHistoryStore();
 
@@ -187,14 +114,6 @@ export default function HomeScreen() {
     router.push("/run-session");
   };
 
-  const handleCalibrate = () => {
-    router.push("/calibration");
-  };
-
-  const handleViewHistory = () => {
-    router.push("/(tabs)/explore");
-  };
-
   const handleSeeAllActivity = () => {
     router.push("/activity-calendar");
   };
@@ -256,7 +175,7 @@ export default function HomeScreen() {
       showsVerticalScrollIndicator={false}
     >
       {/* Header */}
-      <View className="px-5 pt-4 pb-2">
+      <View className="px-5 pb-2" style={{ paddingTop: insets.top + 8 }}>
         <View className="flex-row justify-between items-center">
           <View>
             <Text className="text-muted-foreground text-sm">
@@ -313,29 +232,10 @@ export default function HomeScreen() {
                   </View>
                 </View>
               </View>
-              <Pressable
-                className={`px-3 py-1.5 rounded-full ${
-                  isConnected ? "bg-red-500" : "bg-primary"
-                }`}
-                onPress={handleDeviceAction}
-                disabled={isConnecting}
-              >
-                <Text className="text-white text-xs font-medium">
-                  {isConnected
-                    ? "Take ECG"
-                    : isConnecting
-                      ? "Connecting..."
-                      : pairedDevice
-                        ? "Reconnect"
-                        : "Pair Device"}
-                </Text>
-              </Pressable>
             </View>
 
-            {isConnected && <ECGWaveform />}
-
             {!isConnected && !isConnecting && (
-              <View className="py-4 items-center">
+              <View className="py-2 items-center">
                 <Text className="text-muted-foreground text-sm text-center">
                   {pairedDevice
                     ? "Tap 'Reconnect' to connect to your ECG device"
@@ -343,6 +243,27 @@ export default function HomeScreen() {
                 </Text>
               </View>
             )}
+
+            <View className="flex-row gap-2 mt-2">
+              <Pressable
+                className="flex-1 bg-red-500 rounded-lg py-2.5 px-3 items-center active:opacity-80"
+                onPress={handleDeviceAction}
+                disabled={isConnecting}
+              >
+                <Text className="text-white text-xs font-medium">
+                  Take Resting ECG
+                </Text>
+              </Pressable>
+              <Pressable
+                className="flex-1 bg-primary rounded-lg py-2.5 px-3 items-center active:opacity-80"
+                onPress={handleStartRun}
+                disabled={isConnecting}
+              >
+                <Text className="text-primary-foreground text-xs font-medium">
+                  Start Run
+                </Text>
+              </Pressable>
+            </View>
 
             {isConnected && (
               <View className="flex-row justify-between mt-3 pt-3 border-t border-border">
@@ -367,38 +288,38 @@ export default function HomeScreen() {
       </View>
 
       {/* Heart Rate Stats */}
-      <View className="px-5 py-3">
-        <Text className="text-lg font-semibold mb-3">Heart Rate</Text>
-        <View className="flex-row gap-3">
-          <MetricCard
-            title="Current"
-            value={heartRateData.current}
-            unit="BPM"
-            icon="heart"
-            iconColor="text-red-500"
-          />
-          <MetricCard
-            title="Resting"
-            value={heartRateData.resting}
-            unit="BPM"
-            subtitle="Average"
-            icon="bed"
-            iconColor="text-blue-500"
-          />
-        </View>
+      <View className="px-5 py-2">
+        <Text className="text-lg font-semibold mb-2">Heart Rate</Text>
+        <Card>
+          <CardContent className="p-3">
+            <View className="flex-row items-center justify-between mb-2">
+              <View>
+                <Text className="text-muted-foreground text-xs">Current</Text>
+                <View className="flex-row items-baseline gap-1">
+                  <Text className="text-2xl font-bold">
+                    {heartRateData.current}
+                  </Text>
+                  <Text className="text-muted-foreground text-xs">BPM</Text>
+                </View>
+              </View>
+              <View className="items-end">
+                <Text className="text-muted-foreground text-xs">Resting</Text>
+                <Text className="font-semibold text-base">
+                  {heartRateData.resting} BPM
+                </Text>
+              </View>
+            </View>
 
-        <Card className="mt-3">
-          <CardContent className="p-4">
-            <View className="flex-row justify-between items-center mb-3">
-              <Text className="text-muted-foreground text-sm font-medium">
+            <View className="flex-row justify-between items-center mb-2">
+              <Text className="text-muted-foreground text-xs">
                 Today's Range
               </Text>
               <Text className="text-xs text-muted-foreground">
                 {heartRateData.min} - {heartRateData.max} BPM
               </Text>
             </View>
-            <View className="flex-row items-center gap-3">
-              <Text className="text-muted-foreground text-xs w-8">
+            <View className="flex-row items-center gap-2">
+              <Text className="text-muted-foreground text-xs w-7">
                 {heartRateData.min}
               </Text>
               <View className="flex-1">
@@ -412,7 +333,7 @@ export default function HomeScreen() {
                   indicatorClassName="bg-red-500"
                 />
               </View>
-              <Text className="text-muted-foreground text-xs w-8 text-right">
+              <Text className="text-muted-foreground text-xs w-7 text-right">
                 {heartRateData.max}
               </Text>
             </View>
@@ -481,47 +402,6 @@ export default function HomeScreen() {
             </View>
           </CardContent>
         </Card>
-      </View>
-
-      {/* Quick Actions */}
-      <View className="px-5 py-3">
-        <Text className="text-lg font-semibold mb-3">Quick Actions</Text>
-        <View className="flex-row gap-3 mb-3">
-          <Pressable
-            className="flex-1 bg-secondary rounded-xl p-4 items-center active:opacity-80"
-            onPress={handleStartRun}
-          >
-            <Ionicons name="play" size={28} color="#dcfce7" />
-            <Text className="text-green-100 font-medium mt-2">Start Run</Text>
-          </Pressable>
-          <Pressable
-            className="flex-1 bg-secondary rounded-xl p-4 items-center active:opacity-80"
-            onPress={handleCalibrate}
-          >
-            <Ionicons name="pulse" size={28} color="#fecaca" />
-            <Text className="text-red-200 font-medium mt-2">
-              {isCalibrated ? "Re-calibrate" : "Calibrate"}
-            </Text>
-          </Pressable>
-        </View>
-        <View className="flex-row gap-3">
-          <Pressable
-            className="flex-1 bg-secondary rounded-xl p-4 items-center active:opacity-80"
-            onPress={handleViewHistory}
-          >
-            <Ionicons name="stats-chart" size={28} color="#bfdbfe" />
-            <Text className="text-blue-200 font-medium mt-2">History</Text>
-            {sessions.length > 0 && (
-              <Text className="text-blue-200/70 text-xs">
-                {sessions.length} sessions
-              </Text>
-            )}
-          </Pressable>
-          <Pressable className="flex-1 bg-secondary rounded-xl p-4 items-center active:opacity-80">
-            <Ionicons name="share-outline" size={28} color="#ffffff" />
-            <Text className="text-white font-medium mt-2">Share</Text>
-          </Pressable>
-        </View>
       </View>
     </ScrollView>
   );
