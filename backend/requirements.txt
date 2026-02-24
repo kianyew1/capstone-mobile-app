@@ -1,4 +1,5 @@
 fastapi[standard]
 httpx
 neurokit2
+matplotlib
 pytest
