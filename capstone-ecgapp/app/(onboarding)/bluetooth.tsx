@@ -165,8 +165,8 @@ export default function BluetoothScreen() {
   const handleContinue = () => {
     setOnboardingStep("calibration");
     completeOnboarding();
-    // Navigate to main app - calibration will be in the main app flow
-    router.replace("/(tabs)");
+    // Navigate to calibration before entering the main app tabs
+    router.replace("/calibration");
   };
 
   const handleBack = () => {
