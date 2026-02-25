@@ -1,0 +1,594 @@
+#define CFG_GATT_MAX_MTU_SIZE 100
+#include <bluefruit.h>
+#include <SPI.h>
+
+/*
+ * ADS1298 ECG with Seeed XIAO nRF52840
+ * Adds BLE packet streaming on top of the existing ADS1298 firmware logic.
+ *
+ * Packet format (120 bytes):
+ *   STATUS[10] + CH2[10] + CH3[10] + CH4[10]
+ *   Each sample is 24-bit, big-endian.
+ */
+
+// Pin definitions
+#define PIN_DRDY    0   // D0
+#define PIN_PWDN    1   // D1 - PWDN and RESET tied together
+#define PIN_START   2   // D2
+#define PIN_CS      3   // D3
+#define PIN_SCLK    8   // D8
+#define PIN_MISO    9   // D9
+#define PIN_MOSI    10  // D10
+
+// LED
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
+
+inline void ledOn()  { digitalWrite(LED_BUILTIN, LOW); }
+inline void ledOff() { digitalWrite(LED_BUILTIN, HIGH); }
+
+unsigned long lastBlinkMs = 0;
+const unsigned long ADV_BLINK_MS  = 500;
+const unsigned long FAIL_BLINK_MS = 100;
+
+void blinkNonBlocking(unsigned long intervalMs)
+{
+  unsigned long now = millis();
+  if (now - lastBlinkMs >= intervalMs) {
+    lastBlinkMs = now;
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+  }
+}
+
+// ADS1298 Commands
+#define ADS1298_CMD_WAKEUP   0x02
+#define ADS1298_CMD_STANDBY  0x04
+#define ADS1298_CMD_RESET    0x06
+#define ADS1298_CMD_START    0x08
+#define ADS1298_CMD_STOP     0x0A
+#define ADS1298_CMD_RDATAC   0x10
+#define ADS1298_CMD_SDATAC   0x11
+#define ADS1298_CMD_RDATA    0x12
+#define ADS1298_CMD_RREG     0x20
+#define ADS1298_CMD_WREG     0x40
+
+// ADS1298 Register Addresses
+#define ADS1298_REG_ID       0x00
+#define ADS1298_REG_CONFIG1  0x01
+#define ADS1298_REG_CONFIG2  0x02
+#define ADS1298_REG_CONFIG3  0x03
+#define ADS1298_REG_LOFF     0x04
+#define ADS1298_REG_CH1SET   0x05
+#define ADS1298_REG_CH2SET   0x06
+#define ADS1298_REG_CH3SET   0x07
+#define ADS1298_REG_CH4SET   0x08
+#define ADS1298_REG_CH5SET   0x09
+#define ADS1298_REG_CH6SET   0x0A
+#define ADS1298_REG_CH7SET   0x0B
+#define ADS1298_REG_CH8SET   0x0C
+#define ADS1298_REG_RLD_SENSP 0x0D
+#define ADS1298_REG_RLD_SENSN 0x0E
+#define ADS1298_REG_LOFF_SENSP 0x0F
+#define ADS1298_REG_LOFF_SENSN 0x10
+#define ADS1298_REG_LOFF_FLIP 0x11
+#define ADS1298_REG_LOFF_STATP 0x12
+#define ADS1298_REG_LOFF_STATN 0x13
+#define ADS1298_REG_GPIO     0x14
+#define ADS1298_REG_PACE     0x15
+#define ADS1298_REG_RESP     0x16
+#define ADS1298_REG_CONFIG4  0x17
+#define ADS1298_REG_WCT1     0x18
+#define ADS1298_REG_WCT2     0x19
+
+// Timing constants (in microseconds)
+#define T_POR        1000
+#define T_CLK        1
+#define T_RESET_PULSE 10
+
+// Sample storage
+struct ADS1298_Sample {
+  uint32_t status;      // 24-bit status word
+  int32_t channel[8];   // 8 channels, 24-bit each (sign-extended to 32-bit)
+};
+
+volatile bool newDataReady = false;
+
+// Forward declarations to avoid Arduino auto-prototype issues
+void packetizerPush(const ADS1298_Sample& s);
+bool packetizerReady();
+void packetizerBuild(uint8_t* out);
+void packetizerConsume();
+bool initADS1298();
+void sendCommand(uint8_t cmd);
+uint8_t readRegister(uint8_t reg);
+void writeRegister(uint8_t reg, uint8_t data);
+ADS1298_Sample readData();
+void drdyInterrupt();
+void enableTestSignal();
+void disableTestSignal();
+
+// ======================================================
+// BLE
+// ======================================================
+const char* SERVICE_UUID = "12345678-1234-1234-1234-1234567890ab";
+const char* CHAR_UUID    = "87654321-4321-4321-4321-abcdefabcdef";
+
+BLEService ecgService(SERVICE_UUID);
+BLECharacteristic ecgChar(CHAR_UUID);
+
+static const float sampleRateHz = 500.0f;
+static const int SAMPLES_PER_PACKET = 10;
+static const uint32_t packetIntervalUs =
+  (uint32_t)(1000000.0f * SAMPLES_PER_PACKET / sampleRateHz);
+uint32_t lastSendUs = 0;
+
+// ======================================================
+// PACKETIZER (status + CH2 + CH3 + CH4)
+// ======================================================
+#define ECG_PACKET_SAMPLES 10
+#define ECG_SIGNALS 3
+#define ECG_PACKET_BYTES ((1 + (ECG_PACKET_SAMPLES * ECG_SIGNALS)) * 3)
+
+struct ECGFrame {
+  int32_t ch2;
+  int32_t ch3;
+  int32_t ch4;
+};
+
+static ECGFrame frameBuffer[ECG_PACKET_SAMPLES];
+static volatile uint8_t frameCount = 0;
+static uint32_t packetStatus = 0;
+
+void packetizerPush(const ADS1298_Sample& s)
+{
+  if (frameCount >= ECG_PACKET_SAMPLES) return;
+
+  ECGFrame& f = frameBuffer[frameCount];
+  packetStatus = s.status;
+  f.ch2 = s.channel[1];
+  f.ch3 = s.channel[2];
+  f.ch4 = s.channel[3];
+  frameCount++;
+}
+
+bool packetizerReady()
+{
+  return frameCount == ECG_PACKET_SAMPLES;
+}
+
+void write24(uint8_t* p, int32_t v)
+{
+  p[0] = (v >> 16) & 0xFF;
+  p[1] = (v >> 8) & 0xFF;
+  p[2] = v & 0xFF;
+}
+
+void packetizerBuild(uint8_t* out)
+{
+  uint8_t* p = out;
+
+  // STATUS (single)
+  write24(p, packetStatus);
+  p += 3;
+
+  // CH2 (10 samples)
+  for (int i = 0; i < ECG_PACKET_SAMPLES; i++) {
+    write24(p, frameBuffer[i].ch2);
+    p += 3;
+  }
+
+  // CH3 (10 samples)
+  for (int i = 0; i < ECG_PACKET_SAMPLES; i++) {
+    write24(p, frameBuffer[i].ch3);
+    p += 3;
+  }
+
+  // CH4 (10 samples)
+  for (int i = 0; i < ECG_PACKET_SAMPLES; i++) {
+    write24(p, frameBuffer[i].ch4);
+    p += 3;
+  }
+}
+
+void packetizerConsume()
+{
+  frameCount = 0;
+}
+
+// ======================================================
+// DEBUG PRINT (every 1 second)
+// ======================================================
+uint32_t totalPacketsSent = 0;
+uint32_t packetsSentThisSecond = 0;
+uint32_t notifyFail = 0;
+uint32_t notifyFailThisSecond = 0;
+uint32_t samplesThisSecond = 0;
+uint32_t lastStatsMs = 0;
+uint32_t lastPacketPrintMs = 0;
+
+void printPacketSummary(uint32_t packetNumber)
+{
+  // Use status from the first frame as the packet status indicator.
+  Serial.print("[BLE] packet#");
+  Serial.print(packetNumber);
+  Serial.print(" status=0x");
+  Serial.print(packetStatus, HEX);
+
+  Serial.print(" ch2=[");
+  for (int i = 0; i < ECG_PACKET_SAMPLES; i++) {
+    Serial.print(frameBuffer[i].ch2);
+    if (i + 1 < ECG_PACKET_SAMPLES) Serial.print(", ");
+  }
+  Serial.print("] ch3=[");
+  for (int i = 0; i < ECG_PACKET_SAMPLES; i++) {
+    Serial.print(frameBuffer[i].ch3);
+    if (i + 1 < ECG_PACKET_SAMPLES) Serial.print(", ");
+  }
+  Serial.print("] ch4=[");
+  for (int i = 0; i < ECG_PACKET_SAMPLES; i++) {
+    Serial.print(frameBuffer[i].ch4);
+    if (i + 1 < ECG_PACKET_SAMPLES) Serial.print(", ");
+  }
+  Serial.println("]");
+}
+
+void printStats()
+{
+  Serial.print("[STATS] samples/sec=");
+  Serial.print(samplesThisSecond);
+  Serial.print(" packets/sec=");
+  Serial.print(packetsSentThisSecond);
+  Serial.print(" notifyFail/sec=");
+  Serial.println(notifyFailThisSecond);
+
+  samplesThisSecond = 0;
+  packetsSentThisSecond = 0;
+  notifyFailThisSecond = 0;
+}
+
+void connect_callback(uint16_t conn_hdl)
+{
+  if (!Serial) return;
+  BLEConnection* conn = Bluefruit.Connection(conn_hdl);
+  uint16_t conn_mtu = conn ? conn->getMtu() : 0;
+  Serial.print("[BLE] Connected mtu=");
+  Serial.println(conn_mtu);
+}
+
+void disconnect_callback(uint16_t conn_hdl, uint8_t reason)
+{
+  (void) conn_hdl;
+  if (!Serial) return;
+  Serial.print("[BLE] Disconnected reason=0x");
+  Serial.println(reason, HEX);
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  ledOff();
+
+  Serial.begin(115200);
+  unsigned long serialWaitStart = millis();
+  while (!Serial && (millis() - serialWaitStart < 2000)) {
+    // wait briefly for serial monitor without blocking forever
+  }
+
+  if (initADS1298()) {
+    if (Serial) {
+      Serial.println("\n✓ ADS1298 Initialized Successfully!");
+      Serial.println("Ready to acquire data...\n");
+    }
+  } else {
+    if (Serial) {
+      Serial.println("\n✗ ADS1298 Initialization FAILED!");
+    }
+    while (1) blinkNonBlocking(FAIL_BLINK_MS);
+  }
+
+  pinMode(PIN_DRDY, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIN_DRDY), drdyInterrupt, FALLING);
+  enableTestSignal();
+  disableTestSignal();
+
+  // ---- BLE init ----
+  if (!Bluefruit.begin()) {
+    if (Serial) {
+      Serial.println("✗ Bluefruit init failed!");
+    }
+    while (1) blinkNonBlocking(FAIL_BLINK_MS);
+  }
+  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
+  Bluefruit.Periph.setConnInterval(6, 12);
+  Bluefruit.setTxPower(4);
+  Bluefruit.setName("XIAO-ECG");
+  Bluefruit.Periph.setConnectCallback(connect_callback);
+  Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
+
+  ecgService.begin();
+  ecgChar.setProperties(CHR_PROPS_NOTIFY);
+  ecgChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  ecgChar.setMaxLen(ECG_PACKET_BYTES);
+  ecgChar.begin();
+
+  Bluefruit.Advertising.addService(ecgService);
+  Bluefruit.Advertising.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.start(0);
+
+  if (Serial) {
+    Serial.println("[BLE] Advertising...");
+    Serial.print("[BLE] Max MTU (periph)=");
+    Serial.println(Bluefruit.getMaxMtu(BLE_GAP_ROLE_PERIPH));
+  }
+}
+
+void loop() {
+  // ===== ADC driven acquisition =====
+  if (newDataReady) {
+    newDataReady = false;
+    ADS1298_Sample sample = readData();
+    packetizerPush(sample);
+    samplesThisSecond++;
+  }
+
+  // ===== BLE state =====
+  static bool wasConnected = false;
+  bool isConnected = Bluefruit.connected();
+  if (!isConnected) {
+    if (wasConnected) {
+      wasConnected = false;
+    }
+    blinkNonBlocking(ADV_BLINK_MS);
+    return;
+  }
+  if (!wasConnected) {
+    wasConnected = true;
+    if (Serial) {
+      Serial.println("[BLE] Connected");
+    }
+  }
+  ledOn();
+
+  // ===== timing (20 ms) =====
+  uint32_t nowUs = micros();
+  if (lastSendUs == 0) lastSendUs = nowUs;
+  if ((uint32_t)(nowUs - lastSendUs) < packetIntervalUs) return;
+  lastSendUs += packetIntervalUs;
+
+  // ===== send only full packet =====
+  if (!packetizerReady()) return;
+
+  static uint8_t packet[ECG_PACKET_BYTES];
+  packetizerBuild(packet);
+
+  if (!ecgChar.notifyEnabled()) {
+    // No active subscribers yet
+    return;
+  }
+
+  bool sent = ecgChar.notify(packet, ECG_PACKET_BYTES);
+  if (sent) {
+    totalPacketsSent++;
+    packetsSentThisSecond++;
+    packetizerConsume();
+  } else {
+    notifyFail++;
+    notifyFailThisSecond++;
+  }
+
+  uint32_t nowMs = millis();
+  if (Serial && (nowMs - lastStatsMs >= 1000)) {
+    Serial.println("[BLE] sending...");
+    printStats();
+    lastStatsMs = nowMs;
+  }
+
+  if (Serial && (nowMs - lastPacketPrintMs >= 1000)) {
+    printPacketSummary(totalPacketsSent);
+    lastPacketPrintMs = nowMs;
+  }
+}
+
+// ============================================================================
+// ADS1298 Functions
+// ============================================================================
+
+bool initADS1298() {
+  pinMode(PIN_CS, OUTPUT);
+  pinMode(PIN_START, OUTPUT);
+  pinMode(PIN_PWDN, OUTPUT);
+  pinMode(PIN_DRDY, INPUT);
+
+  digitalWrite(PIN_CS, HIGH);
+  digitalWrite(PIN_START, LOW);
+  digitalWrite(PIN_PWDN, LOW);
+
+  SPI.begin();
+  SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE1));
+
+  Serial.println("Step 1: Power-Up Sequence");
+  Serial.println("  - CLKSEL = 1 (internal oscillator)");
+  Serial.println("  - Setting PWDN = 1, RESET = 1");
+
+  digitalWrite(PIN_PWDN, HIGH);
+
+  Serial.print("  - Waiting ");
+  Serial.print(T_POR);
+  Serial.println("ms for power-on reset (tPOR)...");
+  delay(T_POR);
+
+  Serial.println("  ✓ Assuming VCAP1 >= 1.1V");
+
+  Serial.println("\nStep 2: Issue Reset Pulse");
+  digitalWrite(PIN_PWDN, LOW);
+  delayMicroseconds(T_RESET_PULSE);
+  digitalWrite(PIN_PWDN, HIGH);
+  delayMicroseconds(18 * T_CLK);
+  Serial.println("  ✓ Reset complete");
+
+  digitalWrite(PIN_CS, LOW);
+  delayMicroseconds(10);
+
+  Serial.println("\nStep 3: Send SDATAC Command");
+  sendCommand(ADS1298_CMD_SDATAC);
+  delay(10);
+  Serial.println("  ✓ Device ready for register configuration");
+
+  Serial.println("\nStep 4: Configure Internal Reference");
+  Serial.println("  - CONFIG3 = 0xC0 (Enable internal reference, no external reference)");
+  writeRegister(ADS1298_REG_CONFIG3, 0xC0);
+  delay(150);
+  Serial.println("  ✓ Internal reference enabled and settled");
+
+  Serial.println("\nStep 5: Configure Device Registers");
+  Serial.println("  - CONFIG1 = 0x86 (HR mode, DR = fMOD/1024 = 500 SPS)");
+  writeRegister(ADS1298_REG_CONFIG1, 0x86);
+
+  Serial.println("  - CONFIG2 = 0x00 (Test signals off)");
+  writeRegister(ADS1298_REG_CONFIG2, 0x00);
+
+  Serial.println("  - CH1-8SET = 0x00 (Normal input, Gain=6, Powered up)");
+  for (int ch = 0; ch < 8; ch++) {
+    writeRegister(ADS1298_REG_CH1SET + ch, 0x00);
+  }
+
+  delay(10);
+  Serial.println("  ✓ All registers configured");
+
+  Serial.println("\nStep 6: Verify Device ID");
+  uint8_t deviceID = readRegister(ADS1298_REG_ID);
+  Serial.print("  - Device ID: 0x");
+  Serial.println(deviceID, HEX);
+
+  if ((deviceID & 0xF8) == 0x98) {
+    Serial.println("  ✓ ADS1298 detected");
+  } else if ((deviceID & 0xF8) == 0x90) {
+    Serial.println("  ✓ ADS1296 detected");
+  } else if ((deviceID & 0xF8) == 0x88) {
+    Serial.println("  ✓ ADS1294 detected");
+  } else {
+    Serial.println("  ✗ Unknown device!");
+    return false;
+  }
+
+  Serial.println("\nStep 7: Start Conversion");
+  digitalWrite(PIN_START, HIGH);
+  sendCommand(ADS1298_CMD_START);
+  delay(10);
+  Serial.println("  ✓ Conversions started");
+
+  Serial.println("\nStep 8: Enable Continuous Data Mode");
+  sendCommand(ADS1298_CMD_RDATAC);
+  delay(10);
+  Serial.println("  ✓ RDATAC mode active");
+
+  return true;
+}
+
+void sendCommand(uint8_t cmd) {
+  digitalWrite(PIN_CS, LOW);
+  delayMicroseconds(2);
+  SPI.transfer(cmd);
+  delayMicroseconds(2);
+  digitalWrite(PIN_CS, HIGH);
+  delayMicroseconds(2);
+}
+
+uint8_t readRegister(uint8_t reg) {
+  digitalWrite(PIN_CS, LOW);
+  delayMicroseconds(2);
+
+  SPI.transfer(ADS1298_CMD_RREG | reg);
+  SPI.transfer(0x00);
+  delayMicroseconds(2);
+  uint8_t data = SPI.transfer(0x00);
+
+  delayMicroseconds(2);
+  digitalWrite(PIN_CS, HIGH);
+  return data;
+}
+
+void writeRegister(uint8_t reg, uint8_t data) {
+  digitalWrite(PIN_CS, LOW);
+  delayMicroseconds(2);
+
+  SPI.transfer(ADS1298_CMD_WREG | reg);
+  SPI.transfer(0x00);
+  SPI.transfer(data);
+
+  delayMicroseconds(2);
+  digitalWrite(PIN_CS, HIGH);
+  delayMicroseconds(2);
+}
+
+ADS1298_Sample readData() {
+  ADS1298_Sample sample;
+
+  digitalWrite(PIN_CS, LOW);
+  delayMicroseconds(2);
+
+  uint8_t stat1 = SPI.transfer(0x00);
+  uint8_t stat2 = SPI.transfer(0x00);
+  uint8_t stat3 = SPI.transfer(0x00);
+  sample.status = ((uint32_t)stat1 << 16) | ((uint32_t)stat2 << 8) | stat3;
+
+  for (int ch = 0; ch < 8; ch++) {
+    uint8_t byte1 = SPI.transfer(0x00);
+    uint8_t byte2 = SPI.transfer(0x00);
+    uint8_t byte3 = SPI.transfer(0x00);
+
+    int32_t value = ((uint32_t)byte1 << 16) | ((uint32_t)byte2 << 8) | byte3;
+    if (value & 0x800000) {
+      value |= 0xFF000000;
+    }
+    sample.channel[ch] = value;
+  }
+
+  delayMicroseconds(2);
+  digitalWrite(PIN_CS, HIGH);
+  return sample;
+}
+
+void drdyInterrupt() {
+  newDataReady = true;
+}
+
+// ============================================================================
+// Optional: Test Signal Functions
+// ============================================================================
+
+void enableTestSignal() {
+  sendCommand(ADS1298_CMD_SDATAC);
+  delay(10);
+
+  writeRegister(ADS1298_REG_CONFIG2, 0x10);
+
+  for (int ch = 0; ch < 8; ch++) {
+    writeRegister(ADS1298_REG_CH1SET + ch, 0x05);
+  }
+
+  sendCommand(ADS1298_CMD_RDATAC);
+  delay(10);
+
+  Serial.println("Test signal enabled on all channels");
+}
+
+void disableTestSignal() {
+  sendCommand(ADS1298_CMD_SDATAC);
+  delay(10);
+
+  writeRegister(ADS1298_REG_CONFIG2, 0x00);
+
+  for (int ch = 0; ch < 8; ch++) {
+    writeRegister(ADS1298_REG_CH1SET + ch, 0x00);
+  }
+
+  sendCommand(ADS1298_CMD_RDATAC);
+  delay(10);
+
+  Serial.println("Test signal disabled, normal input restored");
+}
