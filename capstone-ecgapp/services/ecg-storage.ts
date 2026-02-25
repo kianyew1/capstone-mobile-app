@@ -36,6 +36,20 @@ async function getDb(): Promise<SQLiteDatabase> {
   return db;
 }
 
+export async function logDbLocation(context: string) {
+  try {
+    const db = await getDb();
+    const row = await db.getFirstAsync<{ file?: string; name?: string }>(
+      "PRAGMA database_list",
+    );
+    const file = row?.file ?? "unknown";
+    const name = row?.name ?? DB_NAME;
+    console.log(`[DB] ${context} name=${name} file=${file}`);
+  } catch (error) {
+    console.warn("[DB] failed to read database location", error);
+  }
+}
+
 export async function saveCalibrationRun(
   runId: string,
   startedAt: number,

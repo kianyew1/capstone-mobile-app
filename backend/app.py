@@ -30,6 +30,8 @@ logger = logging.getLogger("ecg-backend")
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8001"
 BASE_URL = os.getenv("BASE_URL") or DEFAULT_BASE_URL
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+CSV_OUTPUT_PATH = os.path.join(REPO_ROOT, "channels_volts.csv")
 
 LAST_CALIBRATION_SAMPLES = []
 LAST_CALIBRATION_META = {
@@ -553,6 +555,43 @@ async def calibration_signal_quality_check(
     return {
         "quality_percentage": 100, #round(quality, 2),
         "signal_suitable": True #signal_suitable,
+    }
+
+
+@app.post("/calibration_channels_csv")
+async def calibration_channels_csv(request: Request):
+    payload = await request.body()
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="CSV payload must be UTF-8 encoded.",
+        ) from exc
+
+    if not text.strip().lower().startswith("index,ch2,ch3,ch4"):
+        raise HTTPException(
+            status_code=400,
+            detail="CSV header must be: index,ch2,ch3,ch4",
+        )
+
+    with open(CSV_OUTPUT_PATH, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+    row_count = text.count("\n")
+    run_id = request.headers.get("X-Run-Id", "unknown")
+    logger.info(
+        "[CSV] saved run_id=%s path=%s rows=%s",
+        run_id,
+        CSV_OUTPUT_PATH,
+        row_count,
+    )
+
+    return {
+        "saved": True,
+        "path": CSV_OUTPUT_PATH,
+        "rows": row_count,
+        "run_id": run_id,
     }
 
 
