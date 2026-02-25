@@ -48,7 +48,7 @@ export default function HomeScreen() {
   const insets = useSafeAreaInsets();
   const { connectionStatus, pairedDevice, reconnectToPairedDevice } =
     useBluetoothService();
-  const { user, isCalibrated } = useAppStore();
+  const { user } = useAppStore();
   const { sessions } = useSessionHistoryStore();
 
   const isConnected = connectionStatus === "connected";
@@ -62,12 +62,7 @@ export default function HomeScreen() {
     } else if (!isConnected && !isConnecting) {
       reconnectToPairedDevice();
     } else if (isConnected) {
-      // Start ECG recording - go to calibration if not calibrated
-      if (!isCalibrated) {
-        router.push("/calibration");
-      } else {
-        router.push("/run-session");
-      }
+      router.push("/calibration");
     }
   };
 
@@ -99,19 +94,7 @@ export default function HomeScreen() {
       return;
     }
 
-    if (!isCalibrated) {
-      Alert.alert(
-        "Calibration Required",
-        "Your device needs to be calibrated before starting a session.",
-        [
-          { text: "Cancel", style: "cancel" },
-          { text: "Calibrate", onPress: () => router.push("/calibration") },
-        ],
-      );
-      return;
-    }
-
-    router.push("/run-session");
+    router.push("/calibration?fromRun=true");
   };
 
   const handleSeeAllActivity = () => {

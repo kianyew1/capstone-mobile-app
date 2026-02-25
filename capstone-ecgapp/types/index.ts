@@ -12,7 +12,6 @@ export type OnboardingStep =
   | "account"
   | "permissions"
   | "bluetooth"
-  | "calibration"
   | "complete";
 
 export interface OnboardingState {

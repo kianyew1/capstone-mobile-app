@@ -114,7 +114,7 @@ function SessionCard({ session }: { session: RunSession }) {
 
 function EmptyState() {
   const handleStartSession = () => {
-    router.push("/run-session");
+    router.push("/calibration?fromRun=true");
   };
 
   return (
@@ -194,7 +194,7 @@ export default function HistoryScreen() {
         <View className="flex-row justify-between items-center">
           <Text className="text-2xl font-bold">Session History</Text>
           {sessions.length > 0 && (
-            <Pressable onPress={() => router.push("/run-session")}>
+            <Pressable onPress={() => router.push("/calibration?fromRun=true")}>
               <Text className="text-primary font-medium">New Session</Text>
             </Pressable>
           )}

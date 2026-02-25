@@ -40,8 +40,12 @@ import { toByteArray } from "base64-js";
 type CalibrationStep = "guidance" | "ready" | "calibrating" | "result";
 
 export default function CalibrationScreen() {
-  const params = useLocalSearchParams<{ fromOnboarding?: string }>();
+  const params = useLocalSearchParams<{
+    fromOnboarding?: string;
+    fromRun?: string;
+  }>();
   const isFromOnboarding = params.fromOnboarding === "true";
+  const isFromRun = params.fromRun === "true";
   const targetPacketCount = 1000;
   const calibrationSeconds = ENABLE_MOCK_MODE ? 5 : 30;
   const SHOW_CALIBRATION_GRAPH = true;
@@ -306,6 +310,8 @@ export default function CalibrationScreen() {
         completeOnboarding();
       }
       router.replace("/(tabs)");
+    } else if (isFromRun) {
+      router.replace("/run-session");
     } else {
       navigateBackOrTabs();
     }
@@ -326,6 +332,8 @@ export default function CalibrationScreen() {
         completeOnboarding();
       }
       router.replace("/(tabs)");
+    } else if (isFromRun) {
+      router.replace("/run-session");
     } else {
       navigateBackOrTabs();
     }
@@ -373,7 +381,7 @@ export default function CalibrationScreen() {
     <ScrollView className="flex-1" showsVerticalScrollIndicator={false}>
       <View className="items-center mb-2">
         <Text variant="h3" className="text-center mb-1">
-          Device Placement Guide
+          Pre-Run Calibration and Baseline ECG Reading
         </Text>
         <Text className="text-muted-foreground text-center">
           Follow these steps to ensure accurate readings
@@ -451,8 +459,8 @@ export default function CalibrationScreen() {
               <View className="flex-1">
                 <Text className="font-semibold">Stay still</Text>
                 <Text className="text-muted-foreground text-sm mt-0">
-                  During calibration, remain still and relaxed. Avoid talking or
-                  moving for about 30 seconds.
+                  During calibration and resting ECG recording, remain still and
+                  relaxed. Avoid talking or moving for about 30 seconds.
                 </Text>
               </View>
             </View>
@@ -488,17 +496,18 @@ export default function CalibrationScreen() {
       </Animated.View>
 
       <Text variant="h3" className="text-center mb-0">
-        Ready to Calibrate
+        Ready to Start
       </Text>
       <Text className="text-muted-foreground text-center mb-3">
         Make sure your device is positioned correctly and you're comfortable.
-        The calibration will take about {calibrationSeconds} seconds.
+        Calibration and resting ECG reading will take about {calibrationSeconds}{" "}
+        seconds.
       </Text>
 
       <View className="w-full gap-2">
         <Button size="lg" onPress={handleStartCalibration} className="w-full">
           <Text className="text-primary-foreground font-semibold text-lg">
-            Start Calibration
+            Calibrate & Take Reading
           </Text>
         </Button>
         <Button variant="outline" onPress={() => setStep("guidance")}>
@@ -518,11 +527,11 @@ export default function CalibrationScreen() {
       </Animated.View>
 
       <Text variant="h3" className="text-center mb-0">
-        Calibrating...
+        Reading Resting ECG...
       </Text>
       <Text className="text-muted-foreground text-center mb-3">
-        Please remain still while we calibrate your device. This will take about
-        {calibrationSeconds} seconds.
+        Please remain still while we calibrate and capture your resting ECG.
+        This will take about {calibrationSeconds} seconds.
       </Text>
 
       <View className="w-full mb-2">
@@ -564,8 +573,8 @@ export default function CalibrationScreen() {
 
         <Text variant="h3" className="text-center mb-0">
           {calibrationStatus === "success"
-            ? "Calibration Successful!"
-            : "Calibration Failed"}
+            ? "Calibration & Resting ECG Complete"
+            : "Calibration & Resting ECG Failed"}
         </Text>
         <Text className="text-muted-foreground text-center px-4">
           {resultMessage}
@@ -698,7 +707,7 @@ export default function CalibrationScreen() {
           <Button variant="ghost" size="icon" onPress={handleBack}>
             <ArrowLeft size={24} className="text-foreground" />
           </Button>
-          <Text className="font-semibold">Device Calibration</Text>
+          <Text className="font-semibold">Calibration & Resting ECG</Text>
           <View className="w-10" />
         </View>
 

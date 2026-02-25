@@ -128,7 +128,7 @@ export default function BluetoothScreen() {
     connectToDevice,
   } = useBluetoothService();
 
-  const { setOnboardingStep, completeOnboarding } = useAppStore();
+  const { completeOnboarding } = useAppStore();
 
   // Start scanning on mount
   useEffect(() => {
@@ -163,10 +163,8 @@ export default function BluetoothScreen() {
   };
 
   const handleContinue = () => {
-    setOnboardingStep("calibration");
     completeOnboarding();
-    // Navigate to calibration before entering the main app tabs
-    router.replace("/calibration?fromOnboarding=true");
+    router.replace("/(tabs)");
   };
 
   const handleBack = () => {
