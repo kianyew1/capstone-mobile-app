@@ -6,7 +6,7 @@ import {
 } from "@/config/mock-config";
 import { useAppStore } from "@/stores/app-store";
 import type { BluetoothStatus, ConnectionStatus, ECGDevice } from "@/types";
-import { fromByteArray } from "base64-js";
+import { fromByteArray, toByteArray } from "base64-js";
 import { useCallback, useEffect, useRef } from "react";
 import { PermissionsAndroid, Platform } from "react-native";
 import {
@@ -21,6 +21,7 @@ import { useBluetoothStore } from "@/stores/bluetooth-store";
 // Keep in sync with nrf52480.ino
 const ECG_SERVICE_UUID = "12345678-1234-1234-1234-1234567890ab";
 const ECG_CHARACTERISTIC_UUID = "87654321-4321-4321-4321-abcdefabcdef";
+const DESIRED_MTU = 247;
 
 // Create a singleton BleManager instance
 let bleManagerInstance: BleManager | null = null;
@@ -30,6 +31,8 @@ let lastEcgPacketAtMs = 0;
 let lastEcgPayload: string | null = null;
 const MIN_ECG_PACKET_INTERVAL_MS = 10;
 let mockEcgInterval: ReturnType<typeof setInterval> | null = null;
+let hasLoggedEcgStart = false;
+let hasLoggedFirstPayload = false;
 
 const MOCK_SAMPLE_RATE_HZ = 500;
 const MOCK_SAMPLES_PER_PACKET = 10;
@@ -367,10 +370,21 @@ export function useBluetoothService() {
         }
 
         // Connect to device
-        const device = await bleManager.connectToDevice(deviceId, {
+        let device = await bleManager.connectToDevice(deviceId, {
           autoConnect: false,
           timeout: 10000,
         });
+
+        try {
+          device = await device.requestMTU(DESIRED_MTU);
+          console.log(
+            `[BLE] mtu requested=${DESIRED_MTU} result=${device.mtu ?? "unknown"}`,
+          );
+        } catch (err: unknown) {
+          const message =
+            err instanceof Error ? err.message : "unknown error";
+          console.warn(`[BLE] mtu request failed: ${message}`);
+        }
 
         // Discover services and characteristics
         await device.discoverAllServicesAndCharacteristics();
@@ -494,6 +508,12 @@ export function useBluetoothService() {
       onData: (payloadBase64: string) => void,
       options?: MockEcgOptions,
     ): Promise<boolean> => {
+      if (!hasLoggedEcgStart) {
+        hasLoggedEcgStart = true;
+        console.log(
+          `[BLE] start notifications mock=${ENABLE_MOCK_MODE} env=${process.env.EXPO_PUBLIC_MOCK_MODE ?? "undefined"}`,
+        );
+      }
       if (ENABLE_MOCK_MODE) {
         setError(null);
         ecgListener = onData;
@@ -573,6 +593,13 @@ export function useBluetoothService() {
           }
 
           if (characteristic?.value) {
+            if (!hasLoggedFirstPayload) {
+              const bytes = toByteArray(characteristic.value);
+              console.log(
+                `[BLE] first payload bytes=${bytes.length} device=${device.id}`,
+              );
+              hasLoggedFirstPayload = true;
+            }
             const now = Date.now();
             const payload = characteristic.value;
             const delta = now - lastEcgPacketAtMs;

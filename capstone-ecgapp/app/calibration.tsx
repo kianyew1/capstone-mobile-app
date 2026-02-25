@@ -42,8 +42,9 @@ type CalibrationStep = "guidance" | "ready" | "calibrating" | "result";
 export default function CalibrationScreen() {
   const params = useLocalSearchParams<{ fromOnboarding?: string }>();
   const isFromOnboarding = params.fromOnboarding === "true";
-  const targetPacketCount = 1000;
-  const calibrationSeconds = ENABLE_MOCK_MODE ? 5 : 30;
+  const targetPacketCount = ENABLE_MOCK_MODE ? 100 : 400;
+  const calibrationSeconds = ENABLE_MOCK_MODE ? 5 : 20;
+  const expectedPacketBytes = 228;
   const SHOW_CALIBRATION_GRAPH = true;
 
   const [step, setStep] = useState<CalibrationStep>("guidance");
@@ -67,6 +68,7 @@ export default function CalibrationScreen() {
     useAppStore();
   const { startEcgNotifications, stopEcgNotifications } = useBluetoothService();
   const packetCountRef = useRef(0);
+  const invalidPacketCountRef = useRef(0);
   const packetsRef = useRef<Array<{ data: Uint8Array; receivedAt: number }>>(
     [],
   );
@@ -176,9 +178,14 @@ export default function CalibrationScreen() {
     setElapsedMs(0);
     setLastPacketBytes(null);
     packetCountRef.current = 0;
+    invalidPacketCountRef.current = 0;
     packetsRef.current = [];
     calibrationStartRef.current = Date.now();
     isFinishingRef.current = false;
+    invalidPacketCountRef.current = 0;
+    console.log(
+      `[CAL] start mock=${ENABLE_MOCK_MODE} env=${process.env.EXPO_PUBLIC_MOCK_MODE ?? "undefined"} target=${targetPacketCount} expectedBytes=${expectedPacketBytes}`,
+    );
 
     const runTimestamp = Date.now();
     const runId = formatRunId(runTimestamp);
@@ -243,11 +250,29 @@ export default function CalibrationScreen() {
         const bytes = toByteArray(payloadBase64);
         const receivedAt = Date.now();
 
+        if (bytes.length !== expectedPacketBytes) {
+          invalidPacketCountRef.current += 1;
+          const invalidCount = invalidPacketCountRef.current;
+          if (invalidCount <= 5 || invalidCount % 50 === 0) {
+            console.log(
+              `[CAL] invalid packet len=${bytes.length} expected=${expectedPacketBytes} count=${invalidCount}`,
+            );
+          }
+          return;
+        }
+
         packetsRef.current.push({ data: bytes, receivedAt });
         packetCountRef.current += 1;
         const count = packetCountRef.current;
         setPacketCount(count);
         setLastPacketBytes(bytes);
+        if (count === 1) {
+          console.log(
+            `[CAL] first packet len=${bytes.length} bytes=${Array.from(bytes).join(",")}`,
+          );
+        } else if (count % 20 === 0) {
+          console.log(`[CAL] packet=${count} len=${bytes.length}`);
+        }
         if (calibrationStartRef.current) {
           setElapsedMs(receivedAt - calibrationStartRef.current);
         }
