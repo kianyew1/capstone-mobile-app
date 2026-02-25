@@ -1,4 +1,4 @@
-#define CFG_GATT_MAX_MTU_SIZE 100
+#define CFG_GATT_MAX_MTU_SIZE 247
 #include <bluefruit.h>
 #include <SPI.h>
 
@@ -6,9 +6,9 @@
  * ADS1298 ECG with Seeed XIAO nRF52840
  * Adds BLE packet streaming on top of the existing ADS1298 firmware logic.
  *
- * Packet format (120 bytes):
- *   STATUS[10] + CH2[10] + CH3[10] + CH4[10]
- *   Each sample is 24-bit, big-endian.
+ * Packet format (228 bytes):
+ *   STATUS[1] + CH2[25] + CH3[25] + CH4[25]
+ *   Each value is 24-bit, big-endian.
  */
 
 // Pin definitions
@@ -92,7 +92,23 @@ struct ADS1298_Sample {
   int32_t channel[8];   // 8 channels, 24-bit each (sign-extended to 32-bit)
 };
 
-volatile bool newDataReady = false;
+volatile uint32_t drdyCount = 0;
+uint32_t maxDrdyBacklog = 0;
+
+// Ring buffer for no-loss capture (stores all samples before BLE send)
+struct SampleFrame {
+  uint32_t status;
+  int32_t ch2;
+  int32_t ch3;
+  int32_t ch4;
+};
+
+static const uint16_t RING_CAPACITY = 2000;
+static SampleFrame ringBuffer[RING_CAPACITY];
+static uint16_t ringHead = 0;
+static uint16_t ringTail = 0;
+static uint16_t ringCount = 0;
+static uint16_t ringMax = 0;
 
 // Forward declarations to avoid Arduino auto-prototype issues
 void packetizerPush(const ADS1298_Sample& s);
@@ -118,15 +134,15 @@ BLEService ecgService(SERVICE_UUID);
 BLECharacteristic ecgChar(CHAR_UUID);
 
 static const float sampleRateHz = 500.0f;
-static const int SAMPLES_PER_PACKET = 10;
+static const int SAMPLES_PER_PACKET = 25;
 static const uint32_t packetIntervalUs =
   (uint32_t)(1000000.0f * SAMPLES_PER_PACKET / sampleRateHz);
 uint32_t lastSendUs = 0;
 
 // ======================================================
-// PACKETIZER (status + CH2 + CH3 + CH4)
+// PACKETIZER (single status + CH2 + CH3 + CH4)
 // ======================================================
-#define ECG_PACKET_SAMPLES 10
+#define ECG_PACKET_SAMPLES 25
 #define ECG_SIGNALS 3
 #define ECG_PACKET_BYTES ((1 + (ECG_PACKET_SAMPLES * ECG_SIGNALS)) * 3)
 
@@ -172,19 +188,19 @@ void packetizerBuild(uint8_t* out)
   write24(p, packetStatus);
   p += 3;
 
-  // CH2 (10 samples)
+  // CH2 (25 samples)
   for (int i = 0; i < ECG_PACKET_SAMPLES; i++) {
     write24(p, frameBuffer[i].ch2);
     p += 3;
   }
 
-  // CH3 (10 samples)
+  // CH3 (25 samples)
   for (int i = 0; i < ECG_PACKET_SAMPLES; i++) {
     write24(p, frameBuffer[i].ch3);
     p += 3;
   }
 
-  // CH4 (10 samples)
+  // CH4 (25 samples)
   for (int i = 0; i < ECG_PACKET_SAMPLES; i++) {
     write24(p, frameBuffer[i].ch4);
     p += 3;
@@ -197,19 +213,19 @@ void packetizerConsume()
 }
 
 // ======================================================
-// DEBUG PRINT (every 1 second)
+// DEBUG PRINT (periodic stats)
 // ======================================================
 uint32_t totalPacketsSent = 0;
 uint32_t packetsSentThisSecond = 0;
 uint32_t notifyFail = 0;
 uint32_t notifyFailThisSecond = 0;
 uint32_t samplesThisSecond = 0;
+uint32_t droppedSamplesThisSecond = 0;
+uint32_t droppedSamplesTotal = 0;
 uint32_t lastStatsMs = 0;
-uint32_t lastPacketPrintMs = 0;
 
 void printPacketSummary(uint32_t packetNumber)
 {
-  // Use status from the first frame as the packet status indicator.
   Serial.print("[BLE] packet#");
   Serial.print(packetNumber);
   Serial.print(" status=0x");
@@ -235,33 +251,32 @@ void printPacketSummary(uint32_t packetNumber)
 
 void printStats()
 {
+  const uint32_t expectedSamplesPerSec = 500;
+  const uint32_t expectedPacketsPerSec = expectedSamplesPerSec / SAMPLES_PER_PACKET;
+
   Serial.print("[STATS] samples/sec=");
   Serial.print(samplesThisSecond);
   Serial.print(" packets/sec=");
   Serial.print(packetsSentThisSecond);
+  Serial.print(" expected_packets/sec=");
+  Serial.print(expectedPacketsPerSec);
   Serial.print(" notifyFail/sec=");
   Serial.println(notifyFailThisSecond);
+  Serial.print("[STATS] buffer_fill=");
+  Serial.print(ringCount);
+  Serial.print(" buffer_max=");
+  Serial.print(ringMax);
+  Serial.print(" dropped_samples/sec=");
+  Serial.println(droppedSamplesThisSecond);
+  Serial.print("[STATS] drdy_backlog_max=");
+  Serial.println(maxDrdyBacklog);
+  maxDrdyBacklog = 0;
+  ringMax = 0;
+  droppedSamplesThisSecond = 0;
 
   samplesThisSecond = 0;
   packetsSentThisSecond = 0;
   notifyFailThisSecond = 0;
-}
-
-void connect_callback(uint16_t conn_hdl)
-{
-  if (!Serial) return;
-  BLEConnection* conn = Bluefruit.Connection(conn_hdl);
-  uint16_t conn_mtu = conn ? conn->getMtu() : 0;
-  Serial.print("[BLE] Connected mtu=");
-  Serial.println(conn_mtu);
-}
-
-void disconnect_callback(uint16_t conn_hdl, uint8_t reason)
-{
-  (void) conn_hdl;
-  if (!Serial) return;
-  Serial.print("[BLE] Disconnected reason=0x");
-  Serial.println(reason, HEX);
 }
 
 // ======================================================
@@ -295,19 +310,18 @@ void setup() {
   disableTestSignal();
 
   // ---- BLE init ----
+  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
+  Bluefruit.Periph.setConnInterval(6, 12);
+
   if (!Bluefruit.begin()) {
     if (Serial) {
       Serial.println("✗ Bluefruit init failed!");
     }
     while (1) blinkNonBlocking(FAIL_BLINK_MS);
   }
-  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
-  Bluefruit.Periph.setConnInterval(6, 12);
+
   Bluefruit.setTxPower(4);
   Bluefruit.setName("XIAO-ECG");
-  Bluefruit.Periph.setConnectCallback(connect_callback);
-  Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
-
   ecgService.begin();
   ecgChar.setProperties(CHR_PROPS_NOTIFY);
   ecgChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
@@ -327,31 +341,59 @@ void setup() {
 }
 
 void loop() {
+  static bool wasConnected = false;
+  bool isConnected = Bluefruit.connected();
+
   // ===== ADC driven acquisition =====
-  if (newDataReady) {
-    newDataReady = false;
+  // Drain pending DRDY events into ring buffer
+  uint32_t pending = 0;
+  noInterrupts();
+  pending = drdyCount;
+  drdyCount = 0;
+  interrupts();
+  if (pending > maxDrdyBacklog) {
+    maxDrdyBacklog = pending;
+  }
+  while (pending > 0) {
     ADS1298_Sample sample = readData();
-    packetizerPush(sample);
     samplesThisSecond++;
+    if (isConnected) {
+      if (ringCount < RING_CAPACITY) {
+        ringBuffer[ringHead].status = sample.status;
+        ringBuffer[ringHead].ch2 = sample.channel[1];
+        ringBuffer[ringHead].ch3 = sample.channel[2];
+        ringBuffer[ringHead].ch4 = sample.channel[3];
+        ringHead = (ringHead + 1) % RING_CAPACITY;
+        ringCount++;
+        if (ringCount > ringMax) {
+          ringMax = ringCount;
+        }
+      } else {
+        droppedSamplesTotal++;
+        droppedSamplesThisSecond++;
+      }
+    }
+    pending--;
   }
 
   // ===== BLE state =====
-  static bool wasConnected = false;
-  bool isConnected = Bluefruit.connected();
   if (!isConnected) {
     if (wasConnected) {
       wasConnected = false;
+      ringHead = 0;
+      ringTail = 0;
+      ringCount = 0;
     }
     blinkNonBlocking(ADV_BLINK_MS);
-    return;
-  }
-  if (!wasConnected) {
-    wasConnected = true;
-    if (Serial) {
-      Serial.println("[BLE] Connected");
+  } else {
+    if (!wasConnected) {
+      wasConnected = true;
+      if (Serial) {
+        Serial.println("[BLE] Connected");
+      }
     }
+    ledOn();
   }
-  ledOn();
 
   // ===== timing (20 ms) =====
   uint32_t nowUs = micros();
@@ -359,37 +401,50 @@ void loop() {
   if ((uint32_t)(nowUs - lastSendUs) < packetIntervalUs) return;
   lastSendUs += packetIntervalUs;
 
-  // ===== send only full packet =====
-  if (!packetizerReady()) return;
+  if (isConnected) {
+    // ===== send only when we have enough samples =====
+    if (ringCount >= ECG_PACKET_SAMPLES) {
+      static uint8_t packet[ECG_PACKET_BYTES];
 
-  static uint8_t packet[ECG_PACKET_BYTES];
-  packetizerBuild(packet);
+      // Build packet from ring buffer without consuming (only consume on success)
+      uint16_t idx = ringTail;
+      for (int i = 0; i < ECG_PACKET_SAMPLES; i++) {
+        SampleFrame f = ringBuffer[idx];
+        frameBuffer[i].ch2 = f.ch2;
+        frameBuffer[i].ch3 = f.ch3;
+        frameBuffer[i].ch4 = f.ch4;
+        packetStatus = f.status; // keep last sample status
+        idx = (idx + 1) % RING_CAPACITY;
+      }
+      frameCount = ECG_PACKET_SAMPLES;
+      packetizerBuild(packet);
 
-  if (!ecgChar.notifyEnabled()) {
-    // No active subscribers yet
-    return;
-  }
+      bool sent = ecgChar.notify(packet, ECG_PACKET_BYTES);
+      if (sent) {
+        totalPacketsSent++;
+        packetsSentThisSecond++;
 
-  bool sent = ecgChar.notify(packet, ECG_PACKET_BYTES);
-  if (sent) {
-    totalPacketsSent++;
-    packetsSentThisSecond++;
-    packetizerConsume();
-  } else {
-    notifyFail++;
-    notifyFailThisSecond++;
+        // Consume samples only after successful notify
+        ringTail = (ringTail + ECG_PACKET_SAMPLES) % RING_CAPACITY;
+        ringCount -= ECG_PACKET_SAMPLES;
+        packetizerConsume();
+
+        // intentionally no per-packet serial dump
+      } else {
+        // Still consume to keep streaming continuous, even if no subscriber
+        notifyFail++;
+        notifyFailThisSecond++;
+        ringTail = (ringTail + ECG_PACKET_SAMPLES) % RING_CAPACITY;
+        ringCount -= ECG_PACKET_SAMPLES;
+        packetizerConsume();
+      }
+    }
   }
 
   uint32_t nowMs = millis();
   if (Serial && (nowMs - lastStatsMs >= 1000)) {
-    Serial.println("[BLE] sending...");
     printStats();
     lastStatsMs = nowMs;
-  }
-
-  if (Serial && (nowMs - lastPacketPrintMs >= 1000)) {
-    printPacketSummary(totalPacketsSent);
-    lastPacketPrintMs = nowMs;
   }
 }
 
@@ -554,7 +609,7 @@ ADS1298_Sample readData() {
 }
 
 void drdyInterrupt() {
-  newDataReady = true;
+  drdyCount++;
 }
 
 // ============================================================================
