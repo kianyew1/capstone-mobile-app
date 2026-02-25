@@ -11,28 +11,6 @@
  *   Each sample is 24-bit, big-endian.
  */
 
-// Set to 1 to disable all streaming for MTU isolation testing
-#define DISABLE_STREAMING 0
-// Set to 1 to disable ADS SPI reads (use dummy samples instead)
-// Set to 1 to disable ADS SPI reads (use dummy samples instead)
-#define DISABLE_ADS_READ 0
-// Set to 1 to disable Serial prints (reduce BLE stack load)
-#define DISABLE_SERIAL 0
-
-#if DISABLE_SERIAL
-class NullSerial {
- public:
-  void begin(unsigned long) {}
-  operator bool() const { return false; }
-  template <typename... T>
-  void print(T...){ }
-  template <typename... T>
-  void println(T...){ }
-};
-static NullSerial NullSer;
-#define Serial NullSer
-#endif
-
 // Pin definitions
 #define PIN_DRDY    0   // D0
 #define PIN_PWDN    1   // D1 - PWDN and RESET tied together
@@ -151,7 +129,6 @@ uint32_t lastSendUs = 0;
 #define ECG_PACKET_SAMPLES 10
 #define ECG_SIGNALS 3
 #define ECG_PACKET_BYTES ((1 + (ECG_PACKET_SAMPLES * ECG_SIGNALS)) * 3)
-#define ECG_PACKET_REQUIRED_MTU (ECG_PACKET_BYTES + 3)
 
 struct ECGFrame {
   int32_t ch2;
@@ -162,9 +139,6 @@ struct ECGFrame {
 static ECGFrame frameBuffer[ECG_PACKET_SAMPLES];
 static volatile uint8_t frameCount = 0;
 static uint32_t packetStatus = 0;
-static uint16_t activeConnHandle = BLE_CONN_HANDLE_INVALID;
-static uint32_t connectedAtMs = 0;
-static bool streamReady = false;
 
 void packetizerPush(const ADS1298_Sample& s)
 {
@@ -275,9 +249,6 @@ void printStats()
 
 void connect_callback(uint16_t conn_hdl)
 {
-  activeConnHandle = conn_hdl;
-  connectedAtMs = millis();
-  streamReady = false;
   if (!Serial) return;
   BLEConnection* conn = Bluefruit.Connection(conn_hdl);
   uint16_t conn_mtu = conn ? conn->getMtu() : 0;
@@ -288,9 +259,6 @@ void connect_callback(uint16_t conn_hdl)
 void disconnect_callback(uint16_t conn_hdl, uint8_t reason)
 {
   (void) conn_hdl;
-  activeConnHandle = BLE_CONN_HANDLE_INVALID;
-  connectedAtMs = 0;
-  streamReady = false;
   if (!Serial) return;
   Serial.print("[BLE] Disconnected reason=0x");
   Serial.println(reason, HEX);
@@ -327,15 +295,13 @@ void setup() {
   disableTestSignal();
 
   // ---- BLE init ----
-  // Configure SoftDevice connection parameters BEFORE Bluefruit.begin()
-  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
-
   if (!Bluefruit.begin()) {
     if (Serial) {
       Serial.println("✗ Bluefruit init failed!");
     }
     while (1) blinkNonBlocking(FAIL_BLINK_MS);
   }
+  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
   Bluefruit.Periph.setConnInterval(6, 12);
   Bluefruit.setTxPower(4);
   Bluefruit.setName("XIAO-ECG");
@@ -361,13 +327,20 @@ void setup() {
 }
 
 void loop() {
+  // ===== ADC driven acquisition =====
+  if (newDataReady) {
+    newDataReady = false;
+    ADS1298_Sample sample = readData();
+    packetizerPush(sample);
+    samplesThisSecond++;
+  }
+
   // ===== BLE state =====
   static bool wasConnected = false;
   bool isConnected = Bluefruit.connected();
   if (!isConnected) {
     if (wasConnected) {
       wasConnected = false;
-      streamReady = false;
     }
     blinkNonBlocking(ADV_BLINK_MS);
     return;
@@ -379,47 +352,6 @@ void loop() {
     }
   }
   ledOn();
-
-#if DISABLE_STREAMING
-  return;
-#endif
-
-  BLEConnection* conn = nullptr;
-  if (activeConnHandle != BLE_CONN_HANDLE_INVALID) {
-    conn = Bluefruit.Connection(activeConnHandle);
-  }
-
-  if (!streamReady) {
-    bool notifyReady = ecgChar.notifyEnabled();
-    bool mtuOk = conn && conn->getMtu() >= ECG_PACKET_REQUIRED_MTU;
-    bool delayOk = connectedAtMs > 0 && (millis() - connectedAtMs) > 1000;
-    if (notifyReady && mtuOk && delayOk) {
-      streamReady = true;
-      if (Serial) {
-        Serial.print("[BLE] Stream ready mtu=");
-        Serial.println(conn->getMtu());
-      }
-    }
-  }
-
-  // ===== ADC driven acquisition =====
-  if (newDataReady) {
-    newDataReady = false;
-    if (!streamReady) {
-      return;
-    }
-#if DISABLE_ADS_READ
-    ADS1298_Sample sample;
-    sample.status = 0xC00000;
-    for (int i = 0; i < 8; i++) {
-      sample.channel[i] = 0;
-    }
-#else
-    ADS1298_Sample sample = readData();
-#endif
-    packetizerPush(sample);
-    samplesThisSecond++;
-  }
 
   // ===== timing (20 ms) =====
   uint32_t nowUs = micros();
@@ -433,7 +365,7 @@ void loop() {
   static uint8_t packet[ECG_PACKET_BYTES];
   packetizerBuild(packet);
 
-  if (!streamReady || !ecgChar.notifyEnabled()) {
+  if (!ecgChar.notifyEnabled()) {
     // No active subscribers yet
     return;
   }
