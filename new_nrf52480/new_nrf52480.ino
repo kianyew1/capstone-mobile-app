@@ -1,6 +1,10 @@
 #define CFG_GATT_MAX_MTU_SIZE 247
 #include <bluefruit.h>
+#include <math.h>
 #include <SPI.h>
+
+// Forward declaration to keep Arduino auto-prototypes happy.
+struct ADS1298_Sample;
 
 /*
  * ADS1298 ECG with Seeed XIAO nRF52840
@@ -81,6 +85,9 @@ void blinkNonBlocking(unsigned long intervalMs)
 #define ADS1298_REG_WCT1     0x18
 #define ADS1298_REG_WCT2     0x19
 
+// Toggle mock ECG signal (uses synthetic waveform instead of ADS1298 readings)
+const bool mock_signal = false;
+
 // Timing constants (in microseconds)
 #define T_POR        1000
 #define T_CLK        1
@@ -109,6 +116,50 @@ static uint16_t ringHead = 0;
 static uint16_t ringTail = 0;
 static uint16_t ringCount = 0;
 static uint16_t ringMax = 0;
+
+// Synthetic ECG generator (24-bit range)
+static float mockPhase = 0.0f;
+static const float mockSampleRateHz = 500.0f;
+static const float mockHeartRateHz = 1.2f; // ~72 BPM
+static const float mockPhaseStep =
+  (2.0f * 3.14159265f * mockHeartRateHz) / mockSampleRateHz;
+static const uint32_t mockSamplePeriodUs = 2000;
+static uint32_t lastMockUs = 0;
+
+int32_t mockEcgWave(float phase, float phaseOffset) {
+  // Phase in radians -> normalized cycle [0, 1)
+  const float twoPi = 2.0f * 3.14159265f;
+  float p = phase + phaseOffset;
+  if (p >= twoPi) p -= twoPi;
+  float x = p / twoPi;
+
+  // PQRST model as sum of Gaussians + mild baseline wander
+  float pWave = 0.12f * expf(-0.5f * powf((x - 0.18f) / 0.025f, 2.0f));
+  float qWave = -0.20f * expf(-0.5f * powf((x - 0.46f) / 0.012f, 2.0f));
+  float rWave = 1.00f * expf(-0.5f * powf((x - 0.50f) / 0.010f, 2.0f));
+  float sWave = -0.25f * expf(-0.5f * powf((x - 0.54f) / 0.015f, 2.0f));
+  float tWave = 0.35f * expf(-0.5f * powf((x - 0.76f) / 0.050f, 2.0f));
+  float wander = 0.02f * sinf(twoPi * x);
+
+  float value = pWave + qWave + rWave + sWave + tWave + wander;
+
+  // Scale to 24-bit signed range (keep some headroom)
+  float scaled = value * 2500000.0f;
+  if (scaled > 8388607.0f) scaled = 8388607.0f;
+  if (scaled < -8388608.0f) scaled = -8388608.0f;
+  return (int32_t)scaled;
+}
+
+void fillMockSample(ADS1298_Sample* sample) {
+  sample->status = 0xC00000;
+  sample->channel[1] = mockEcgWave(mockPhase, 0.0f);
+  sample->channel[2] = mockEcgWave(mockPhase, 0.4f);
+  sample->channel[3] = mockEcgWave(mockPhase, 0.8f);
+  mockPhase += mockPhaseStep;
+  if (mockPhase >= 2.0f * 3.14159265f) {
+    mockPhase -= 2.0f * 3.14159265f;
+  }
+}
 
 // Forward declarations to avoid Arduino auto-prototype issues
 void packetizerPush(const ADS1298_Sample& s);
@@ -251,25 +302,27 @@ void printPacketSummary(uint32_t packetNumber)
 
 void printStats()
 {
-  const uint32_t expectedSamplesPerSec = 500;
-  const uint32_t expectedPacketsPerSec = expectedSamplesPerSec / SAMPLES_PER_PACKET;
+  // const uint32_t expectedSamplesPerSec = 500;
+  // const uint32_t expectedPacketsPerSec = expectedSamplesPerSec / SAMPLES_PER_PACKET;
 
-  Serial.print("[STATS] samples/sec=");
-  Serial.print(samplesThisSecond);
-  Serial.print(" packets/sec=");
-  Serial.print(packetsSentThisSecond);
-  Serial.print(" expected_packets/sec=");
-  Serial.print(expectedPacketsPerSec);
-  Serial.print(" notifyFail/sec=");
-  Serial.println(notifyFailThisSecond);
-  Serial.print("[STATS] buffer_fill=");
-  Serial.print(ringCount);
-  Serial.print(" buffer_max=");
-  Serial.print(ringMax);
-  Serial.print(" dropped_samples/sec=");
-  Serial.println(droppedSamplesThisSecond);
-  Serial.print("[STATS] drdy_backlog_max=");
-  Serial.println(maxDrdyBacklog);
+  // Serial.print("[STATS] samples/sec=");
+  // Serial.print(samplesThisSecond);
+  // Serial.print(" packets/sec=");
+  // Serial.print(packetsSentThisSecond);
+  // Serial.print(" expected_packets/sec=");
+  // Serial.print(expectedPacketsPerSec);
+  // Serial.print(" notifyFail/sec=");
+  // Serial.println(notifyFailThisSecond);
+  // Serial.print("[STATS] buffer_fill=");
+  // Serial.print(ringCount);
+  // Serial.print(" buffer_max=");
+  // Serial.print(ringMax);
+  // Serial.print(" dropped_samples/sec=");
+  // Serial.println(droppedSamplesThisSecond);
+  // Serial.print("[STATS] drdy_backlog_max=");
+  // Serial.println(maxDrdyBacklog);
+  Serial.println("... dropped: ");
+  Serial.print(droppedSamplesThisSecond);
   maxDrdyBacklog = 0;
   ringMax = 0;
   droppedSamplesThisSecond = 0;
@@ -337,6 +390,8 @@ void setup() {
     Serial.println("[BLE] Advertising...");
     Serial.print("[BLE] Max MTU (periph)=");
     Serial.println(Bluefruit.getMaxMtu(BLE_GAP_ROLE_PERIPH));
+    Serial.print("[BLE] mock_signal=");
+    Serial.println(mock_signal ? "true" : "false");
   }
 }
 
@@ -356,6 +411,9 @@ void loop() {
   }
   while (pending > 0) {
     ADS1298_Sample sample = readData();
+    if (mock_signal) {
+      fillMockSample(&sample);
+    }
     samplesThisSecond++;
     if (isConnected) {
       if (ringCount < RING_CAPACITY) {
@@ -374,6 +432,31 @@ void loop() {
       }
     }
     pending--;
+  }
+
+  if (mock_signal && isConnected) {
+    uint32_t nowMockUs = micros();
+    if (lastMockUs == 0) lastMockUs = nowMockUs;
+    while ((uint32_t)(nowMockUs - lastMockUs) >= mockSamplePeriodUs) {
+      lastMockUs += mockSamplePeriodUs;
+      ADS1298_Sample sample;
+      fillMockSample(&sample);
+      samplesThisSecond++;
+      if (ringCount < RING_CAPACITY) {
+        ringBuffer[ringHead].status = sample.status;
+        ringBuffer[ringHead].ch2 = sample.channel[1];
+        ringBuffer[ringHead].ch3 = sample.channel[2];
+        ringBuffer[ringHead].ch4 = sample.channel[3];
+        ringHead = (ringHead + 1) % RING_CAPACITY;
+        ringCount++;
+        if (ringCount > ringMax) {
+          ringMax = ringCount;
+        }
+      } else {
+        droppedSamplesTotal++;
+        droppedSamplesThisSecond++;
+      }
+    }
   }
 
   // ===== BLE state =====
@@ -429,7 +512,9 @@ void loop() {
         ringCount -= ECG_PACKET_SAMPLES;
         packetizerConsume();
 
-        // intentionally no per-packet serial dump
+        if (Serial && (totalPacketsSent % 100 == 0)) {
+          printPacketSummary(totalPacketsSent);
+        }
       } else {
         // Still consume to keep streaming continuous, even if no subscriber
         notifyFail++;
@@ -514,20 +599,24 @@ bool initADS1298() {
   delay(10);
   Serial.println("  ✓ All registers configured");
 
-  Serial.println("\nStep 6: Verify Device ID");
-  uint8_t deviceID = readRegister(ADS1298_REG_ID);
-  Serial.print("  - Device ID: 0x");
-  Serial.println(deviceID, HEX);
+  if (!mock_signal) {
+    Serial.println("\nStep 6: Verify Device ID");
+    uint8_t deviceID = readRegister(ADS1298_REG_ID);
+    Serial.print("  - Device ID: 0x");
+    Serial.println(deviceID, HEX);
 
-  if ((deviceID & 0xF8) == 0x98) {
-    Serial.println("  ✓ ADS1298 detected");
-  } else if ((deviceID & 0xF8) == 0x90) {
-    Serial.println("  ✓ ADS1296 detected");
-  } else if ((deviceID & 0xF8) == 0x88) {
-    Serial.println("  ✓ ADS1294 detected");
+    if ((deviceID & 0xF8) == 0x98){
+      Serial.println("  ✓ ADS1298 detected");
+    } else if ((deviceID & 0xF8) == 0x90) {
+      Serial.println("  ✓ ADS1296 detected");
+    } else if ((deviceID & 0xF8) == 0x88) {
+      Serial.println("  ✓ ADS1294 detected");
+    } else {
+      Serial.println("  ✗ Unknown device!");
+      return false;
+    }
   } else {
-    Serial.println("  ✗ Unknown device!");
-    return false;
+    Serial.println("Mock code and device being used instead");
   }
 
   Serial.println("\nStep 7: Start Conversion");

@@ -31,7 +31,13 @@ logger = logging.getLogger("ecg-backend")
 DEFAULT_BASE_URL = "http://127.0.0.1:8001"
 BASE_URL = os.getenv("BASE_URL") or DEFAULT_BASE_URL
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CSV_OUTPUT_PATH = os.path.join(REPO_ROOT, "channels_volts.csv")
+
+PACKET_BYTES = 228
+SAMPLES_PER_PACKET = 25
+CHANNEL_LABELS = ["CH2", "CH3", "CH4"]
+ADS1298_VREF = 2.4
+ADS1298_GAIN = 6.0
+ADS1298_MAX_CODE = (2**23) - 1
 
 LAST_CALIBRATION_SAMPLES = []
 LAST_CALIBRATION_META = {
@@ -185,6 +191,58 @@ def _decode_int16_le(payload: bytes) -> List[int]:
         int.from_bytes(payload[i : i + 2], "little", signed=True)
         for i in range(0, sample_count * 2, 2)
     ]
+
+
+def _read24_signed_be(payload: bytes, offset: int) -> int:
+    value = (payload[offset] << 16) | (payload[offset + 1] << 8) | payload[offset + 2]
+    if value & 0x800000:
+        return value | 0xFF000000
+    return value
+
+
+def _counts_to_mv(count: int) -> float:
+    return (count / ADS1298_MAX_CODE) * (ADS1298_VREF / ADS1298_GAIN) * 1000.0
+
+
+def _decode_ads1298_packets(payload: bytes) -> Dict[str, List[float]]:
+    if len(payload) < PACKET_BYTES:
+        return {label: [] for label in CHANNEL_LABELS}
+    packet_count = len(payload) // PACKET_BYTES
+    remainder = len(payload) % PACKET_BYTES
+    if remainder != 0:
+        logger.warning(
+            "[DECODE] payload not multiple of packet bytes len=%s remainder=%s",
+            len(payload),
+            remainder,
+        )
+    channels: Dict[str, List[float]] = {label: [] for label in CHANNEL_LABELS}
+    for p in range(packet_count):
+        base = p * PACKET_BYTES
+        offset = base + 3  # skip status
+        for _ in range(SAMPLES_PER_PACKET):
+            channels["CH2"].append(_counts_to_mv(_read24_signed_be(payload, offset)))
+            offset += 3
+        for _ in range(SAMPLES_PER_PACKET):
+            channels["CH3"].append(_counts_to_mv(_read24_signed_be(payload, offset)))
+            offset += 3
+        for _ in range(SAMPLES_PER_PACKET):
+            channels["CH4"].append(_counts_to_mv(_read24_signed_be(payload, offset)))
+            offset += 3
+    return channels
+
+
+def _csv_path(filename: str) -> str:
+    return os.path.join(REPO_ROOT, filename)
+
+
+def _write_mv_csv(filename: str, samples: List[float]) -> int:
+    path = _csv_path(filename)
+    rows = ["index,value_mv"]
+    for idx, value in enumerate(samples, start=1):
+        rows.append(f"{idx},{value:.6f}")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(rows))
+    return len(samples)
 
 
 def _decimate(samples: List[int], max_points: int = 2000) -> List[int]:
@@ -575,7 +633,8 @@ async def calibration_channels_csv(request: Request):
             detail="CSV header must be: index,ch2,ch3,ch4",
         )
 
-    with open(CSV_OUTPUT_PATH, "w", encoding="utf-8") as handle:
+    path = _csv_path("calibration_mv.csv")
+    with open(path, "w", encoding="utf-8") as handle:
         handle.write(text)
 
     row_count = text.count("\n")
@@ -583,13 +642,13 @@ async def calibration_channels_csv(request: Request):
     logger.info(
         "[CSV] saved run_id=%s path=%s rows=%s",
         run_id,
-        CSV_OUTPUT_PATH,
+        path,
         row_count,
     )
 
     return {
         "saved": True,
-        "path": CSV_OUTPUT_PATH,
+        "path": path,
         "rows": row_count,
         "run_id": run_id,
     }
@@ -685,78 +744,78 @@ def _session_analysis_job(job_id: str, record_id: str) -> None:
 
         session_bytes = _fetch_storage_bytes(session_key)
         calibration_bytes = _fetch_storage_bytes(calibration_key)
-        session_samples = _decode_int16_le(session_bytes)
-        calibration_samples = _decode_int16_le(calibration_bytes)
+        session_channels = _decode_ads1298_packets(session_bytes)
+        calibration_channels = _decode_ads1298_packets(calibration_bytes)
         sample_rate_hz = int(record.get("sample_rate_hz") or 500)
 
         window_seconds = 20
-        best_windows = _select_top_windows(
-            session_samples,
-            sample_rate_hz=sample_rate_hz,
-            window_seconds=window_seconds,
-            top_k=3,
-            max_points=10000,
-        )
+        channel_results: Dict[str, Dict[str, Any]] = {}
+        for channel in CHANNEL_LABELS:
+            session_samples = session_channels.get(channel, [])
+            calibration_samples = calibration_channels.get(channel, [])
+            best_windows = _select_top_windows(
+                session_samples,
+                sample_rate_hz=sample_rate_hz,
+                window_seconds=window_seconds,
+                top_k=3,
+                max_points=10000,
+            )
 
-        window_size = sample_rate_hz * window_seconds
-        calibration_segment = (
-            calibration_samples[:window_size]
-            if len(calibration_samples) >= window_size
-            else calibration_samples
-        )
-        calibration_result = _process_window(
-            calibration_segment,
-            sample_rate_hz=sample_rate_hz,
-        )
-        calibration_metrics = calibration_result.get("metrics", {})
+            window_size = sample_rate_hz * window_seconds
+            calibration_segment = (
+                calibration_samples[:window_size]
+                if len(calibration_samples) >= window_size
+                else calibration_samples
+            )
+            calibration_result = _process_window(
+                calibration_segment,
+                sample_rate_hz=sample_rate_hz,
+            )
+            calibration_metrics = calibration_result.get("metrics", {})
 
-        LAST_ANALYSIS_PLOT["session"] = {
+            calibration_plot_b64 = _ecg_plot_base64(
+                calibration_result.get("signals"),
+                calibration_result.get("info", {}),
+                sample_rate_hz=sample_rate_hz,
+            )
+            window_plot_b64 = []
+            for win in best_windows:
+                window_plot_b64.append(
+                    _ecg_plot_base64(
+                        win.get("signals"),
+                        win.get("info", {}),
+                        sample_rate_hz=sample_rate_hz,
+                    )
+                )
+
+            channel_results[channel] = {
+                "session_samples": session_samples,
+                "calibration_samples": calibration_samples,
+                "best_windows": best_windows,
+                "calibration_metrics": calibration_metrics,
+                "ecg_plots": {
+                    "calibration": calibration_plot_b64,
+                    "windows": window_plot_b64,
+                },
+            }
+
+        LAST_ANALYSIS_PLOT["session_meta"] = {
             "object_key": session_key,
             "bucket": bucket,
             "byte_length": len(session_bytes),
-            "sample_count": len(session_samples),
-            "data": _decimate(session_samples),
-            "best_windows": best_windows,
         }
-        LAST_ANALYSIS_PLOT["calibration"] = {
+        LAST_ANALYSIS_PLOT["calibration_meta"] = {
             "object_key": calibration_key,
             "bucket": bucket,
             "byte_length": len(calibration_bytes),
-            "sample_count": len(calibration_samples),
-            "data": _decimate(calibration_segment, max_points=10000),
-            "metrics": calibration_metrics,
         }
-
-        calibration_plot_b64 = _ecg_plot_base64(
-            calibration_result.get("signals"),
-            calibration_result.get("info", {}),
-            sample_rate_hz=sample_rate_hz,
-        )
-        window_plot_b64 = []
-        for win in best_windows:
-            window_plot_b64.append(
-                _ecg_plot_base64(
-                    win.get("signals"),
-                    win.get("info", {}),
-                    sample_rate_hz=sample_rate_hz,
-                )
-            )
-        LAST_ANALYSIS_PLOT["ecg_plots"] = {
-            "calibration": calibration_plot_b64,
-            "windows": window_plot_b64,
-        }
+        LAST_ANALYSIS_PLOT["channels"] = channel_results
 
         _set_job(job_id, status="decoded")
         logger.info(
-            "[JOB] decoded job_id=%s session_samples=%s calibration_samples=%s",
+            "[JOB] decoded job_id=%s channels=%s",
             job_id,
-            len(session_samples),
-            len(calibration_samples),
-        )
-        logger.info(
-            "[JOB] best_windows job_id=%s count=%s",
-            job_id,
-            len(best_windows),
+            list(channel_results.keys()),
         )
     except HTTPException as exc:
         _set_job(job_id, status="error", error=exc.detail)
@@ -928,7 +987,7 @@ async def session_insights(payload: SessionAnalysisRequest) -> List[Insight]:
 
 
 @app.get("/", response_class=HTMLResponse)
-def root() -> str:
+def root(request: Request) -> str:
     try:
         latest_id = _fetch_latest_recording_id()
         if latest_id and LAST_ANALYSIS_PLOT.get("record_id") != latest_id:
@@ -937,16 +996,21 @@ def root() -> str:
     except Exception as exc:  # pragma: no cover - safeguard
         logger.error("[ROOT] refresh_failed error=%s", exc)
 
-    calibration_plot = LAST_ANALYSIS_PLOT.get("calibration")
-    session_plot = LAST_ANALYSIS_PLOT.get("session")
-    ecg_plots = LAST_ANALYSIS_PLOT.get("ecg_plots", {}) or {}
+    selected_channel = (request.query_params.get("ch") or "CH2").upper()
+    if selected_channel not in CHANNEL_LABELS:
+        selected_channel = "CH2"
+
+    channel_data = (LAST_ANALYSIS_PLOT.get("channels") or {}).get(selected_channel, {})
+    calibration_plot = LAST_ANALYSIS_PLOT.get("calibration_meta") or {}
+    session_plot = LAST_ANALYSIS_PLOT.get("session_meta") or {}
+    ecg_plots = channel_data.get("ecg_plots", {}) or {}
     calib_plot_b64 = ecg_plots.get("calibration")
     window_plot_b64 = ecg_plots.get("windows", []) or []
 
-    has_calibration = bool(calibration_plot and calibration_plot.get("data"))
-    has_session = bool(session_plot and session_plot.get("data"))
-    has_best_windows = bool(session_plot and session_plot.get("best_windows"))
-    best_windows = session_plot.get("best_windows") if session_plot else []
+    has_calibration = bool(channel_data.get("calibration_samples"))
+    has_session = bool(channel_data.get("session_samples"))
+    best_windows = channel_data.get("best_windows", []) or []
+    has_best_windows = bool(best_windows)
     best_windows_sanitized = []
     for item in best_windows or []:
         best_windows_sanitized.append(
@@ -1003,7 +1067,7 @@ def root() -> str:
         return "<div class='metrics-grid'>" + "".join(cells) + "</div>"
 
     calibration_metrics_html = _metrics_grid(
-        calibration_plot.get("metrics") if calibration_plot else None
+        channel_data.get("calibration_metrics") if channel_data else None
     )
 
     best_windows_html = "".join(
@@ -1029,12 +1093,28 @@ def root() -> str:
     )
 
     calibration_data_json = json.dumps(
-        calibration_plot["data"] if calibration_plot else []
+        channel_data.get("calibration_samples") if channel_data else []
     )
     session_data_json = json.dumps(
-        session_plot["data"] if session_plot else []
+        channel_data.get("session_samples") if channel_data else []
     )
     best_windows_json = json.dumps(best_windows_sanitized)
+
+    try:
+        calibration_samples = channel_data.get("calibration_samples", []) if channel_data else []
+        written_cal = _write_mv_csv("calibration_mv.csv", calibration_samples)
+        window_samples = []
+        for idx, window in enumerate(best_windows or [], start=1):
+            samples = window.get("cleaned") or window.get("data") or []
+            window_samples.append(_write_mv_csv(f"window{idx}_mv.csv", samples))
+        logger.info(
+            "[CSV] export channel=%s calibration=%s window_counts=%s",
+            selected_channel,
+            written_cal,
+            window_samples,
+        )
+    except Exception as exc:  # pragma: no cover - safeguard
+        logger.error("[CSV] export failed error=%s", exc)
 
     return f"""<!doctype html>
 <html>
@@ -1101,17 +1181,40 @@ def root() -> str:
         display: block;
         background: #111827;
       }}
+      .header-row {{
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }}
+      .channel-select {{
+        background: #0f172a;
+        color: #e5e5e5;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 6px 10px;
+        font-size: 14px;
+      }}
     </style>
   </head>
   <body>
-    <h1>ECG Session Verification</h1>
+    <div class="header-row">
+      <h1>ECG Session Verification</h1>
+      <label>
+        <select class="channel-select" id="channel-select">
+          <option value="CH2" {"selected" if selected_channel == "CH2" else ""}>CH2</option>
+          <option value="CH3" {"selected" if selected_channel == "CH3" else ""}>CH3</option>
+          <option value="CH4" {"selected" if selected_channel == "CH4" else ""}>CH4</option>
+        </select>
+      </label>
+    </div>
     {"<div>No analysis data received yet.</div>" if not (has_calibration or has_session) else ""}
 
     <div class="layout">
       <div class="left">
         <div class="panel">
-      <h2>Calibration Signal</h2>
-      <div class="meta">Calibration Signal, filepath={(calibration_plot["bucket"] + "/" + calibration_plot["object_key"]) if calibration_plot else "n/a"} | byte_length={calibration_plot["byte_length"] if calibration_plot else 0} | sample_count={calibration_plot["sample_count"] if calibration_plot else 0}</div>
+      <h2>Calibration Signal ({selected_channel})</h2>
+      <div class="meta">Calibration Signal, filepath={(calibration_plot.get("bucket", "") + "/" + calibration_plot.get("object_key", "")) if calibration_plot else "n/a"} | byte_length={calibration_plot.get("byte_length", 0) if calibration_plot else 0} | sample_count={len(channel_data.get("calibration_samples", []) if channel_data else [])}</div>
       {"<div>No calibration data received yet.</div>" if not has_calibration else ""}
       <div class="controls">
         <label><input type="checkbox" id="toggle-window-1" checked /> Show Window 1</label>
@@ -1147,8 +1250,8 @@ def root() -> str:
     </div>
 
     <div class="panel">
-      <h2>Session Signal</h2>
-      <div class="meta">Session Signal, filepath={(session_plot["bucket"] + "/" + session_plot["object_key"]) if session_plot else "n/a"} | byte_length={session_plot["byte_length"] if session_plot else 0} | sample_count={session_plot["sample_count"] if session_plot else 0}</div>
+      <h2>Session Signal ({selected_channel})</h2>
+      <div class="meta">Session Signal, filepath={(session_plot.get("bucket", "") + "/" + session_plot.get("object_key", "")) if session_plot else "n/a"} | byte_length={session_plot.get("byte_length", 0) if session_plot else 0} | sample_count={len(channel_data.get("session_samples", []) if channel_data else [])}</div>
       {"<div>No session data received yet.</div>" if not has_session else ""}
     </div>
 
@@ -1171,6 +1274,15 @@ def root() -> str:
       const calibrationData = {calibration_data_json};
       const sessionData = {session_data_json};
       const bestWindows = {best_windows_json};
+      const channelSelect = document.getElementById("channel-select");
+      if (channelSelect) {{
+        channelSelect.addEventListener("change", (evt) => {{
+          const value = evt.target.value || "CH2";
+          const url = new URL(window.location.href);
+          url.searchParams.set("ch", value);
+          window.location.href = url.toString();
+        }});
+      }}
 
       function drawAxes(ctx, canvas, axisLen, maxAbs, viewStart, viewEnd, padding) {{
         const plotWidth = canvas.width - padding.left - padding.right;
@@ -1231,16 +1343,17 @@ def root() -> str:
         ctx.lineWidth = 1.5;
         const mid = padding.top + plotHeight / 2;
         const viewSpan = Math.max(1, viewEnd - viewStart);
-        const dataSpan = Math.max(1, data.length - 1);
+        const maxPoints = 5000;
+        const step = Math.max(1, Math.floor(viewSpan / maxPoints));
         ctx.beginPath();
-        for (let i = 0; i < data.length; i++) {{
-          const xIndex = (i / dataSpan) * (axisLen - 1);
-          if (xIndex < viewStart || xIndex > viewEnd) continue;
+        const startIndex = Math.max(0, Math.floor(viewStart));
+        const endIndex = Math.min(data.length - 1, Math.floor(viewEnd));
+        for (let i = startIndex; i <= endIndex; i += step) {{
           const x =
             padding.left +
-            ((xIndex - viewStart) / viewSpan) * plotWidth;
+            ((i - viewStart) / viewSpan) * plotWidth;
           const y = mid - (data[i] / scale) * (plotHeight / 2);
-          if (i === 0) ctx.moveTo(x, y);
+          if (i === startIndex) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
         }}
         ctx.stroke();
