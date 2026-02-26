@@ -49,3 +49,6 @@ capstone-ecgapp/.env
 backend/calibration_request.json
 /backend/.venv
 backend/tests/__pycache__/test_imports.cpython-312-pytest-9.0.2.pyc
+window1_mv.csv
+window2_mv.csv
+window3_mv.csv
