@@ -49,6 +49,10 @@ import {
   ECG_PACKET_BYTES,
   ECG_SAMPLES_PER_PACKET,
 } from "@/services/ecg-utils";
+import {
+  enqueueLivefeedSamples,
+  resetLivefeedQueue,
+} from "@/services/livefeed";
 import { useAppStore } from "@/stores/app-store";
 import { useSessionStore } from "@/stores/session-store";
 
@@ -170,9 +174,10 @@ export default function RunSessionScreen() {
 
     if (isStreamingRef.current) return;
     isStreamingRef.current = true;
-    sessionPacketsRef.current = [];
-    sessionPacketCountRef.current = 0;
-    invalidPacketCountRef.current = 0;
+    if (sessionPacketsRef.current.length === 0) {
+      sessionPacketCountRef.current = 0;
+      invalidPacketCountRef.current = 0;
+    }
     console.log(
       `[SESSION] start stream expectedBytes=${expectedPacketBytes}`,
     );
@@ -195,6 +200,7 @@ export default function RunSessionScreen() {
         invalidPacketCountRef.current += 1;
         return;
       }
+      enqueueLivefeedSamples(decoded.ch2);
       sessionPacketsRef.current.push(bytes);
       sessionPacketCountRef.current += 1;
       const count = sessionPacketCountRef.current;
@@ -219,6 +225,13 @@ export default function RunSessionScreen() {
       sessionStartRef.current = null;
       stopEcgNotifications();
     }
+  }, [sessionStatus, stopEcgNotifications]);
+
+  useEffect(() => {
+    if (sessionStatus !== "paused") return;
+    if (!isStreamingRef.current) return;
+    isStreamingRef.current = false;
+    stopEcgNotifications();
   }, [sessionStatus, stopEcgNotifications]);
 
   useEffect(() => {
@@ -276,6 +289,7 @@ export default function RunSessionScreen() {
   };
 
   const handleStart = () => {
+    resetLivefeedQueue();
     startSession();
     setShowBackgroundTip(true);
   };
@@ -291,6 +305,7 @@ export default function RunSessionScreen() {
   const handleEnd = async () => {
     isStreamingRef.current = false;
     stopEcgNotifications();
+    resetLivefeedQueue();
 
     const chunks = sessionPacketsRef.current;
     sessionPacketsRef.current = [];

@@ -27,6 +27,7 @@ const DESIRED_MTU = 247;
 let bleManagerInstance: BleManager | null = null;
 let ecgSubscription: Subscription | null = null;
 let ecgListener: ((payloadBase64: string) => void) | null = null;
+let ecgTransactionId: string | null = null;
 let lastEcgPacketAtMs = 0;
 let lastEcgPayload: string | null = null;
 const MIN_ECG_PACKET_INTERVAL_MS = 10;
@@ -500,6 +501,7 @@ export function useBluetoothService() {
       ecgSubscription.remove();
       ecgSubscription = null;
     }
+    ecgTransactionId = null;
     if (mockEcgInterval) {
       clearInterval(mockEcgInterval);
       mockEcgInterval = null;
@@ -586,6 +588,7 @@ export function useBluetoothService() {
         ecgSubscription = null;
       }
 
+      ecgTransactionId = `ecg-monitor-${device.id}-${Date.now()}`;
       ecgSubscription = device.monitorCharacteristicForService(
         ECG_SERVICE_UUID,
         ECG_CHARACTERISTIC_UUID,
@@ -619,6 +622,7 @@ export function useBluetoothService() {
             ecgListener?.(payload);
           }
         },
+        ecgTransactionId,
       );
 
       return true;

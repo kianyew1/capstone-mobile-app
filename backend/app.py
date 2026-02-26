@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import warnings
+import threading
 from math import sqrt
 from typing import Any, Dict, List, Optional, Union
 from uuid import uuid4
@@ -55,6 +56,63 @@ LAST_ANALYSIS_PLOT: Dict[str, Any] = {
     },
     "record_id": None,
 }
+
+# Livefeed (CH2) buffer for backend visualization
+LIVEFEED_MAX_SAMPLES = 6000
+LIVEFEED_SAMPLE_RATE_HZ = 500
+_livefeed_lock = threading.Lock()
+_livefeed_samples: List[float] = []
+_livefeed_index = 0  # next sample index (monotonic)
+
+
+def _livefeed_append(samples: List[float]) -> None:
+    global _livefeed_index, _livefeed_samples
+    if not samples:
+        return
+    with _livefeed_lock:
+        _livefeed_samples.extend(samples)
+        _livefeed_index += len(samples)
+        if len(_livefeed_samples) > LIVEFEED_MAX_SAMPLES:
+            _livefeed_samples = _livefeed_samples[-LIVEFEED_MAX_SAMPLES:]
+
+
+def _livefeed_reset() -> None:
+    global _livefeed_samples, _livefeed_index
+    with _livefeed_lock:
+        _livefeed_samples = []
+        _livefeed_index = 0
+
+
+def _livefeed_get(since: Optional[int]) -> Dict[str, Any]:
+    with _livefeed_lock:
+        buffer_len = len(_livefeed_samples)
+        start_index = _livefeed_index - buffer_len
+        last_index = _livefeed_index - 1
+        if buffer_len == 0:
+            return {
+                "samples": [],
+                "next_index": last_index,
+                "buffer_start_index": start_index,
+                "buffer_length": 0,
+            }
+        if since is None:
+            since = start_index - 1
+        if since < start_index:
+            samples = list(_livefeed_samples)
+        else:
+            offset = (since - start_index) + 1
+            if offset < 0:
+                offset = 0
+            if offset >= buffer_len:
+                samples = []
+            else:
+                samples = _livefeed_samples[offset:]
+        return {
+            "samples": samples,
+            "next_index": last_index,
+            "buffer_start_index": start_index,
+            "buffer_length": buffer_len,
+        }
 
 
 def _get_supabase_config() -> Dict[str, str]:
@@ -563,6 +621,19 @@ class SessionAnalysisJob(BaseModel):
     error: Optional[str] = None
 
 
+class LivefeedIngestRequest(BaseModel):
+    samples_mv: List[float] = Field(default_factory=list)
+    sample_rate_hz: Optional[int] = None
+
+
+class LivefeedResponse(BaseModel):
+    samples: List[float]
+    next_index: int
+    buffer_start_index: int
+    buffer_length: int
+    sample_rate_hz: int
+
+
 class CleanWindow(BaseModel):
     start_index: int
     end_index: int
@@ -612,6 +683,286 @@ class CalibrationComparison(BaseModel):
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok", "base_url": BASE_URL}
+
+
+@app.post("/livefeed/ingest")
+def livefeed_ingest(payload: LivefeedIngestRequest) -> Dict[str, Union[int, str]]:
+    global LIVEFEED_SAMPLE_RATE_HZ
+    if payload.sample_rate_hz:
+        LIVEFEED_SAMPLE_RATE_HZ = payload.sample_rate_hz
+    _livefeed_append(payload.samples_mv)
+    snapshot = _livefeed_get(None)
+    return {
+        "status": "ok",
+        "next_index": snapshot["next_index"],
+        "buffer_length": snapshot["buffer_length"],
+    }
+
+
+@app.get("/livefeed/ch2", response_model=LivefeedResponse)
+def livefeed_ch2(since: Optional[int] = None) -> LivefeedResponse:
+    payload = _livefeed_get(since)
+    return LivefeedResponse(
+        samples=payload["samples"],
+        next_index=payload["next_index"],
+        buffer_start_index=payload["buffer_start_index"],
+        buffer_length=payload["buffer_length"],
+        sample_rate_hz=LIVEFEED_SAMPLE_RATE_HZ,
+    )
+
+
+@app.post("/livefeed/reset")
+def livefeed_reset() -> Dict[str, Union[int, str]]:
+    _livefeed_reset()
+    return {"status": "ok"}
+
+
+@app.get("/livefeed", response_class=HTMLResponse)
+def livefeed_page() -> str:
+    return """<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>ECG Livefeed (CH2)</title>
+    <style>
+      body { font-family: Arial, sans-serif; padding: 16px; background: #0b0b0b; color: #e5e5e5; }
+      .meta { margin-bottom: 12px; color: #a3a3a3; font-size: 13px; }
+      canvas { background: #111827; border: 1px solid #1f2937; width: 100%; height: 45vh; }
+      .panel { width: 80vw; max-width: 1600px; margin: 0 auto; }
+      .header-row { display: flex; align-items: center; justify-content: space-between; }
+      button#reset {
+        background: #1f2937;
+        color: #e5e5e5;
+        border: 1px solid #374151;
+        border-radius: 6px;
+        padding: 6px 12px;
+        cursor: pointer;
+      }
+      button#reset:hover { background: #111827; }
+    </style>
+  </head>
+  <body>
+    <div class="panel">
+      <div class="header-row">
+        <h1>Livefeed (CH2)</h1>
+        <button id="reset">Reset</button>
+      </div>
+      <div class="meta" id="status">Waiting for data...</div>
+      <canvas id="livefeed"></canvas>
+    </div>
+    <script>
+      const maxSamples = 6000;
+      const viewWindow = 5000;
+      const lagSamples = 100; // ~0.2s behind at 500 Hz
+      const yRange = 8.0; // +/-8 mV
+      const displayMultiplier = 16.0;
+      const buffer = [];
+      let bufferStart = 0;
+      let lastIndex = -1;
+      let cursorIndex = 0;
+      let lastFrameTs = performance.now();
+      let sampleRate = 500;
+
+      function resizeCanvas() {
+        const canvas = document.getElementById("livefeed");
+        if (!canvas) return;
+        const width = canvas.clientWidth || 300;
+        const height = canvas.clientHeight || 200;
+        canvas.width = Math.floor(width);
+        canvas.height = Math.floor(height);
+      }
+
+      function appendSamples(samples, startIndex) {
+        if (!samples || samples.length === 0) return;
+        if (buffer.length === 0 || startIndex < bufferStart) {
+          buffer.length = 0;
+          buffer.push(...samples);
+          bufferStart = startIndex;
+        } else {
+          buffer.push(...samples);
+        }
+        if (buffer.length > maxSamples) {
+          const drop = buffer.length - maxSamples;
+          buffer.splice(0, drop);
+          bufferStart += drop;
+        }
+      }
+
+      async function poll() {
+        try {
+          const res = await fetch(`/livefeed/ch2?since=${lastIndex}`);
+          if (!res.ok) throw new Error(`status ${res.status}`);
+          const data = await res.json();
+          sampleRate = data.sample_rate_hz || sampleRate;
+          appendSamples(data.samples || [], data.buffer_start_index || 0);
+          lastIndex = data.next_index ?? lastIndex;
+          const status = document.getElementById("status");
+          if (status) {
+            status.textContent = `buffer=${data.buffer_length} last_index=${lastIndex} lag=${lagSamples} samples`;
+          }
+        } catch (err) {
+          const status = document.getElementById("status");
+          if (status) status.textContent = `poll error: ${err}`;
+        }
+      }
+
+      async function resetBuffer() {
+        try {
+          await fetch("/livefeed/reset", { method: "POST" });
+        } catch (err) {
+          console.error("reset failed", err);
+        }
+        buffer.length = 0;
+        bufferStart = 0;
+        lastIndex = -1;
+        cursorIndex = 0;
+        lastFrameTs = performance.now();
+        const status = document.getElementById("status");
+        if (status) status.textContent = "Waiting for data...";
+      }
+
+      function sampleAt(index) {
+        const offset = index - bufferStart;
+        if (offset < 0 || offset >= buffer.length) return null;
+        return buffer[Math.floor(offset)];
+      }
+
+      function drawAxes(ctx, canvas, viewStart, viewEnd) {
+        const padding = { left: 48, right: 16, top: 16, bottom: 36 };
+        const plotWidth = canvas.width - padding.left - padding.right;
+        const plotHeight = canvas.height - padding.top - padding.bottom;
+        const left = padding.left;
+        const top = padding.top;
+        const bottom = top + plotHeight;
+        const right = left + plotWidth;
+        const span = Math.max(1, viewEnd - viewStart);
+        const mid = top + plotHeight / 2;
+
+        const smallX = 20; // 0.04s at 500 Hz
+        const largeX = 100; // 0.2s at 500 Hz
+        for (
+          let sample = Math.ceil(viewStart / smallX) * smallX;
+          sample <= viewEnd;
+          sample += smallX
+        ) {
+          const x = left + ((sample - viewStart) / span) * plotWidth;
+          const isMajor = sample % largeX === 0;
+          ctx.strokeStyle = isMajor
+            ? "rgba(148, 163, 184, 0.25)"
+            : "rgba(148, 163, 184, 0.08)";
+          ctx.lineWidth = isMajor ? 1.2 : 0.8;
+          ctx.beginPath();
+          ctx.moveTo(x, top);
+          ctx.lineTo(x, bottom);
+          ctx.stroke();
+        }
+
+        const smallY = 0.2; // mV
+        const largeY = 1.0; // mV
+        for (let v = -yRange; v <= yRange + 1e-6; v += smallY) {
+          const y = mid - (v / yRange) * (plotHeight / 2);
+          const isMajor = Math.abs(v / largeY - Math.round(v / largeY)) < 1e-6;
+          ctx.strokeStyle = isMajor
+            ? "rgba(148, 163, 184, 0.25)"
+            : "rgba(148, 163, 184, 0.08)";
+          ctx.lineWidth = isMajor ? 1.2 : 0.8;
+          ctx.beginPath();
+          ctx.moveTo(left, y);
+          ctx.lineTo(right, y);
+          ctx.stroke();
+        }
+
+        ctx.fillStyle = "#9ca3af";
+        ctx.font = "12px Arial";
+        const xTicks = 5;
+        for (let i = 0; i <= xTicks; i++) {
+          const t = i / xTicks;
+          const x = left + t * plotWidth;
+          const val = Math.round(viewStart + t * (viewEnd - viewStart));
+          ctx.fillText(val.toString(), x - 6, bottom + 18);
+        }
+
+        ctx.fillText("samples", right - 48, bottom + 30);
+        ctx.strokeStyle = "#374151";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(left, top);
+        ctx.lineTo(left, bottom);
+        ctx.lineTo(right, bottom);
+        ctx.stroke();
+
+        return { padding, plotWidth, plotHeight, mid };
+      }
+
+      function render() {
+        const canvas = document.getElementById("livefeed");
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        const now = performance.now();
+        const dt = (now - lastFrameTs) / 1000;
+        lastFrameTs = now;
+
+        if (lastIndex >= 0) {
+          const target = Math.max(lastIndex - lagSamples, 0);
+          cursorIndex = Math.min(cursorIndex + dt * sampleRate, target);
+        }
+
+        const viewEnd = Math.max(cursorIndex, 0);
+        const viewStart = Math.max(0, viewEnd - (viewWindow - 1));
+        const viewEndFixed = viewStart + (viewWindow - 1);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const { padding, plotWidth, plotHeight, mid } = drawAxes(
+          ctx,
+          canvas,
+          viewStart,
+          viewEndFixed,
+        );
+        const span = Math.max(1, viewWindow - 1);
+        ctx.strokeStyle = "#22c55e";
+        ctx.lineWidth = 1.5;
+        let mean = 0;
+        let meanCount = 0;
+        for (let i = 0; i < viewWindow; i++) {
+          const idx = viewStart + i;
+          if (idx > viewEnd) break;
+          const v = sampleAt(idx);
+          if (v === null) continue;
+          mean += v;
+          meanCount += 1;
+        }
+        if (meanCount > 0) mean /= meanCount;
+        ctx.beginPath();
+        let started = false;
+        for (let i = 0; i < viewWindow; i++) {
+          const idx = viewStart + i;
+          if (idx > viewEnd) break;
+          const v = sampleAt(idx);
+          if (v === null) continue;
+          const x = padding.left + (i / span) * plotWidth;
+          const normalized = (v - mean) * displayMultiplier;
+          const y = mid - (normalized / yRange) * (plotHeight / 2);
+          if (!started) {
+            ctx.moveTo(x, y);
+            started = true;
+          } else {
+            ctx.lineTo(x, y);
+          }
+        }
+        if (started) ctx.stroke();
+
+        requestAnimationFrame(render);
+      }
+
+      resizeCanvas();
+      window.addEventListener("resize", resizeCanvas);
+      document.getElementById("reset")?.addEventListener("click", resetBuffer);
+      poll();
+      setInterval(poll, 500);
+      requestAnimationFrame(render);
+    </script>
+  </body>
+</html>
+"""
 
 
 
