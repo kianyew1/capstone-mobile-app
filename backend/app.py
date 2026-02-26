@@ -289,6 +289,18 @@ def _metrics_from_info(
     return metrics
 
 
+def _extract_r_peaks(info: Dict[str, Any]) -> List[int]:
+    peaks = info.get("ECG_R_Peaks", []) if info else []
+    if peaks is None:
+        return []
+    try:
+        if hasattr(peaks, "tolist"):
+            peaks = peaks.tolist()
+        return [int(p) for p in list(peaks) if p is not None]
+    except Exception:
+        return []
+
+
 def _process_window(
     window: List[int],
     sample_rate_hz: int,
@@ -299,6 +311,7 @@ def _process_window(
             "info": {},
             "quality": 0.0,
             "metrics": _metrics_from_info([], {}, sample_rate_hz),
+            "r_peaks": [],
         }
     try:
         with warnings.catch_warnings():
@@ -328,12 +341,14 @@ def _process_window(
         else:
             quality_score = float(quality) if quality is not None else 0.0
         metrics = _metrics_from_info(cleaned, info, sample_rate_hz)
+        r_peaks = _extract_r_peaks(info)
         return {
             "cleaned": cleaned,
             "signals": signals,
             "info": info,
             "quality": quality_score,
             "metrics": metrics,
+            "r_peaks": r_peaks,
         }
     except Exception as exc:  # pragma: no cover - safeguard
         logger.error("[PROCESS] failed error=%s", exc)
@@ -342,6 +357,7 @@ def _process_window(
             "info": {},
             "quality": 0.0,
             "metrics": _metrics_from_info([], {}, sample_rate_hz),
+            "r_peaks": [],
         }
 
 
@@ -418,6 +434,7 @@ def _select_top_windows(
                 "signals": result.get("signals"),
                 "info": result.get("info", {}),
                 "metrics": result.get("metrics", {}),
+                "r_peaks": result.get("r_peaks", []),
             }
         )
 
@@ -440,6 +457,7 @@ def _select_top_windows(
                 "delineate": delineate,
                 "signals": item.get("signals"),
                 "info": info,
+                "r_peaks": item.get("r_peaks", []),
             }
         )
     return results
@@ -772,6 +790,7 @@ def _session_analysis_job(job_id: str, record_id: str) -> None:
                 sample_rate_hz=sample_rate_hz,
             )
             calibration_metrics = calibration_result.get("metrics", {})
+            calibration_r_peaks = calibration_result.get("r_peaks", [])
 
             calibration_plot_b64 = _ecg_plot_base64(
                 calibration_result.get("signals"),
@@ -793,6 +812,7 @@ def _session_analysis_job(job_id: str, record_id: str) -> None:
                 "calibration_samples": calibration_samples,
                 "best_windows": best_windows,
                 "calibration_metrics": calibration_metrics,
+                "calibration_r_peaks": calibration_r_peaks,
                 "ecg_plots": {
                     "calibration": calibration_plot_b64,
                     "windows": window_plot_b64,
@@ -1021,6 +1041,7 @@ def root(request: Request) -> str:
                 "data": item.get("data", []),
                 "metrics": item.get("metrics", {}),
                 "delineate": item.get("delineate", {}),
+                "r_peaks": item.get("r_peaks", []),
             }
         )
 
@@ -1043,32 +1064,10 @@ def root(request: Request) -> str:
         ]
         return "<ul class='metrics'>" + "".join(items) + "</ul>"
 
-    def _metrics_grid(metrics: Optional[Dict[str, Optional[float]]]) -> str:
-        if not metrics:
-            return "<div class='metrics-grid'>No metrics available.</div>"
-        rows = [
-            ("Avg HR", metrics.get("avg_hr_bpm"), " bpm"),
-            ("Min HR", metrics.get("min_hr_bpm"), " bpm"),
-            ("Max HR", metrics.get("max_hr_bpm"), " bpm"),
-            ("HRV RMSSD", metrics.get("hrv_rmssd_ms"), " ms"),
-            ("HRV SDNN", metrics.get("hrv_sdnn_ms"), " ms"),
-            ("HRV MeanNN", metrics.get("hrv_meannn_ms"), " ms"),
-            ("R Peaks", metrics.get("r_peak_count"), ""),
-        ]
-        cells = []
-        for label, value, unit in rows:
-            if value is None:
-                display = "n/a"
-            else:
-                display = f"{value:.2f}{unit}"
-            cells.append(
-                f"<div class='metric-cell'><div class='metric-label'>{label}</div><div class='metric-value'>{display}</div></div>"
-            )
-        return "<div class='metrics-grid'>" + "".join(cells) + "</div>"
-
-    calibration_metrics_html = _metrics_grid(
-        channel_data.get("calibration_metrics") if channel_data else None
-    )
+    def _format_value(value: Optional[float], unit: str = "") -> str:
+        if value is None:
+            return "n/a"
+        return f"{value:.2f}{unit}"
 
     best_windows_html = "".join(
         [
@@ -1079,21 +1078,46 @@ def root(request: Request) -> str:
             for i, item in enumerate(best_windows)
         ]
     )
+    metrics_rows = [
+        ("Avg HR", "avg_hr_bpm", " bpm"),
+        ("Min HR", "min_hr_bpm", " bpm"),
+        ("Max HR", "max_hr_bpm", " bpm"),
+        ("HRV RMSSD", "hrv_rmssd_ms", " ms"),
+        ("HRV SDNN", "hrv_sdnn_ms", " ms"),
+        ("HRV MeanNN", "hrv_meannn_ms", " ms"),
+        ("R Peaks", "r_peak_count", ""),
+    ]
+    calibration_metrics = channel_data.get("calibration_metrics") if channel_data else {}
+    window_metrics = [w.get("metrics", {}) for w in best_windows[:3]]
 
-    window_metrics_html = "".join(
-        [
-            (
-                f"<div class='panel'>"
-                f"<h3>Window {i + 1}: samples {item['start_index']}-{item['end_index']}</h3>"
-                f"{_metrics_grid(item.get('metrics'))}"
-                f"</div>"
+    def _metrics_table() -> str:
+        headers = (
+            "<tr>"
+            "<th>Feature</th>"
+            "<th>Calibration</th>"
+            "<th>Window 1</th>"
+            "<th>Window 2</th>"
+            "<th>Window 3</th>"
+            "</tr>"
+        )
+        rows = []
+        for label, key, unit in metrics_rows:
+            calib_val = _format_value(calibration_metrics.get(key), unit)
+            w1 = _format_value(window_metrics[0].get(key), unit) if len(window_metrics) > 0 else "n/a"
+            w2 = _format_value(window_metrics[1].get(key), unit) if len(window_metrics) > 1 else "n/a"
+            w3 = _format_value(window_metrics[2].get(key), unit) if len(window_metrics) > 2 else "n/a"
+            rows.append(
+                f"<tr><td>{label}</td><td>{calib_val}</td><td>{w1}</td><td>{w2}</td><td>{w3}</td></tr>"
             )
-            for i, item in enumerate(best_windows)
-        ]
-    )
+        return "<table class='metrics-table'>" + headers + "".join(rows) + "</table>"
+
+    metrics_table_html = _metrics_table()
 
     calibration_data_json = json.dumps(
         channel_data.get("calibration_samples") if channel_data else []
+    )
+    calibration_r_peaks_json = json.dumps(
+        channel_data.get("calibration_r_peaks") if channel_data else []
     )
     session_data_json = json.dumps(
         channel_data.get("session_samples") if channel_data else []
@@ -1154,6 +1178,25 @@ def root(request: Request) -> str:
         grid-template-columns: repeat(4, minmax(140px, 1fr));
         gap: 10px 16px;
         margin: 8px 0 16px;
+      }}
+      .metrics-table {{
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+        margin: 8px 0 16px;
+      }}
+      .metrics-table th, .metrics-table td {{
+        border: 1px solid #1f2937;
+        padding: 6px 8px;
+        text-align: left;
+        vertical-align: top;
+      }}
+      .metrics-table th {{
+        background: #111827;
+        color: #cbd5f5;
+        font-weight: 600;
+        font-size: 11px;
+        letter-spacing: 0.02em;
       }}
       .metric-cell {{
         background: #111827;
@@ -1264,14 +1307,14 @@ def root(request: Request) -> str:
 
       <div class="right">
         <div class="panel">
-          <h2>Calibration Metrics</h2>
-          {calibration_metrics_html}
+          <h2>Calibration vs Windows</h2>
+          {metrics_table_html}
         </div>
-        {window_metrics_html if has_best_windows else "<div class='panel'><h2>Window Metrics</h2><div>No windows available.</div></div>"}
       </div>
     </div>
     <script>
       const calibrationData = {calibration_data_json};
+      const calibrationRPeaks = {calibration_r_peaks_json};
       const sessionData = {session_data_json};
       const bestWindows = {best_windows_json};
       const channelSelect = document.getElementById("channel-select");
@@ -1398,16 +1441,110 @@ def root(request: Request) -> str:
         }});
       }}
 
+      function drawRPeaks(canvasId, data, peaks, color, axisLen, viewStart, viewEnd, maxAbs) {{
+        const canvas = document.getElementById(canvasId);
+        if (!canvas || !data || data.length === 0 || !peaks || peaks.length === 0) return;
+        const ctx = canvas.getContext("2d");
+        const padding = {{ left: 48, right: 16, top: 16, bottom: 36 }};
+        const plotWidth = canvas.width - padding.left - padding.right;
+        const plotHeight = canvas.height - padding.top - padding.bottom;
+        const mid = padding.top + plotHeight / 2;
+        const viewSpan = Math.max(1, viewEnd - viewStart);
+        const scale = maxAbs || 1;
+        ctx.fillStyle = color;
+        for (const peak of peaks) {{
+          const idx = Math.round(peak);
+          if (idx < 0 || idx >= data.length) continue;
+          if (idx < viewStart || idx > viewEnd) continue;
+          const x =
+            padding.left + ((idx - viewStart) / viewSpan) * plotWidth;
+          const y = mid - (data[idx] / scale) * (plotHeight / 2);
+          ctx.beginPath();
+          ctx.arc(x, y, 3, 0, Math.PI * 2);
+          ctx.fill();
+        }}
+      }}
+
+      function drawOverlayRPeaks(canvasId, windows, showFlags, axisLen, viewStart, viewEnd, maxAbs) {{
+        const canvas = document.getElementById(canvasId);
+        if (!canvas || !windows || windows.length === 0) return;
+        const ctx = canvas.getContext("2d");
+        const padding = {{ left: 48, right: 16, top: 16, bottom: 36 }};
+        const plotWidth = canvas.width - padding.left - padding.right;
+        const plotHeight = canvas.height - padding.top - padding.bottom;
+        const mid = padding.top + plotHeight / 2;
+        const viewSpan = Math.max(1, viewEnd - viewStart);
+        const colors = ["#ef4444", "#f97316", "#f59e0b"];
+        const scale = maxAbs || 1;
+
+        windows.forEach((w, idx) => {{
+          if (!showFlags[idx]) return;
+          const data = w?.data || [];
+          const peaks = w?.r_peaks || [];
+          if (!data.length || !peaks.length) return;
+          const dataSpan = Math.max(1, data.length - 1);
+          ctx.fillStyle = colors[idx] || "#f59e0b";
+          for (const peak of peaks) {{
+            const peakIdx = Math.round(peak);
+            const xIndex = (peakIdx / dataSpan) * (axisLen - 1);
+            if (xIndex < viewStart || xIndex > viewEnd) continue;
+            const x = padding.left + ((xIndex - viewStart) / viewSpan) * plotWidth;
+            const safeIdx = Math.min(Math.max(peakIdx, 0), data.length - 1);
+            const y = mid - (data[safeIdx] / scale) * (plotHeight / 2);
+            ctx.beginPath();
+            ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+            ctx.fill();
+          }}
+        }});
+      }}
+
+      function meanOf(data) {{
+        if (!data || data.length === 0) return 0;
+        let sum = 0;
+        for (const v of data) sum += v;
+        return sum / data.length;
+      }}
+
+      function centerData(data, mean) {{
+        if (!data || data.length === 0) return [];
+        return data.map((v) => v - mean);
+      }}
+
+      const calibrationMean = meanOf(calibrationData || []);
+      const calibrationCentered = centerData(calibrationData || [], calibrationMean);
+      const windowCentered = (bestWindows || []).map((w) => {{
+        const data = w?.data || [];
+        const mean = meanOf(data);
+        return {{ ...w, mean, data: centerData(data, mean) }};
+      }});
+
+      function computeGlobalScale() {{
+        let maxAbs = 0;
+        for (const v of calibrationCentered || []) maxAbs = Math.max(maxAbs, Math.abs(v));
+        for (const w of windowCentered || []) {{
+          const data = w?.data || [];
+          for (const v of data) maxAbs = Math.max(maxAbs, Math.abs(v));
+        }}
+        return maxAbs || 1;
+      }}
+
+      const globalScale = computeGlobalScale();
+      const calibrationNorm = (calibrationCentered || []).map((v) => v / globalScale);
+      const windowsNorm = (windowCentered || []).map((w) => {{
+        const data = w?.data || [];
+        return {{ ...w, data: data.map((v) => v / globalScale) }};
+      }});
+
       function computeAxisLen() {{
-        if (calibrationData && calibrationData.length > 0) return calibrationData.length;
-        if (bestWindows && bestWindows.length > 0 && bestWindows[0]?.data?.length) return bestWindows[0].data.length;
+        if (calibrationNorm && calibrationNorm.length > 0) return calibrationNorm.length;
+        if (windowsNorm && windowsNorm.length > 0 && windowsNorm[0]?.data?.length) return windowsNorm[0].data.length;
         return 1;
       }}
 
       function computeMaxAbs() {{
         let maxAbs = 0;
-        for (const v of calibrationData || []) maxAbs = Math.max(maxAbs, Math.abs(v));
-        for (const w of bestWindows || []) {{
+        for (const v of calibrationNorm || []) maxAbs = Math.max(maxAbs, Math.abs(v));
+        for (const w of windowsNorm || []) {{
           const data = w?.data || [];
           for (const v of data) maxAbs = Math.max(maxAbs, Math.abs(v));
         }}
@@ -1424,14 +1561,16 @@ def root(request: Request) -> str:
         if (viewStart < 0) viewStart = 0;
         if (viewStart >= viewEnd) viewStart = Math.max(0, viewEnd - 1);
         const maxAbs = computeMaxAbs();
-        drawSignal("calibration", calibrationData, "#22c55e", 1, axisLen, viewStart, viewEnd, maxAbs);
+        drawSignal("calibration", calibrationNorm, "#22c55e", 1, axisLen, viewStart, viewEnd, maxAbs);
         const showFlags = [
           document.getElementById("toggle-window-1").checked,
           document.getElementById("toggle-window-2").checked,
           document.getElementById("toggle-window-3").checked,
         ];
         const alpha = parseFloat(document.getElementById("window-opacity").value);
-        drawOverlayWindows("calibration", bestWindows, alpha, showFlags, axisLen, viewStart, viewEnd, maxAbs);
+        drawOverlayWindows("calibration", windowsNorm, alpha, showFlags, axisLen, viewStart, viewEnd, maxAbs);
+        drawRPeaks("calibration", calibrationNorm, calibrationRPeaks, "#e2e8f0", axisLen, viewStart, viewEnd, maxAbs);
+        drawOverlayRPeaks("calibration", windowsNorm, showFlags, axisLen, viewStart, viewEnd, maxAbs);
       }}
 
       const slider = document.getElementById("window-opacity");
