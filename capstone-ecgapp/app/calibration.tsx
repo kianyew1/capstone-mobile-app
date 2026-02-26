@@ -19,7 +19,7 @@ import Animated, {
   withTiming,
 } from "react-native-reanimated";
 import { SafeAreaView } from "react-native-safe-area-context";
-import Svg, { Path } from "react-native-svg";
+import Svg, { Line, Path, Text as SvgText } from "react-native-svg";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -75,6 +75,7 @@ export default function CalibrationScreen() {
   }>({ ch2: [], ch3: [], ch4: [] });
   const [graphError, setGraphError] = useState<string | null>(null);
   const [isGraphLoading, setIsGraphLoading] = useState(false);
+  const [graphWidth, setGraphWidth] = useState(320);
 
   const { setCalibrationResult, completeOnboarding, isOnboardingComplete } =
     useAppStore();
@@ -144,16 +145,18 @@ export default function CalibrationScreen() {
           ch4Raw.push(...decoded.ch4);
         }
 
-        const maxPoints = 800;
+        const previewSamples = 2500;
+        const maxPoints = 2500;
         const normalize = (values: number[]) => {
           if (values.length === 0) return [];
+          const limited = values.slice(0, previewSamples);
           const stepSize = Math.max(
             1,
-            Math.ceil(values.length / maxPoints),
+            Math.ceil(limited.length / maxPoints),
           );
           const sampled: number[] = [];
-          for (let i = 0; i < values.length; i += stepSize) {
-            sampled.push(values[i]);
+          for (let i = 0; i < limited.length; i += stepSize) {
+            sampled.push(limited[i]);
           }
 
           const mean =
@@ -451,6 +454,68 @@ export default function CalibrationScreen() {
     return d;
   };
 
+  const buildSampleMarkers = (
+    count: number,
+    stepX: number,
+    height: number,
+  ) => {
+    if (count <= 1) return null;
+    const markerStep = count >= 2500 ? 500 : count >= 1000 ? 250 : 100;
+    const markers = [];
+    for (let i = 0; i < count; i += markerStep) {
+      const x = i * stepX;
+      markers.push(
+        <Line
+          key={`tick-${i}`}
+          x1={x}
+          y1={0}
+          x2={x}
+          y2={height}
+          stroke="rgba(148, 163, 184, 0.35)"
+          strokeWidth={1}
+        />,
+      );
+      markers.push(
+        <SvgText
+          key={`label-${i}`}
+          x={x + 2}
+          y={height - 4}
+          fontSize={10}
+          fill="rgba(148, 163, 184, 0.8)"
+        >
+          {i}
+        </SvgText>,
+      );
+    }
+    const lastIndex = count - 1;
+    if (lastIndex > 0 && lastIndex % markerStep !== 0) {
+      const x = lastIndex * stepX;
+      markers.push(
+        <Line
+          key={`tick-${lastIndex}`}
+          x1={x}
+          y1={0}
+          x2={x}
+          y2={height}
+          stroke="rgba(148, 163, 184, 0.35)"
+          strokeWidth={1}
+        />,
+      );
+      markers.push(
+        <SvgText
+          key={`label-${lastIndex}`}
+          x={x + 2}
+          y={height - 4}
+          fontSize={10}
+          fill="rgba(148, 163, 184, 0.8)"
+        >
+          {count}
+        </SvgText>,
+      );
+    }
+    return markers;
+  };
+
   const renderGuidance = () => (
     <ScrollView className="flex-1" showsVerticalScrollIndicator={false}>
       <View className="items-center mb-2">
@@ -720,25 +785,37 @@ export default function CalibrationScreen() {
                           No samples to preview.
                         </Text>
                       ) : (
-                        <ScrollView
-                          horizontal
-                          showsHorizontalScrollIndicator={false}
+                        <View
                           className="mt-1"
+                          onLayout={(event) => {
+                            const width = event.nativeEvent.layout.width;
+                            if (width > 0 && width !== graphWidth) {
+                              setGraphWidth(width);
+                            }
+                          }}
                         >
                           <View style={{ height: 140 }}>
-                            <Svg
-                              width={Math.max(series.data.length * 3, 320)}
-                              height={120}
-                            >
+                            <Svg width={graphWidth} height={120}>
+                              {buildSampleMarkers(
+                                series.data.length,
+                                graphWidth /
+                                  Math.max(series.data.length - 1, 1),
+                                120,
+                              )}
                               <Path
-                                d={buildWavePath(series.data, 120, 3)}
+                                d={buildWavePath(
+                                  series.data,
+                                  120,
+                                  graphWidth /
+                                    Math.max(series.data.length - 1, 1),
+                                )}
                                 stroke={series.color}
                                 strokeWidth={2}
                                 fill="none"
                               />
                             </Svg>
                           </View>
-                        </ScrollView>
+                        </View>
                       )}
                     </View>
                   ))}

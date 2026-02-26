@@ -120,7 +120,7 @@ static uint16_t ringMax = 0;
 // Synthetic ECG generator (24-bit range)
 static float mockPhase = 0.0f;
 static const float mockSampleRateHz = 500.0f;
-static const float mockHeartRateHz = 1.2f; // ~72 BPM
+static const float mockHeartRateHz = 1.0f; // ~60 BPM
 static const float mockPhaseStep =
   (2.0f * 3.14159265f * mockHeartRateHz) / mockSampleRateHz;
 static const uint32_t mockSamplePeriodUs = 2000;
@@ -302,27 +302,25 @@ void printPacketSummary(uint32_t packetNumber)
 
 void printStats()
 {
-  // const uint32_t expectedSamplesPerSec = 500;
-  // const uint32_t expectedPacketsPerSec = expectedSamplesPerSec / SAMPLES_PER_PACKET;
+  const uint32_t expectedSamplesPerSec = 500;
+  const uint32_t expectedPacketsPerSec = expectedSamplesPerSec / SAMPLES_PER_PACKET;
 
-  // Serial.print("[STATS] samples/sec=");
-  // Serial.print(samplesThisSecond);
-  // Serial.print(" packets/sec=");
-  // Serial.print(packetsSentThisSecond);
-  // Serial.print(" expected_packets/sec=");
-  // Serial.print(expectedPacketsPerSec);
-  // Serial.print(" notifyFail/sec=");
-  // Serial.println(notifyFailThisSecond);
-  // Serial.print("[STATS] buffer_fill=");
-  // Serial.print(ringCount);
-  // Serial.print(" buffer_max=");
-  // Serial.print(ringMax);
-  // Serial.print(" dropped_samples/sec=");
-  // Serial.println(droppedSamplesThisSecond);
-  // Serial.print("[STATS] drdy_backlog_max=");
-  // Serial.println(maxDrdyBacklog);
-  Serial.println("... dropped: ");
-  Serial.print(droppedSamplesThisSecond);
+  Serial.print("[STATS] samples/sec=");
+  Serial.print(samplesThisSecond);
+  Serial.print(" packets/sec=");
+  Serial.print(packetsSentThisSecond);
+  Serial.print(" expected_packets/sec=");
+  Serial.print(expectedPacketsPerSec);
+  Serial.print(" notifyFail/sec=");
+  Serial.println(notifyFailThisSecond);
+  Serial.print("[STATS] buffer_fill=");
+  Serial.print(ringCount);
+  Serial.print(" buffer_max=");
+  Serial.print(ringMax);
+  Serial.print(" dropped_samples/sec=");
+  Serial.println(droppedSamplesThisSecond);
+  Serial.print("[STATS] drdy_backlog_max=");
+  Serial.println(maxDrdyBacklog);
   maxDrdyBacklog = 0;
   ringMax = 0;
   droppedSamplesThisSecond = 0;
@@ -397,7 +395,9 @@ void setup() {
 
 void loop() {
   static bool wasConnected = false;
+  static bool wasStreaming = false;
   bool isConnected = Bluefruit.connected();
+  bool isStreaming = isConnected && ecgChar.notifyEnabled();
 
   // ===== ADC driven acquisition =====
   // Drain pending DRDY events into ring buffer
@@ -409,32 +409,34 @@ void loop() {
   if (pending > maxDrdyBacklog) {
     maxDrdyBacklog = pending;
   }
-  while (pending > 0) {
-    ADS1298_Sample sample = readData();
-    if (mock_signal) {
-      fillMockSample(&sample);
-    }
-    samplesThisSecond++;
-    if (isConnected) {
-      if (ringCount < RING_CAPACITY) {
-        ringBuffer[ringHead].status = sample.status;
-        ringBuffer[ringHead].ch2 = sample.channel[1];
-        ringBuffer[ringHead].ch3 = sample.channel[2];
-        ringBuffer[ringHead].ch4 = sample.channel[3];
-        ringHead = (ringHead + 1) % RING_CAPACITY;
-        ringCount++;
-        if (ringCount > ringMax) {
-          ringMax = ringCount;
+  if (!mock_signal) {
+    while (pending > 0) {
+      ADS1298_Sample sample = readData();
+      samplesThisSecond++;
+      if (isStreaming) {
+        if (ringCount < RING_CAPACITY) {
+          ringBuffer[ringHead].status = sample.status;
+          ringBuffer[ringHead].ch2 = sample.channel[1];
+          ringBuffer[ringHead].ch3 = sample.channel[2];
+          ringBuffer[ringHead].ch4 = sample.channel[3];
+          ringHead = (ringHead + 1) % RING_CAPACITY;
+          ringCount++;
+          if (ringCount > ringMax) {
+            ringMax = ringCount;
+          }
+        } else {
+          droppedSamplesTotal++;
+          droppedSamplesThisSecond++;
         }
-      } else {
-        droppedSamplesTotal++;
-        droppedSamplesThisSecond++;
       }
+      pending--;
     }
-    pending--;
+  } else {
+    // Mock mode ignores ADS1298 DRDY samples to avoid double-sampling.
+    pending = 0;
   }
 
-  if (mock_signal && isConnected) {
+  if (mock_signal && isStreaming) {
     uint32_t nowMockUs = micros();
     if (lastMockUs == 0) lastMockUs = nowMockUs;
     while ((uint32_t)(nowMockUs - lastMockUs) >= mockSamplePeriodUs) {
@@ -477,6 +479,18 @@ void loop() {
     }
     ledOn();
   }
+  if (wasStreaming && !isStreaming) {
+    ringHead = 0;
+    ringTail = 0;
+    ringCount = 0;
+    drdyCount = 0;
+    lastMockUs = 0;
+  } else if (!isStreaming && ringCount > 0) {
+    ringHead = 0;
+    ringTail = 0;
+    ringCount = 0;
+  }
+  wasStreaming = isStreaming;
 
   // ===== timing (20 ms) =====
   uint32_t nowUs = micros();
@@ -484,7 +498,7 @@ void loop() {
   if ((uint32_t)(nowUs - lastSendUs) < packetIntervalUs) return;
   lastSendUs += packetIntervalUs;
 
-  if (isConnected) {
+  if (isStreaming) {
     // ===== send only when we have enough samples =====
     if (ringCount >= ECG_PACKET_SAMPLES) {
       static uint8_t packet[ECG_PACKET_BYTES];

@@ -496,6 +496,10 @@ export function useBluetoothService() {
 
   const stopEcgNotifications = useCallback(() => {
     ecgListener = null;
+    if (ecgSubscription) {
+      ecgSubscription.remove();
+      ecgSubscription = null;
+    }
     if (mockEcgInterval) {
       clearInterval(mockEcgInterval);
       mockEcgInterval = null;
@@ -578,7 +582,8 @@ export function useBluetoothService() {
       ecgListener = onData;
 
       if (ecgSubscription) {
-        return true;
+        ecgSubscription.remove();
+        ecgSubscription = null;
       }
 
       ecgSubscription = device.monitorCharacteristicForService(
