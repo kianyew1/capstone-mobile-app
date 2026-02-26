@@ -39,12 +39,16 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Text } from "@/components/ui/text";
 import { ENABLE_MOCK_MODE } from "@/config/mock-config";
-import { generateMockHeartRate } from "@/services/api-service";
 import { useBluetoothService } from "@/services/bluetooth-service";
 import {
   createSessionRecordAtStart,
   uploadCalibrationFile,
 } from "@/services/supabase-ecg";
+import {
+  decodeEcgPacketToChannelsMv,
+  ECG_PACKET_BYTES,
+  ECG_SAMPLES_PER_PACKET,
+} from "@/services/ecg-utils";
 import { useAppStore } from "@/stores/app-store";
 import { useSessionStore } from "@/stores/session-store";
 
@@ -53,7 +57,7 @@ export default function RunSessionScreen() {
   const [isAppActive, setIsAppActive] = useState(true);
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const heartRateRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const expectedPacketBytes = ECG_PACKET_BYTES;
 
   const {
     currentSession,
@@ -85,6 +89,8 @@ export default function RunSessionScreen() {
   const userId = user?.email ?? "unknown@local";
 
   const sessionPacketsRef = useRef<Uint8Array[]>([]);
+  const sessionPacketCountRef = useRef(0);
+  const invalidPacketCountRef = useRef(0);
   const sessionStartRef = useRef<Date | null>(null);
   const isStreamingRef = useRef(false);
   const hasPreparedUploadRef = useRef(false);
@@ -165,11 +171,40 @@ export default function RunSessionScreen() {
     if (isStreamingRef.current) return;
     isStreamingRef.current = true;
     sessionPacketsRef.current = [];
+    sessionPacketCountRef.current = 0;
+    invalidPacketCountRef.current = 0;
+    console.log(
+      `[SESSION] start stream expectedBytes=${expectedPacketBytes}`,
+    );
 
     startEcgNotifications((payloadBase64) => {
       if (!isStreamingRef.current) return;
       const bytes = toByteArray(payloadBase64);
+      if (bytes.length !== expectedPacketBytes) {
+        invalidPacketCountRef.current += 1;
+        const invalidCount = invalidPacketCountRef.current;
+        if (invalidCount <= 5 || invalidCount % 50 === 0) {
+          console.log(
+            `[SESSION] invalid packet len=${bytes.length} expected=${expectedPacketBytes} count=${invalidCount}`,
+          );
+        }
+        return;
+      }
+      const decoded = decodeEcgPacketToChannelsMv(bytes);
+      if (!decoded) {
+        invalidPacketCountRef.current += 1;
+        return;
+      }
       sessionPacketsRef.current.push(bytes);
+      sessionPacketCountRef.current += 1;
+      const count = sessionPacketCountRef.current;
+      if (count === 1) {
+        console.log(
+          `[SESSION] first packet status=0x${decoded.status.toString(16)} bytes=${bytes.length}`,
+        );
+      } else if (count % 20 === 0) {
+        console.log(`[SESSION] packet=${count}`);
+      }
     }).catch((error) => {
       console.error("Failed to start ECG stream:", error);
     });
@@ -213,31 +248,12 @@ export default function RunSessionScreen() {
     };
   }, [sessionStatus, elapsedTime, updateElapsedTime]);
 
-  // Mock heart rate data generation
   useEffect(() => {
-    if (sessionStatus === "running") {
-      heartRateRef.current = setInterval(() => {
-        // Generate mock heart rate data - replace with real BLE data
-        const mockHeartRate = generateMockHeartRate(70, true);
-        addHeartRateData({
-          timestamp: Date.now(),
-          heartRate: mockHeartRate,
-          rrInterval: 60000 / mockHeartRate,
-        });
-      }, 1000);
-    } else {
-      if (heartRateRef.current) {
-        clearInterval(heartRateRef.current);
-        heartRateRef.current = null;
-      }
-    }
-
-    return () => {
-      if (heartRateRef.current) {
-        clearInterval(heartRateRef.current);
-      }
-    };
-  }, [sessionStatus, addHeartRateData]);
+    if (sessionStatus !== "running") return;
+    console.log(
+      `[SESSION] packets captured=${sessionPacketCountRef.current} samplesPerChannel=${sessionPacketCountRef.current * ECG_SAMPLES_PER_PACKET}`,
+    );
+  }, [sessionStatus]);
 
   const formatTime = (seconds: number): string => {
     const hrs = Math.floor(seconds / 3600);
@@ -284,6 +300,10 @@ export default function RunSessionScreen() {
     if (!recordId || !sessionId) {
       console.warn("Missing session identifiers; upload will be skipped.");
     } else {
+      const samplesPerChannel = chunks.length * ECG_SAMPLES_PER_PACKET;
+      console.log(
+        `[SESSION] end packets=${chunks.length} samplesPerChannel=${samplesPerChannel} invalidPackets=${invalidPacketCountRef.current}`,
+      );
       if (chunks.length === 0 && !ENABLE_MOCK_MODE) {
         console.warn("No session bytes captured; upload will be skipped.");
       }
@@ -293,7 +313,7 @@ export default function RunSessionScreen() {
         sessionId,
         startTimeIso: sessionStartRef.current?.toISOString() ?? null,
         packets: chunks,
-        useMock: ENABLE_MOCK_MODE,
+        useMock: false,
       });
     }
 

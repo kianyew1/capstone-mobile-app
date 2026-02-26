@@ -2,15 +2,27 @@ import {
   getLatestCalibrationRunId,
   getPacketsForRun,
 } from "@/services/ecg-storage";
+import {
+  ECG_PACKET_BYTES,
+  ECG_SAMPLES_PER_PACKET,
+} from "@/services/ecg-utils";
 
 const SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL ?? "";
 const SUPABASE_ANON_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ?? "";
 const SUPABASE_STORAGE_BUCKET =
   process.env.EXPO_PUBLIC_SUPABASE_STORAGE_BUCKET ?? "";
 
-const DEFAULT_ENCODING = "int16_le";
+const DEFAULT_ENCODING = "ads1298_24be_mv";
 const DEFAULT_SAMPLE_RATE_HZ = 500;
-const DEFAULT_CHANNELS = 1;
+const DEFAULT_CHANNELS = 3;
+const DEFAULT_CHANNEL_LABELS = ["CH2", "CH3", "CH4"];
+
+function computePacketStats(bytes: Uint8Array) {
+  const packetCount = Math.floor(bytes.length / ECG_PACKET_BYTES);
+  const remainder = bytes.length % ECG_PACKET_BYTES;
+  const sampleCountPerChannel = packetCount * ECG_SAMPLES_PER_PACKET;
+  return { packetCount, remainder, sampleCountPerChannel };
+}
 
 function assertSupabaseConfig() {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !SUPABASE_STORAGE_BUCKET) {
@@ -83,6 +95,12 @@ export async function createSessionRecordAtStart(params: {
   const sessionObjectKey = `session/${params.sessionId}.bin`;
   const url = `${SUPABASE_URL}/rest/v1/ecg_recordings`;
   console.log(`LOG ${url}`);
+  const notes = JSON.stringify({
+    channel_labels: DEFAULT_CHANNEL_LABELS,
+    packet_bytes: ECG_PACKET_BYTES,
+    samples_per_packet: ECG_SAMPLES_PER_PACKET,
+    encoding: DEFAULT_ENCODING,
+  });
 
   const response = await fetch(url, {
     method: "POST",
@@ -104,6 +122,7 @@ export async function createSessionRecordAtStart(params: {
       duration_ms: 0,
       start_time: params.startTime ? params.startTime.toISOString() : null,
       byte_length: 0,
+      notes,
     }),
   });
 
@@ -131,10 +150,23 @@ export async function finalizeSessionRecording(params: {
   const sessionObjectKey = `session/${params.sessionId}.bin`;
   await uploadToStorage(sessionObjectKey, params.bytes);
 
-  const sampleCount = Math.floor(params.bytes.length / 2);
+  const { packetCount, remainder, sampleCountPerChannel } =
+    computePacketStats(params.bytes);
+  if (remainder !== 0) {
+    console.warn(
+      `[SESSION] byte_length=${params.bytes.length} not multiple of packet_bytes=${ECG_PACKET_BYTES} remainder=${remainder}`,
+    );
+  }
   const durationMs = Math.round(
-    (sampleCount / DEFAULT_SAMPLE_RATE_HZ) * 1000,
+    (sampleCountPerChannel / DEFAULT_SAMPLE_RATE_HZ) * 1000,
   );
+  const notes = JSON.stringify({
+    channel_labels: DEFAULT_CHANNEL_LABELS,
+    packet_bytes: ECG_PACKET_BYTES,
+    samples_per_packet: ECG_SAMPLES_PER_PACKET,
+    encoding: DEFAULT_ENCODING,
+    packet_count: packetCount,
+  });
 
   const updateUrl = `${SUPABASE_URL}/rest/v1/ecg_recordings?id=eq.${params.recordId}`;
   console.log(`LOG ${updateUrl}`);
@@ -149,10 +181,14 @@ export async function finalizeSessionRecording(params: {
     body: JSON.stringify({
       user_id: params.userId,
       session_object_key: sessionObjectKey,
-      sample_count: sampleCount,
+      sample_count: sampleCountPerChannel,
       duration_ms: durationMs,
       start_time: params.startTime ? params.startTime.toISOString() : null,
       byte_length: params.bytes.length,
+      encoding: DEFAULT_ENCODING,
+      sample_rate_hz: DEFAULT_SAMPLE_RATE_HZ,
+      channels: DEFAULT_CHANNELS,
+      notes,
     }),
   });
 
