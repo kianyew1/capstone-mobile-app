@@ -791,6 +791,7 @@ def _session_analysis_job(job_id: str, record_id: str) -> None:
             )
             calibration_metrics = calibration_result.get("metrics", {})
             calibration_r_peaks = calibration_result.get("r_peaks", [])
+            calibration_cleaned = calibration_result.get("cleaned", [])
 
             calibration_plot_b64 = _ecg_plot_base64(
                 calibration_result.get("signals"),
@@ -810,6 +811,7 @@ def _session_analysis_job(job_id: str, record_id: str) -> None:
             channel_results[channel] = {
                 "session_samples": session_samples,
                 "calibration_samples": calibration_samples,
+                "calibration_cleaned": calibration_cleaned,
                 "best_windows": best_windows,
                 "calibration_metrics": calibration_metrics,
                 "calibration_r_peaks": calibration_r_peaks,
@@ -1114,7 +1116,9 @@ def root(request: Request) -> str:
     metrics_table_html = _metrics_table()
 
     calibration_data_json = json.dumps(
-        channel_data.get("calibration_samples") if channel_data else []
+        channel_data.get("calibration_cleaned")
+        if channel_data and channel_data.get("calibration_cleaned")
+        else channel_data.get("calibration_samples") if channel_data else []
     )
     calibration_r_peaks_json = json.dumps(
         channel_data.get("calibration_r_peaks") if channel_data else []
@@ -1317,6 +1321,7 @@ def root(request: Request) -> str:
       const calibrationRPeaks = {calibration_r_peaks_json};
       const sessionData = {session_data_json};
       const bestWindows = {best_windows_json};
+      const Y_RANGE_MV = 2.0; // fixed ECG scale: +/-2 mV
       const channelSelect = document.getElementById("channel-select");
       if (channelSelect) {{
         channelSelect.addEventListener("change", (evt) => {{
@@ -1327,7 +1332,7 @@ def root(request: Request) -> str:
         }});
       }}
 
-      function drawAxes(ctx, canvas, axisLen, maxAbs, viewStart, viewEnd, padding) {{
+      function drawAxes(ctx, canvas, maxAbs, viewStart, viewEnd, padding) {{
         const plotWidth = canvas.width - padding.left - padding.right;
         const plotHeight = canvas.height - padding.top - padding.bottom;
         const left = padding.left;
@@ -1359,9 +1364,16 @@ def root(request: Request) -> str:
           const y = top + t * plotHeight;
           const val = Math.round((1 - 2 * t) * maxAbs);
           ctx.fillText(val.toString(), 6, y + 4);
+          // light horizontal gridline
+          ctx.strokeStyle = "rgba(148, 163, 184, 0.15)";
+          ctx.beginPath();
+          ctx.moveTo(left, y);
+          ctx.lineTo(right, y);
+          ctx.stroke();
+          ctx.strokeStyle = "#374151";
         }}
         ctx.fillText("samples", right - 48, bottom + 30);
-        ctx.fillText("amplitude", 6, top - 4);
+        ctx.fillText("mV", 6, top - 4);
       }}
 
       function drawSignal(canvasId, data, color, alpha, axisLen, viewStart, viewEnd, maxAbs) {{
@@ -1378,7 +1390,7 @@ def root(request: Request) -> str:
         const plotWidth = canvas.width - padding.left - padding.right;
         const plotHeight = canvas.height - padding.top - padding.bottom;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        drawAxes(ctx, canvas, axisLen, maxAbs, viewStart, viewEnd, padding);
+        drawAxes(ctx, canvas, maxAbs, viewStart, viewEnd, padding);
 
         const scale = maxAbs || 1;
         ctx.strokeStyle = color;
@@ -1498,57 +1510,14 @@ def root(request: Request) -> str:
         }});
       }}
 
-      function meanOf(data) {{
-        if (!data || data.length === 0) return 0;
-        let sum = 0;
-        for (const v of data) sum += v;
-        return sum / data.length;
-      }}
-
-      function centerData(data, mean) {{
-        if (!data || data.length === 0) return [];
-        return data.map((v) => v - mean);
-      }}
-
-      const calibrationMean = meanOf(calibrationData || []);
-      const calibrationCentered = centerData(calibrationData || [], calibrationMean);
-      const windowCentered = (bestWindows || []).map((w) => {{
-        const data = w?.data || [];
-        const mean = meanOf(data);
-        return {{ ...w, mean, data: centerData(data, mean) }};
-      }});
-
-      function computeGlobalScale() {{
-        let maxAbs = 0;
-        for (const v of calibrationCentered || []) maxAbs = Math.max(maxAbs, Math.abs(v));
-        for (const w of windowCentered || []) {{
-          const data = w?.data || [];
-          for (const v of data) maxAbs = Math.max(maxAbs, Math.abs(v));
-        }}
-        return maxAbs || 1;
-      }}
-
-      const globalScale = computeGlobalScale();
-      const calibrationNorm = (calibrationCentered || []).map((v) => v / globalScale);
-      const windowsNorm = (windowCentered || []).map((w) => {{
-        const data = w?.data || [];
-        return {{ ...w, data: data.map((v) => v / globalScale) }};
-      }});
-
       function computeAxisLen() {{
-        if (calibrationNorm && calibrationNorm.length > 0) return calibrationNorm.length;
-        if (windowsNorm && windowsNorm.length > 0 && windowsNorm[0]?.data?.length) return windowsNorm[0].data.length;
+        if (calibrationData && calibrationData.length > 0) return calibrationData.length;
+        if (bestWindows && bestWindows.length > 0 && bestWindows[0]?.data?.length) return bestWindows[0].data.length;
         return 1;
       }}
 
       function computeMaxAbs() {{
-        let maxAbs = 0;
-        for (const v of calibrationNorm || []) maxAbs = Math.max(maxAbs, Math.abs(v));
-        for (const w of windowsNorm || []) {{
-          const data = w?.data || [];
-          for (const v of data) maxAbs = Math.max(maxAbs, Math.abs(v));
-        }}
-        return maxAbs || 1;
+        return Y_RANGE_MV;
       }}
 
       let axisLen = computeAxisLen();
@@ -1561,16 +1530,16 @@ def root(request: Request) -> str:
         if (viewStart < 0) viewStart = 0;
         if (viewStart >= viewEnd) viewStart = Math.max(0, viewEnd - 1);
         const maxAbs = computeMaxAbs();
-        drawSignal("calibration", calibrationNorm, "#22c55e", 1, axisLen, viewStart, viewEnd, maxAbs);
+        drawSignal("calibration", calibrationData, "#22c55e", 1, axisLen, viewStart, viewEnd, maxAbs);
         const showFlags = [
           document.getElementById("toggle-window-1").checked,
           document.getElementById("toggle-window-2").checked,
           document.getElementById("toggle-window-3").checked,
         ];
         const alpha = parseFloat(document.getElementById("window-opacity").value);
-        drawOverlayWindows("calibration", windowsNorm, alpha, showFlags, axisLen, viewStart, viewEnd, maxAbs);
-        drawRPeaks("calibration", calibrationNorm, calibrationRPeaks, "#e2e8f0", axisLen, viewStart, viewEnd, maxAbs);
-        drawOverlayRPeaks("calibration", windowsNorm, showFlags, axisLen, viewStart, viewEnd, maxAbs);
+        drawOverlayWindows("calibration", bestWindows, alpha, showFlags, axisLen, viewStart, viewEnd, maxAbs);
+        drawRPeaks("calibration", calibrationData, calibrationRPeaks, "#e2e8f0", axisLen, viewStart, viewEnd, maxAbs);
+        drawOverlayRPeaks("calibration", bestWindows, showFlags, axisLen, viewStart, viewEnd, maxAbs);
       }}
 
       const slider = document.getElementById("window-opacity");
