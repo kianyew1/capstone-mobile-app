@@ -196,12 +196,12 @@ def _decode_int16_le(payload: bytes) -> List[int]:
 def _read24_signed_be(payload: bytes, offset: int) -> int:
     value = (payload[offset] << 16) | (payload[offset + 1] << 8) | payload[offset + 2]
     if value & 0x800000:
-        return value | 0xFF000000
+        return value - (1 << 24)
     return value
 
 
 def _counts_to_mv(count: int) -> float:
-    return (count / ADS1298_MAX_CODE) * (ADS1298_VREF / ADS1298_GAIN) * 1000.0
+    return (count / ADS1298_MAX_CODE) * (ADS1298_VREF) * 1000.0
 
 
 def _decode_ads1298_packets(payload: bytes) -> Dict[str, List[float]]:
@@ -266,6 +266,29 @@ def _metrics_from_info(
         "hrv_rmssd_ms": None,
         "hrv_sdnn_ms": None,
         "hrv_meannn_ms": None,
+        "hrv_mediannn_ms": None,
+        "hrv_min_nn_ms": None,
+        "hrv_max_nn_ms": None,
+        "hrv_pnn50_pct": None,
+        "hrv_pnn20_pct": None,
+        "hrv_cvnn_pct": None,
+        "hrv_cvsd_pct": None,
+        "hrv_sdrmssd": None,
+        "hrv_iqrnn_ms": None,
+        "hrv_lf_ms2": None,
+        "hrv_hf_ms2": None,
+        "hrv_vlf_ms2": None,
+        "hrv_lf_hf_ratio": None,
+        "hrv_lfnu": None,
+        "hrv_hfnu": None,
+        "hrv_total_power": None,
+        "hrv_sd1": None,
+        "hrv_sd2": None,
+        "hrv_sd1_sd2": None,
+        "hrv_sampen": None,
+        "hrv_apen": None,
+        "hrv_dfa_alpha1": None,
+        "hrv_dfa_alpha2": None,
         "r_peak_count": None,
     }
     r_peaks = info.get("ECG_R_Peaks", [])
@@ -286,6 +309,41 @@ def _metrics_from_info(
             metrics["hrv_rmssd_ms"] = float(row.get("RMSSD", None)) if "RMSSD" in row else None
             metrics["hrv_sdnn_ms"] = float(row.get("SDNN", None)) if "SDNN" in row else None
             metrics["hrv_meannn_ms"] = float(row.get("MeanNN", None)) if "MeanNN" in row else None
+            metrics["hrv_mediannn_ms"] = float(row.get("MedianNN", None)) if "MedianNN" in row else None
+            metrics["hrv_min_nn_ms"] = float(row.get("MinNN", None)) if "MinNN" in row else None
+            metrics["hrv_max_nn_ms"] = float(row.get("MaxNN", None)) if "MaxNN" in row else None
+            metrics["hrv_pnn50_pct"] = float(row.get("pNN50", None)) if "pNN50" in row else None
+            metrics["hrv_pnn20_pct"] = float(row.get("pNN20", None)) if "pNN20" in row else None
+            metrics["hrv_cvnn_pct"] = float(row.get("CVNN", None)) if "CVNN" in row else None
+            metrics["hrv_cvsd_pct"] = float(row.get("CVSD", None)) if "CVSD" in row else None
+            metrics["hrv_sdrmssd"] = float(row.get("SDRMSSD", None)) if "SDRMSSD" in row else None
+            metrics["hrv_iqrnn_ms"] = float(row.get("IQRNN", None)) if "IQRNN" in row else None
+        try:
+            hrv_freq = nk.hrv_frequency(info, sampling_rate=sample_rate_hz)
+            if not hrv_freq.empty:
+                row = hrv_freq.iloc[0]
+                metrics["hrv_lf_ms2"] = float(row.get("LF", None)) if "LF" in row else None
+                metrics["hrv_hf_ms2"] = float(row.get("HF", None)) if "HF" in row else None
+                metrics["hrv_vlf_ms2"] = float(row.get("VLF", None)) if "VLF" in row else None
+                metrics["hrv_lf_hf_ratio"] = float(row.get("LFHF", None)) if "LFHF" in row else None
+                metrics["hrv_lfnu"] = float(row.get("LFnu", None)) if "LFnu" in row else None
+                metrics["hrv_hfnu"] = float(row.get("HFnu", None)) if "HFnu" in row else None
+                metrics["hrv_total_power"] = float(row.get("TP", None)) if "TP" in row else None
+        except Exception as exc:  # pragma: no cover - neurokit variance
+            logger.warning("[HRV] frequency failed error=%s", exc)
+        try:
+            hrv_nl = nk.hrv_nonlinear(info, sampling_rate=sample_rate_hz)
+            if not hrv_nl.empty:
+                row = hrv_nl.iloc[0]
+                metrics["hrv_sd1"] = float(row.get("SD1", None)) if "SD1" in row else None
+                metrics["hrv_sd2"] = float(row.get("SD2", None)) if "SD2" in row else None
+                metrics["hrv_sd1_sd2"] = float(row.get("SD1SD2", None)) if "SD1SD2" in row else None
+                metrics["hrv_sampen"] = float(row.get("SampEn", None)) if "SampEn" in row else None
+                metrics["hrv_apen"] = float(row.get("ApEn", None)) if "ApEn" in row else None
+                metrics["hrv_dfa_alpha1"] = float(row.get("DFA_alpha1", None)) if "DFA_alpha1" in row else None
+                metrics["hrv_dfa_alpha2"] = float(row.get("DFA_alpha2", None)) if "DFA_alpha2" in row else None
+        except Exception as exc:  # pragma: no cover - neurokit variance
+            logger.warning("[HRV] nonlinear failed error=%s", exc)
     return metrics
 
 
@@ -1084,10 +1142,33 @@ def root(request: Request) -> str:
         ("Avg HR", "avg_hr_bpm", " bpm"),
         ("Min HR", "min_hr_bpm", " bpm"),
         ("Max HR", "max_hr_bpm", " bpm"),
-        ("HRV RMSSD", "hrv_rmssd_ms", " ms"),
-        ("HRV SDNN", "hrv_sdnn_ms", " ms"),
-        ("HRV MeanNN", "hrv_meannn_ms", " ms"),
         ("R Peaks", "r_peak_count", ""),
+        ("Mean NN", "hrv_meannn_ms", " ms"),
+        ("Median NN", "hrv_mediannn_ms", " ms"),
+        ("Min NN", "hrv_min_nn_ms", " ms"),
+        ("Max NN", "hrv_max_nn_ms", " ms"),
+        ("SDNN", "hrv_sdnn_ms", " ms"),
+        ("RMSSD", "hrv_rmssd_ms", " ms"),
+        ("SDRMSSD", "hrv_sdrmssd", ""),
+        ("IQRNN", "hrv_iqrnn_ms", " ms"),
+        ("pNN50", "hrv_pnn50_pct", " %"),
+        ("pNN20", "hrv_pnn20_pct", " %"),
+        ("CVNN", "hrv_cvnn_pct", " %"),
+        ("CVSD", "hrv_cvsd_pct", " %"),
+        ("VLF", "hrv_vlf_ms2", " ms2"),
+        ("LF", "hrv_lf_ms2", " ms2"),
+        ("HF", "hrv_hf_ms2", " ms2"),
+        ("LF/HF", "hrv_lf_hf_ratio", ""),
+        ("LFnu", "hrv_lfnu", ""),
+        ("HFnu", "hrv_hfnu", ""),
+        ("Total Power", "hrv_total_power", " ms2"),
+        ("SD1", "hrv_sd1", ""),
+        ("SD2", "hrv_sd2", ""),
+        ("SD1/SD2", "hrv_sd1_sd2", ""),
+        ("Sample Entropy", "hrv_sampen", ""),
+        ("ApEn", "hrv_apen", ""),
+        ("DFA α1", "hrv_dfa_alpha1", ""),
+        ("DFA α2", "hrv_dfa_alpha2", ""),
     ]
     calibration_metrics = channel_data.get("calibration_metrics") if channel_data else {}
     window_metrics = [w.get("metrics", {}) for w in best_windows[:3]]
@@ -1321,7 +1402,7 @@ def root(request: Request) -> str:
       const calibrationRPeaks = {calibration_r_peaks_json};
       const sessionData = {session_data_json};
       const bestWindows = {best_windows_json};
-      const Y_RANGE_MV = 2.0; // fixed ECG scale: +/-2 mV
+      const Y_RANGE_MV = 5.0; // fixed ECG scale: +/-5 mV
       const channelSelect = document.getElementById("channel-select");
       if (channelSelect) {{
         channelSelect.addEventListener("change", (evt) => {{
