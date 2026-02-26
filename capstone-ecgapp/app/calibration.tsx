@@ -19,7 +19,7 @@ import Animated, {
   withTiming,
 } from "react-native-reanimated";
 import { SafeAreaView } from "react-native-safe-area-context";
-import Svg, { Path } from "react-native-svg";
+import Svg, { Line, Path, Text as SvgText } from "react-native-svg";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -27,12 +27,20 @@ import { Progress } from "@/components/ui/progress";
 import { Text } from "@/components/ui/text";
 import { ENABLE_MOCK_MODE } from "@/config/mock-config";
 import { getCalibrationSignalQuality } from "@/services/calibration-quality";
+import { uploadCalibrationCsv } from "@/services/calibration-csv";
 import { useBluetoothService } from "@/services/bluetooth-service";
 import {
   getLatestCalibrationRunId,
   getPacketsForRun,
+  logDbLocation,
   saveCalibrationRun,
 } from "@/services/ecg-storage";
+import {
+  buildChannelsCsvFromPackets,
+  decodeEcgPacketToChannelsMv,
+  ECG_PACKET_BYTES,
+  ECG_SAMPLES_PER_PACKET,
+} from "@/services/ecg-utils";
 import { useAppStore } from "@/stores/app-store";
 import type { CalibrationStatus } from "@/types";
 import { toByteArray } from "base64-js";
@@ -42,8 +50,9 @@ type CalibrationStep = "guidance" | "ready" | "calibrating" | "result";
 export default function CalibrationScreen() {
   const params = useLocalSearchParams<{ fromOnboarding?: string }>();
   const isFromOnboarding = params.fromOnboarding === "true";
-  const targetPacketCount = 1000;
-  const calibrationSeconds = ENABLE_MOCK_MODE ? 5 : 30;
+  const targetPacketCount = ENABLE_MOCK_MODE ? 100 : 400;
+  const calibrationSeconds = ENABLE_MOCK_MODE ? 5 : 20;
+  const expectedPacketBytes = ECG_PACKET_BYTES;
   const SHOW_CALIBRATION_GRAPH = true;
 
   const [step, setStep] = useState<CalibrationStep>("guidance");
@@ -59,14 +68,20 @@ export default function CalibrationScreen() {
     null,
   );
   const [lastRunId, setLastRunId] = useState<string | null>(null);
-  const [graphPoints, setGraphPoints] = useState<number[]>([]);
+  const [graphSeries, setGraphSeries] = useState<{
+    ch2: number[];
+    ch3: number[];
+    ch4: number[];
+  }>({ ch2: [], ch3: [], ch4: [] });
   const [graphError, setGraphError] = useState<string | null>(null);
   const [isGraphLoading, setIsGraphLoading] = useState(false);
+  const [graphWidth, setGraphWidth] = useState(320);
 
   const { setCalibrationResult, completeOnboarding, isOnboardingComplete } =
     useAppStore();
   const { startEcgNotifications, stopEcgNotifications } = useBluetoothService();
   const packetCountRef = useRef(0);
+  const invalidPacketCountRef = useRef(0);
   const packetsRef = useRef<Array<{ data: Uint8Array; receivedAt: number }>>(
     [],
   );
@@ -98,7 +113,7 @@ export default function CalibrationScreen() {
 
       setIsGraphLoading(true);
       setGraphError(null);
-      setGraphPoints([]);
+      setGraphSeries({ ch2: [], ch3: [], ch4: [] });
 
       try {
         const runId = lastRunId ?? (await getLatestCalibrationRunId());
@@ -113,33 +128,56 @@ export default function CalibrationScreen() {
           return;
         }
 
-        const samples: number[] = [];
+        const ch2Raw: number[] = [];
+        const ch3Raw: number[] = [];
+        const ch4Raw: number[] = [];
         for (const packet of packets) {
-          for (let i = 0; i + 1 < packet.length; i += 2) {
-            const raw = packet[i] | (packet[i + 1] << 8);
-            const signed = raw & 0x8000 ? raw - 0x10000 : raw;
-            samples.push(signed);
+          if (packet.length < expectedPacketBytes) {
+            console.warn(
+              `[CAL] preview skip packet len=${packet.length} expected=${expectedPacketBytes}`,
+            );
+            continue;
           }
+          const decoded = decodeEcgPacketToChannelsMv(packet);
+          if (!decoded) continue;
+          ch2Raw.push(...decoded.ch2);
+          ch3Raw.push(...decoded.ch3);
+          ch4Raw.push(...decoded.ch4);
         }
 
-        const maxPoints = 800;
-        const stepSize = Math.max(1, Math.ceil(samples.length / maxPoints));
-        const sampled: number[] = [];
-        for (let i = 0; i < samples.length; i += stepSize) {
-          sampled.push(samples[i]);
-        }
+        const previewSamples = 2500;
+        const maxPoints = 2500;
+        const normalize = (values: number[]) => {
+          if (values.length === 0) return [];
+          const limited = values.slice(0, previewSamples);
+          const stepSize = Math.max(
+            1,
+            Math.ceil(limited.length / maxPoints),
+          );
+          const sampled: number[] = [];
+          for (let i = 0; i < limited.length; i += stepSize) {
+            sampled.push(limited[i]);
+          }
 
-        const mean =
-          sampled.reduce((sum, value) => sum + value, 0) / sampled.length;
-        let maxAbs = 0;
-        for (const v of sampled) {
-          const delta = Math.abs(v - mean);
-          if (delta > maxAbs) maxAbs = delta;
-        }
-        const scale = maxAbs || 1;
-        const normalized = sampled.map((v) => (v - mean) / scale);
+          const mean =
+            sampled.reduce((sum, value) => sum + value, 0) / sampled.length;
+          let maxAbs = 0;
+          for (const v of sampled) {
+            const delta = Math.abs(v - mean);
+            if (delta > maxAbs) maxAbs = delta;
+          }
+          const scale = maxAbs || 1;
+          return sampled.map((v) => (v - mean) / scale);
+        };
 
-        setGraphPoints(normalized);
+        const ch2 = normalize(ch2Raw);
+        const ch3 = normalize(ch3Raw);
+        const ch4 = normalize(ch4Raw);
+        console.log(
+          `[CAL] preview samples mv ch2=${ch2Raw.length} ch3=${ch3Raw.length} ch4=${ch4Raw.length}`,
+        );
+
+        setGraphSeries({ ch2, ch3, ch4 });
       } catch (error) {
         console.error("Failed to load calibration graph:", error);
         setGraphError("Failed to load calibration graph.");
@@ -176,9 +214,14 @@ export default function CalibrationScreen() {
     setElapsedMs(0);
     setLastPacketBytes(null);
     packetCountRef.current = 0;
+    invalidPacketCountRef.current = 0;
     packetsRef.current = [];
     calibrationStartRef.current = Date.now();
     isFinishingRef.current = false;
+    invalidPacketCountRef.current = 0;
+    console.log(
+      `[CAL] start mock=${ENABLE_MOCK_MODE} env=${process.env.EXPO_PUBLIC_MOCK_MODE ?? "undefined"} target=${targetPacketCount} expectedBytes=${expectedPacketBytes}`,
+    );
 
     const runTimestamp = Date.now();
     const runId = formatRunId(runTimestamp);
@@ -193,12 +236,36 @@ export default function CalibrationScreen() {
       setElapsedMs(endedAt - startedAt);
 
       try {
+        const packetTotal = packetsRef.current.length;
+        const samplesPerChannel =
+          packetTotal * ECG_SAMPLES_PER_PACKET;
+        console.log(
+          `[CAL] packets=${packetTotal} samplesPerChannel=${samplesPerChannel}`,
+        );
+        const csvPayload = buildChannelsCsvFromPackets(
+          packetsRef.current.map((packet) => packet.data),
+        );
+        try {
+          await uploadCalibrationCsv({
+            csv: csvPayload.csv,
+            runId,
+            rows: csvPayload.rows,
+            invalidPackets: csvPayload.invalidPackets,
+          });
+          console.log(
+            `[CAL] csv uploaded rows=${csvPayload.rows} invalidPackets=${csvPayload.invalidPackets}`,
+          );
+        } catch (error) {
+          console.warn("[CAL] csv upload failed", error);
+        }
+
         const bytes = concatUint8Arrays(
           packetsRef.current.map((packet) => packet.data),
         );
         const quality = await getCalibrationSignalQuality(bytes);
 
         await saveCalibrationRun(runId, startedAt, endedAt, packetsRef.current);
+        await logDbLocation(`calibration_saved run=${runId}`);
 
         const message = quality.signalSuitable
           ? `Signal quality ${quality.qualityPercentage}%. Calibration successful.`
@@ -243,11 +310,29 @@ export default function CalibrationScreen() {
         const bytes = toByteArray(payloadBase64);
         const receivedAt = Date.now();
 
+        if (bytes.length !== expectedPacketBytes) {
+          invalidPacketCountRef.current += 1;
+          const invalidCount = invalidPacketCountRef.current;
+          if (invalidCount <= 5 || invalidCount % 50 === 0) {
+            console.log(
+              `[CAL] invalid packet len=${bytes.length} expected=${expectedPacketBytes} count=${invalidCount}`,
+            );
+          }
+          return;
+        }
+
         packetsRef.current.push({ data: bytes, receivedAt });
         packetCountRef.current += 1;
         const count = packetCountRef.current;
         setPacketCount(count);
         setLastPacketBytes(bytes);
+        if (count === 1) {
+          console.log(
+            `[CAL] first packet len=${bytes.length} bytes=${Array.from(bytes).join(",")}`,
+          );
+        } else if (count % 20 === 0) {
+          console.log(`[CAL] packet=${count} len=${bytes.length}`);
+        }
         if (calibrationStartRef.current) {
           setElapsedMs(receivedAt - calibrationStartRef.current);
         }
@@ -284,7 +369,7 @@ export default function CalibrationScreen() {
     setElapsedMs(0);
     setLastPacketBytes(null);
     setLastRunId(null);
-    setGraphPoints([]);
+    setGraphSeries({ ch2: [], ch3: [], ch4: [] });
     setGraphError(null);
     packetCountRef.current = 0;
     packetsRef.current = [];
@@ -367,6 +452,68 @@ export default function CalibrationScreen() {
       d += i === 0 ? `M ${x} ${y}` : ` L ${x} ${y}`;
     }
     return d;
+  };
+
+  const buildSampleMarkers = (
+    count: number,
+    stepX: number,
+    height: number,
+  ) => {
+    if (count <= 1) return null;
+    const markerStep = count >= 2500 ? 500 : count >= 1000 ? 250 : 100;
+    const markers = [];
+    for (let i = 0; i < count; i += markerStep) {
+      const x = i * stepX;
+      markers.push(
+        <Line
+          key={`tick-${i}`}
+          x1={x}
+          y1={0}
+          x2={x}
+          y2={height}
+          stroke="rgba(148, 163, 184, 0.35)"
+          strokeWidth={1}
+        />,
+      );
+      markers.push(
+        <SvgText
+          key={`label-${i}`}
+          x={x + 2}
+          y={height - 4}
+          fontSize={10}
+          fill="rgba(148, 163, 184, 0.8)"
+        >
+          {i}
+        </SvgText>,
+      );
+    }
+    const lastIndex = count - 1;
+    if (lastIndex > 0 && lastIndex % markerStep !== 0) {
+      const x = lastIndex * stepX;
+      markers.push(
+        <Line
+          key={`tick-${lastIndex}`}
+          x1={x}
+          y1={0}
+          x2={x}
+          y2={height}
+          stroke="rgba(148, 163, 184, 0.35)"
+          strokeWidth={1}
+        />,
+      );
+      markers.push(
+        <SvgText
+          key={`label-${lastIndex}`}
+          x={x + 2}
+          y={height - 4}
+          fontSize={10}
+          fill="rgba(148, 163, 184, 0.8)"
+        >
+          {count}
+        </SvgText>,
+      );
+    }
+    return markers;
   };
 
   const renderGuidance = () => (
@@ -618,27 +765,62 @@ export default function CalibrationScreen() {
             {graphError && (
               <Text className="text-destructive text-sm">{graphError}</Text>
             )}
-            {!isGraphLoading && !graphError && graphPoints.length > 0 && (
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                className="mt-1"
-              >
-                <View style={{ height: 140 }}>
-                  <Svg
-                    width={Math.max(graphPoints.length * 3, 320)}
-                    height={120}
-                  >
-                    <Path
-                      d={buildWavePath(graphPoints, 120, 3)}
-                      stroke="#22c55e"
-                      strokeWidth={2}
-                      fill="none"
-                    />
-                  </Svg>
+            {!isGraphLoading &&
+              !graphError &&
+              (graphSeries.ch2.length > 0 ||
+                graphSeries.ch3.length > 0 ||
+                graphSeries.ch4.length > 0) && (
+                <View className="gap-3">
+                  {[
+                    { label: "CH2", data: graphSeries.ch2, color: "#22c55e" },
+                    { label: "CH3", data: graphSeries.ch3, color: "#0ea5e9" },
+                    { label: "CH4", data: graphSeries.ch4, color: "#f59e0b" },
+                  ].map((series) => (
+                    <View key={series.label}>
+                      <Text className="text-xs text-muted-foreground">
+                        {series.label}
+                      </Text>
+                      {series.data.length === 0 ? (
+                        <Text className="text-xs text-muted-foreground">
+                          No samples to preview.
+                        </Text>
+                      ) : (
+                        <View
+                          className="mt-1"
+                          onLayout={(event) => {
+                            const width = event.nativeEvent.layout.width;
+                            if (width > 0 && width !== graphWidth) {
+                              setGraphWidth(width);
+                            }
+                          }}
+                        >
+                          <View style={{ height: 140 }}>
+                            <Svg width={graphWidth} height={120}>
+                              {buildSampleMarkers(
+                                series.data.length,
+                                graphWidth /
+                                  Math.max(series.data.length - 1, 1),
+                                120,
+                              )}
+                              <Path
+                                d={buildWavePath(
+                                  series.data,
+                                  120,
+                                  graphWidth /
+                                    Math.max(series.data.length - 1, 1),
+                                )}
+                                stroke={series.color}
+                                strokeWidth={2}
+                                fill="none"
+                              />
+                            </Svg>
+                          </View>
+                        </View>
+                      )}
+                    </View>
+                  ))}
                 </View>
-              </ScrollView>
-            )}
+              )}
           </CardContent>
         </Card>
       )}

@@ -36,7 +36,6 @@ import {
 import { useAppStore } from "@/stores/app-store";
 import {
   concatUint8Arrays,
-  generateMockSessionBytes,
 } from "@/services/ecg-utils";
 import { finalizeSessionRecording } from "@/services/supabase-ecg";
 import { startSessionAnalysis } from "@/services/session-analysis";
@@ -89,17 +88,11 @@ export default function RunSummaryScreen() {
         throw new Error("No pending upload data found.");
       }
 
-      const { recordId, sessionId, packets, startTimeIso, useMock } =
+      const { recordId, sessionId, packets, startTimeIso } =
         pendingUpload;
       const userId = user?.email ?? "unknown@local";
 
-      let bytes: Uint8Array;
-      if (useMock) {
-        console.log("[SUMMARY] mock mode: generating 10-minute ECG stream");
-        bytes = generateMockSessionBytes();
-      } else {
-        bytes = concatUint8Arrays(packets);
-      }
+      const bytes = concatUint8Arrays(packets);
 
       if (bytes.length === 0) {
         throw new Error("No session bytes available for upload.");

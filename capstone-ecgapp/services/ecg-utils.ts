@@ -59,3 +59,89 @@ export function generateMockSessionBytes(): Uint8Array {
 
   return bytes;
 }
+
+export const ECG_SAMPLES_PER_PACKET = 25;
+export const ECG_PACKET_BYTES =
+  (1 + ECG_SAMPLES_PER_PACKET * 3) * 3;
+
+const ADS1298_DEFAULT_VREF = 2.4;
+const ADS1298_DEFAULT_GAIN = 6;
+const ADS1298_MAX_CODE = Math.pow(2, 23) - 1;
+
+export function read24SignedBE(bytes: Uint8Array, offset: number): number {
+  const value =
+    (bytes[offset] << 16) | (bytes[offset + 1] << 8) | bytes[offset + 2];
+  return value & 0x800000 ? value | 0xff000000 : value;
+}
+
+export function countsToMillivolts(
+  count: number,
+  vref: number = ADS1298_DEFAULT_VREF,
+  gain: number = ADS1298_DEFAULT_GAIN,
+): number {
+  const volts = (count / ADS1298_MAX_CODE) * (vref / gain);
+  return volts * 1000;
+}
+
+export type EcgChannelsMv = {
+  status: number;
+  ch2: number[];
+  ch3: number[];
+  ch4: number[];
+};
+
+export function decodeEcgPacketToChannelsMv(
+  packet: Uint8Array,
+): EcgChannelsMv | null {
+  if (packet.length < ECG_PACKET_BYTES) return null;
+
+  let offset = 0;
+  const status = read24SignedBE(packet, offset);
+  offset += 3;
+
+  const ch2 = new Array<number>(ECG_SAMPLES_PER_PACKET);
+  const ch3 = new Array<number>(ECG_SAMPLES_PER_PACKET);
+  const ch4 = new Array<number>(ECG_SAMPLES_PER_PACKET);
+
+  for (let i = 0; i < ECG_SAMPLES_PER_PACKET; i += 1) {
+    const count = read24SignedBE(packet, offset);
+    ch2[i] = countsToMillivolts(count);
+    offset += 3;
+  }
+  for (let i = 0; i < ECG_SAMPLES_PER_PACKET; i += 1) {
+    const count = read24SignedBE(packet, offset);
+    ch3[i] = countsToMillivolts(count);
+    offset += 3;
+  }
+  for (let i = 0; i < ECG_SAMPLES_PER_PACKET; i += 1) {
+    const count = read24SignedBE(packet, offset);
+    ch4[i] = countsToMillivolts(count);
+    offset += 3;
+  }
+
+  return { status, ch2, ch3, ch4 };
+}
+
+export function buildChannelsCsvFromPackets(
+  packets: Uint8Array[],
+): { csv: string; rows: number; invalidPackets: number } {
+  const rows: string[] = ["index,ch2,ch3,ch4"];
+  let rowIndex = 1;
+  let invalidPackets = 0;
+
+  for (const packet of packets) {
+    const decoded = decodeEcgPacketToChannelsMv(packet);
+    if (!decoded) {
+      invalidPackets += 1;
+      continue;
+    }
+    for (let i = 0; i < decoded.ch2.length; i += 1) {
+      rows.push(
+        `${rowIndex},${decoded.ch2[i].toFixed(6)},${decoded.ch3[i].toFixed(6)},${decoded.ch4[i].toFixed(6)}`,
+      );
+      rowIndex += 1;
+    }
+  }
+
+  return { csv: rows.join("\n"), rows: rowIndex - 1, invalidPackets };
+}
