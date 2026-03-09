@@ -37,7 +37,7 @@ import { useAppStore } from "@/stores/app-store";
 import {
   concatUint8Arrays,
 } from "@/services/ecg-utils";
-import { finalizeSessionRecording } from "@/services/supabase-ecg";
+import { finalizeSessionRecord } from "@/services/backend-ecg";
 import { startSessionAnalysis } from "@/services/session-analysis";
 import {
   getSessionAnalysis,
@@ -99,7 +99,7 @@ export default function RunSummaryScreen() {
       }
 
       setSyncProgress(40);
-      await finalizeSessionRecording({
+      await finalizeSessionRecord({
         recordId,
         userId,
         sessionId,

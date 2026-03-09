@@ -183,6 +183,89 @@ def _fetch_storage_bytes(object_key: str) -> bytes:
         ) from exc
 
 
+def _supabase_headers(json_content: bool = True) -> Dict[str, str]:
+    config = _get_supabase_config()
+    headers = {
+        "apikey": config["key"],
+        "Authorization": f"Bearer {config['key']}",
+    }
+    if json_content:
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
+    return headers
+
+
+def _upload_storage_bytes(object_key: str, payload: bytes) -> None:
+    config = _get_supabase_config()
+    url = f"{config['url']}/storage/v1/object/{config['bucket']}/{object_key}"
+    headers = {
+        "apikey": config["key"],
+        "Authorization": f"Bearer {config['key']}",
+        "Content-Type": "application/octet-stream",
+        "x-upsert": "true",
+    }
+    try:
+        with httpx.Client(timeout=60) as client:
+            response = client.post(url, headers=headers, content=payload)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase Storage upload error: {exc.response.status_code} {exc.response.text}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase Storage upload unreachable: {exc}",
+        ) from exc
+
+
+def _insert_recording_row(payload: Dict[str, Any]) -> Dict[str, Any]:
+    config = _get_supabase_config()
+    url = f"{config['url']}/rest/v1/ecg_recordings"
+    headers = _supabase_headers(json_content=True)
+    headers["Prefer"] = "return=representation"
+    try:
+        with httpx.Client(timeout=30) as client:
+            response = client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase insert error: {exc.response.status_code} {exc.response.text}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase insert unreachable: {exc}",
+        ) from exc
+    if not data:
+        raise HTTPException(status_code=502, detail="Supabase insert returned no rows.")
+    return data[0]
+
+
+def _update_recording_row(record_id: str, payload: Dict[str, Any]) -> None:
+    config = _get_supabase_config()
+    url = f"{config['url']}/rest/v1/ecg_recordings?id=eq.{record_id}"
+    headers = _supabase_headers(json_content=True)
+    headers["Prefer"] = "return=minimal"
+    try:
+        with httpx.Client(timeout=30) as client:
+            response = client.patch(url, headers=headers, json=payload)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase update error: {exc.response.status_code} {exc.response.text}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase update unreachable: {exc}",
+        ) from exc
+
+
 def _decode_int16_le(payload: bytes) -> List[int]:
     if len(payload) % 2 != 0:
         logger.warning("[DECODE] odd byte count len=%s", len(payload))
@@ -201,7 +284,7 @@ def _read24_signed_be(payload: bytes, offset: int) -> int:
 
 
 def _counts_to_mv(count: int) -> float:
-    return (count / ADS1298_MAX_CODE) * (ADS1298_VREF) * 1000.0
+    return (count / ADS1298_MAX_CODE) * (ADS1298_VREF / ADS1298_GAIN) * 1000.0
 
 
 def _decode_ads1298_packets(payload: bytes) -> Dict[str, List[float]]:
@@ -229,6 +312,27 @@ def _decode_ads1298_packets(payload: bytes) -> Dict[str, List[float]]:
             channels["CH4"].append(_counts_to_mv(_read24_signed_be(payload, offset)))
             offset += 3
     return channels
+
+
+def _preview_series(samples: List[float], preview_samples: int = 2500) -> List[float]:
+    limited = samples[:preview_samples]
+    if not limited:
+        return []
+    mean = sum(limited) / len(limited)
+    max_abs = max(abs(value - mean) for value in limited) or 1.0
+    return [(value - mean) / max_abs for value in limited]
+
+
+def _packet_stats(payload: bytes) -> Dict[str, int]:
+    packet_count = len(payload) // PACKET_BYTES
+    sample_count_per_channel = packet_count * SAMPLES_PER_PACKET
+    remainder = len(payload) % PACKET_BYTES
+    return {
+        "packet_count": packet_count,
+        "sample_count_per_channel": sample_count_per_channel,
+        "remainder": remainder,
+        "byte_length": len(payload),
+    }
 
 
 def _csv_path(filename: str) -> str:
@@ -555,6 +659,37 @@ class SessionAnalysisStartRequest(BaseModel):
     record_id: str = Field(..., description="Supabase ecg_recordings.id")
 
 
+class CalibrationSignalQualityResponse(BaseModel):
+    quality_percentage: float
+    signal_suitable: bool
+    calibration_object_key: str
+    byte_length: int
+    packet_count: int
+    sample_count_per_channel: int
+    preview: Dict[str, List[float]]
+
+
+class SessionStartRequest(BaseModel):
+    user_id: str
+    session_id: str
+    calibration_object_key: str
+    start_time: Optional[str] = None
+
+
+class SessionStartResponse(BaseModel):
+    record_id: str
+    session_object_key: str
+
+
+class SessionUploadResponse(BaseModel):
+    record_id: str
+    session_object_key: str
+    byte_length: int
+    packet_count: int
+    sample_count_per_channel: int
+    duration_ms: int
+
+
 class SessionAnalysisJob(BaseModel):
     job_id: str
     status: str
@@ -615,119 +750,74 @@ def health() -> Dict[str, str]:
 
 
 
-@app.post("/calibration_signal_quality_check")
+@app.post("/calibration_signal_quality_check", response_model=CalibrationSignalQualityResponse)
 async def calibration_signal_quality_check(
     request: Request,
-) -> Dict[str, Union[float, bool]]:
+) -> CalibrationSignalQualityResponse:
     data = await request.body()
-    byte_length = len(data)
-    sample_count = byte_length // 2
-    remainder = byte_length % 2
+    stats = _packet_stats(data)
+    run_id = request.headers.get("X-Run-Id") or f"calibration_{uuid4().hex}"
+    object_key = f"calibration/{run_id}.bin"
 
-    decoded_samples = [
-        int.from_bytes(data[i : i + 2], "little", signed=True)
-        for i in range(0, sample_count * 2, 2)
-    ]
-    request_dump = {
-        "method": request.method,
-        "url": str(request.url),
-        "headers": dict(request.headers),
-        "byte_length": byte_length,
-        "samples": decoded_samples,
-    }
-    dump_path = os.path.join(os.path.dirname(__file__), "calibration_request.json")
-    with open(dump_path, "w", encoding="utf-8") as handle:
-        json.dump(request_dump, handle, indent=2)
+    logger.info(
+        "[CALIBRATION] received run_id=%s byte_length=%s packet_count=%s sample_count_per_channel=%s remainder=%s",
+        run_id,
+        stats["byte_length"],
+        stats["packet_count"],
+        stats["sample_count_per_channel"],
+        stats["remainder"],
+    )
 
-    print("[CALIBRATION] Received calibration signal")
-    print(f"[CALIBRATION] byte_length={byte_length} sample_count={sample_count}")
-    if remainder:
-        print(f"[CALIBRATION] WARNING: odd byte count (remainder={remainder})")
+    if stats["packet_count"] == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No complete ECG packets received.",
+        )
+    if stats["remainder"] != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Payload length is not a multiple of packet size {PACKET_BYTES}.",
+        )
 
-    if sample_count == 0:
-        print("[CALIBRATION] No samples received -> quality=0, suitable=False")
-        LAST_CALIBRATION_SAMPLES.clear()
-        LAST_CALIBRATION_META["byte_length"] = 0
-        LAST_CALIBRATION_META["sample_count"] = 0
-        return {"quality_percentage": 0.0, "signal_suitable": False}
+    channels = _decode_ads1298_packets(data)
+    ch2 = channels.get("CH2", [])
+    if not ch2:
+        raise HTTPException(status_code=400, detail="Decoded calibration signal is empty.")
 
     sum_sq = 0.0
-    samples = []
     min_val = None
     max_val = None
-    for i in range(0, sample_count * 2, 2):
-        value = int.from_bytes(data[i : i + 2], "little", signed=True)
+    for value in ch2:
         sum_sq += float(value * value)
-        samples.append(value)
         if min_val is None or value < min_val:
             min_val = value
         if max_val is None or value > max_val:
             max_val = value
 
-    rms = sqrt(sum_sq / sample_count)
-    quality = max(0.0, min(100.0, (rms / 1000.0) * 100.0))
+    rms = sqrt(sum_sq / len(ch2))
+    quality = max(0.0, min(100.0, (rms / 0.5) * 100.0))
     signal_suitable = quality >= 70.0
 
     LAST_CALIBRATION_SAMPLES.clear()
-    LAST_CALIBRATION_SAMPLES.extend(samples)
-    LAST_CALIBRATION_META["byte_length"] = byte_length
-    LAST_CALIBRATION_META["sample_count"] = sample_count
+    LAST_CALIBRATION_SAMPLES.extend(ch2)
+    LAST_CALIBRATION_META["byte_length"] = stats["byte_length"]
+    LAST_CALIBRATION_META["sample_count"] = stats["sample_count_per_channel"]
 
-    print(
-        "[CALIBRATION] Computation details:"
-        f" min={min_val} max={max_val} rms={rms:.2f}"
+    _upload_storage_bytes(object_key, data)
+
+    return CalibrationSignalQualityResponse(
+        quality_percentage=round(quality, 2),
+        signal_suitable=signal_suitable,
+        calibration_object_key=object_key,
+        byte_length=stats["byte_length"],
+        packet_count=stats["packet_count"],
+        sample_count_per_channel=stats["sample_count_per_channel"],
+        preview={
+            "CH2": _preview_series(channels.get("CH2", [])),
+            "CH3": _preview_series(channels.get("CH3", [])),
+            "CH4": _preview_series(channels.get("CH4", [])),
+        },
     )
-    print(
-        "[CALIBRATION] Quality mapping:"
-        f" quality_percentage={quality:.2f} threshold=70.0"
-    )
-    print(
-        "[CALIBRATION] Result:"
-        f" signal_suitable={signal_suitable}"
-    )
-
-    return {
-        "quality_percentage": 100, #round(quality, 2),
-        "signal_suitable": True #signal_suitable,
-    }
-
-
-@app.post("/calibration_channels_csv")
-async def calibration_channels_csv(request: Request):
-    payload = await request.body()
-    try:
-        text = payload.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="CSV payload must be UTF-8 encoded.",
-        ) from exc
-
-    if not text.strip().lower().startswith("index,ch2,ch3,ch4"):
-        raise HTTPException(
-            status_code=400,
-            detail="CSV header must be: index,ch2,ch3,ch4",
-        )
-
-    path = _csv_path("calibration_mv.csv")
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(text)
-
-    row_count = text.count("\n")
-    run_id = request.headers.get("X-Run-Id", "unknown")
-    logger.info(
-        "[CSV] saved run_id=%s path=%s rows=%s",
-        run_id,
-        path,
-        row_count,
-    )
-
-    return {
-        "saved": True,
-        "path": path,
-        "rows": row_count,
-        "run_id": run_id,
-    }
 
 
 @app.post("/session_signal_quality_check")
@@ -794,6 +884,96 @@ async def session_signal_quality_check(
         "quality_percentage": round(quality, 2),
         "signal_suitable": signal_suitable,
     }
+
+
+@app.post("/session/start", response_model=SessionStartResponse)
+async def session_start(payload: SessionStartRequest) -> SessionStartResponse:
+    config = _get_supabase_config()
+    session_object_key = f"session/{payload.session_id}.bin"
+    record = _insert_recording_row(
+        {
+            "user_id": payload.user_id,
+            "bucket": config["bucket"],
+            "session_object_key": session_object_key,
+            "calibration_object_key": payload.calibration_object_key,
+            "encoding": "ads1298_24be_mv",
+            "sample_rate_hz": 500,
+            "channels": 3,
+            "sample_count": 0,
+            "duration_ms": 0,
+            "start_time": payload.start_time,
+            "byte_length": 0,
+            "notes": json.dumps(
+                {
+                    "channel_labels": CHANNEL_LABELS,
+                    "packet_bytes": PACKET_BYTES,
+                    "samples_per_packet": SAMPLES_PER_PACKET,
+                    "encoding": "ads1298_24be_mv",
+                }
+            ),
+        }
+    )
+    return SessionStartResponse(
+        record_id=str(record["id"]),
+        session_object_key=session_object_key,
+    )
+
+
+@app.post("/session/{record_id}/upload", response_model=SessionUploadResponse)
+async def session_upload(record_id: str, request: Request) -> SessionUploadResponse:
+    payload = await request.body()
+    session_id = request.headers.get("X-Session-Id")
+    user_id = request.headers.get("X-User-Id")
+    start_time = request.headers.get("X-Start-Time")
+    if not session_id or not user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing X-Session-Id or X-User-Id header.",
+        )
+
+    stats = _packet_stats(payload)
+    if stats["packet_count"] == 0:
+        raise HTTPException(status_code=400, detail="No complete ECG packets received.")
+    if stats["remainder"] != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Payload length is not a multiple of packet size {PACKET_BYTES}.",
+        )
+
+    session_object_key = f"session/{session_id}.bin"
+    _upload_storage_bytes(session_object_key, payload)
+    duration_ms = round((stats["sample_count_per_channel"] / 500) * 1000)
+    _update_recording_row(
+        record_id,
+        {
+            "user_id": user_id,
+            "session_object_key": session_object_key,
+            "sample_count": stats["sample_count_per_channel"],
+            "duration_ms": duration_ms,
+            "start_time": start_time,
+            "byte_length": stats["byte_length"],
+            "encoding": "ads1298_24be_mv",
+            "sample_rate_hz": 500,
+            "channels": 3,
+            "notes": json.dumps(
+                {
+                    "channel_labels": CHANNEL_LABELS,
+                    "packet_bytes": PACKET_BYTES,
+                    "samples_per_packet": SAMPLES_PER_PACKET,
+                    "encoding": "ads1298_24be_mv",
+                    "packet_count": stats["packet_count"],
+                }
+            ),
+        },
+    )
+    return SessionUploadResponse(
+        record_id=record_id,
+        session_object_key=session_object_key,
+        byte_length=stats["byte_length"],
+        packet_count=stats["packet_count"],
+        sample_count_per_channel=stats["sample_count_per_channel"],
+        duration_ms=duration_ms,
+    )
 
 def _session_analysis_job(job_id: str, record_id: str) -> None:
     logger.info("[JOB] start job_id=%s record_id=%s", job_id, record_id)

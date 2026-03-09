@@ -39,13 +39,9 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Text } from "@/components/ui/text";
 import { ENABLE_MOCK_MODE } from "@/config/mock-config";
+import { startSessionRecord } from "@/services/backend-ecg";
 import { useBluetoothService } from "@/services/bluetooth-service";
 import {
-  createSessionRecordAtStart,
-  uploadCalibrationFile,
-} from "@/services/supabase-ecg";
-import {
-  decodeEcgPacketToChannelsMv,
   ECG_PACKET_BYTES,
   ECG_SAMPLES_PER_PACKET,
 } from "@/services/ecg-utils";
@@ -84,7 +80,7 @@ export default function RunSessionScreen() {
     startEcgNotifications,
     stopEcgNotifications,
   } = useBluetoothService();
-  const { user } = useAppStore();
+  const { user, calibrationResult } = useAppStore();
   const isConnected = connectionStatus === "connected";
   const userId = user?.email ?? "unknown@local";
 
@@ -142,19 +138,19 @@ export default function RunSessionScreen() {
 
       const sessionId = formatSessionId(sessionStartRef.current ?? new Date());
       sessionIdRef.current = sessionId;
+      const calibrationObjectKey = calibrationResult?.calibrationObjectKey;
+      if (!calibrationObjectKey) {
+        hasPreparedUploadRef.current = false;
+        console.error("Failed to prepare session upload:", new Error("Missing calibration object key."));
+        return;
+      }
 
-      uploadCalibrationFile()
-        .then((calibration) => {
-          if (!calibration) {
-            throw new Error("No calibration available to upload.");
-          }
-          return createSessionRecordAtStart({
-            userId,
-            sessionId,
-            calibrationObjectKey: calibration.objectKey,
-            startTime: sessionStartRef.current,
-          });
-        })
+      startSessionRecord({
+        userId,
+        sessionId,
+        calibrationObjectKey,
+        startTime: sessionStartRef.current,
+      })
         .then((record) => {
           recordIdRef.current = record.recordId ?? null;
           if (recordIdRef.current) {
@@ -190,17 +186,12 @@ export default function RunSessionScreen() {
         }
         return;
       }
-      const decoded = decodeEcgPacketToChannelsMv(bytes);
-      if (!decoded) {
-        invalidPacketCountRef.current += 1;
-        return;
-      }
       sessionPacketsRef.current.push(bytes);
       sessionPacketCountRef.current += 1;
       const count = sessionPacketCountRef.current;
       if (count === 1) {
         console.log(
-          `[SESSION] first packet status=0x${decoded.status.toString(16)} bytes=${bytes.length}`,
+          `[SESSION] first packet bytes=${bytes.length}`,
         );
       } else if (count % 20 === 0) {
         console.log(`[SESSION] packet=${count}`);
@@ -208,7 +199,7 @@ export default function RunSessionScreen() {
     }).catch((error) => {
       console.error("Failed to start ECG stream:", error);
     });
-  }, [sessionStatus, startEcgNotifications, userId]);
+  }, [calibrationResult?.calibrationObjectKey, sessionStatus, startEcgNotifications, userId]);
 
   useEffect(() => {
     if (sessionStatus === "idle" || sessionStatus === "completed") {

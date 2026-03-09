@@ -62,6 +62,7 @@ export interface CalibrationResult {
   message?: string;
   timestamp?: Date;
   signalQuality?: number;
+  calibrationObjectKey?: string;
 }
 
 // Run session types

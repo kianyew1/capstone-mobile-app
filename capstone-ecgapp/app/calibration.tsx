@@ -27,17 +27,13 @@ import { Progress } from "@/components/ui/progress";
 import { Text } from "@/components/ui/text";
 import { ENABLE_MOCK_MODE } from "@/config/mock-config";
 import { getCalibrationSignalQuality } from "@/services/calibration-quality";
-import { uploadCalibrationCsv } from "@/services/calibration-csv";
 import { useBluetoothService } from "@/services/bluetooth-service";
 import {
-  getLatestCalibrationRunId,
-  getPacketsForRun,
   logDbLocation,
   saveCalibrationRun,
 } from "@/services/ecg-storage";
 import {
-  buildChannelsCsvFromPackets,
-  decodeEcgPacketToChannelsMv,
+  concatUint8Arrays,
   ECG_PACKET_BYTES,
   ECG_SAMPLES_PER_PACKET,
 } from "@/services/ecg-utils";
@@ -67,7 +63,6 @@ export default function CalibrationScreen() {
   const [lastPacketBytes, setLastPacketBytes] = useState<Uint8Array | null>(
     null,
   );
-  const [lastRunId, setLastRunId] = useState<string | null>(null);
   const [graphSeries, setGraphSeries] = useState<{
     ch2: number[];
     ch3: number[];
@@ -105,89 +100,6 @@ export default function CalibrationScreen() {
       pulseAnim.value = 1;
     }
   }, [step]);
-
-  useEffect(() => {
-    const loadGraph = async () => {
-      if (!SHOW_CALIBRATION_GRAPH) return;
-      if (step !== "result" || calibrationStatus !== "success") return;
-
-      setIsGraphLoading(true);
-      setGraphError(null);
-      setGraphSeries({ ch2: [], ch3: [], ch4: [] });
-
-      try {
-        const runId = lastRunId ?? (await getLatestCalibrationRunId());
-        if (!runId) {
-          setGraphError("No calibration run found.");
-          return;
-        }
-
-        const packets = await getPacketsForRun(runId);
-        if (packets.length === 0) {
-          setGraphError("No packets found for the latest run.");
-          return;
-        }
-
-        const ch2Raw: number[] = [];
-        const ch3Raw: number[] = [];
-        const ch4Raw: number[] = [];
-        for (const packet of packets) {
-          if (packet.length < expectedPacketBytes) {
-            console.warn(
-              `[CAL] preview skip packet len=${packet.length} expected=${expectedPacketBytes}`,
-            );
-            continue;
-          }
-          const decoded = decodeEcgPacketToChannelsMv(packet);
-          if (!decoded) continue;
-          ch2Raw.push(...decoded.ch2);
-          ch3Raw.push(...decoded.ch3);
-          ch4Raw.push(...decoded.ch4);
-        }
-
-        const previewSamples = 2500;
-        const maxPoints = 2500;
-        const normalize = (values: number[]) => {
-          if (values.length === 0) return [];
-          const limited = values.slice(0, previewSamples);
-          const stepSize = Math.max(
-            1,
-            Math.ceil(limited.length / maxPoints),
-          );
-          const sampled: number[] = [];
-          for (let i = 0; i < limited.length; i += stepSize) {
-            sampled.push(limited[i]);
-          }
-
-          const mean =
-            sampled.reduce((sum, value) => sum + value, 0) / sampled.length;
-          let maxAbs = 0;
-          for (const v of sampled) {
-            const delta = Math.abs(v - mean);
-            if (delta > maxAbs) maxAbs = delta;
-          }
-          const scale = maxAbs || 1;
-          return sampled.map((v) => (v - mean) / scale);
-        };
-
-        const ch2 = normalize(ch2Raw);
-        const ch3 = normalize(ch3Raw);
-        const ch4 = normalize(ch4Raw);
-        console.log(
-          `[CAL] preview samples mv ch2=${ch2Raw.length} ch3=${ch3Raw.length} ch4=${ch4Raw.length}`,
-        );
-
-        setGraphSeries({ ch2, ch3, ch4 });
-      } catch (error) {
-        console.error("Failed to load calibration graph:", error);
-        setGraphError("Failed to load calibration graph.");
-      } finally {
-        setIsGraphLoading(false);
-      }
-    };
-
-    void loadGraph();
-  }, [SHOW_CALIBRATION_GRAPH, calibrationStatus, lastRunId, step]);
 
   useEffect(() => {
     return () => {
@@ -236,33 +148,18 @@ export default function CalibrationScreen() {
       setElapsedMs(endedAt - startedAt);
 
       try {
+        setIsGraphLoading(true);
+        setGraphError(null);
         const packetTotal = packetsRef.current.length;
         const samplesPerChannel =
           packetTotal * ECG_SAMPLES_PER_PACKET;
         console.log(
           `[CAL] packets=${packetTotal} samplesPerChannel=${samplesPerChannel}`,
         );
-        const csvPayload = buildChannelsCsvFromPackets(
-          packetsRef.current.map((packet) => packet.data),
-        );
-        try {
-          await uploadCalibrationCsv({
-            csv: csvPayload.csv,
-            runId,
-            rows: csvPayload.rows,
-            invalidPackets: csvPayload.invalidPackets,
-          });
-          console.log(
-            `[CAL] csv uploaded rows=${csvPayload.rows} invalidPackets=${csvPayload.invalidPackets}`,
-          );
-        } catch (error) {
-          console.warn("[CAL] csv upload failed", error);
-        }
-
         const bytes = concatUint8Arrays(
           packetsRef.current.map((packet) => packet.data),
         );
-        const quality = await getCalibrationSignalQuality(bytes);
+        const quality = await getCalibrationSignalQuality(bytes, runId);
 
         await saveCalibrationRun(runId, startedAt, endedAt, packetsRef.current);
         await logDbLocation(`calibration_saved run=${runId}`);
@@ -275,12 +172,17 @@ export default function CalibrationScreen() {
         setProgress(100);
         setResultMessage(message);
         setCalibrationStatus(quality.signalSuitable ? "success" : "failed");
-        setLastRunId(runId);
+        setGraphSeries({
+          ch2: quality.preview.CH2,
+          ch3: quality.preview.CH3,
+          ch4: quality.preview.CH4,
+        });
         setCalibrationResult({
           status: quality.signalSuitable ? "success" : "failed",
           message,
           timestamp: new Date(),
           signalQuality: quality.qualityPercentage,
+          calibrationObjectKey: quality.calibrationObjectKey,
         });
       } catch (error) {
         console.error("Failed to save calibration packets:", error);
@@ -289,7 +191,9 @@ export default function CalibrationScreen() {
         setResultMessage(
           "Calibration failed while checking signal quality. Please try again.",
         );
+        setGraphError("Failed to build calibration preview.");
       } finally {
+        setIsGraphLoading(false);
         setStep("result");
       }
     };
@@ -368,7 +272,6 @@ export default function CalibrationScreen() {
     setPacketCount(0);
     setElapsedMs(0);
     setLastPacketBytes(null);
-    setLastRunId(null);
     setGraphSeries({ ch2: [], ch3: [], ch4: [] });
     setGraphError(null);
     packetCountRef.current = 0;
@@ -429,17 +332,6 @@ export default function CalibrationScreen() {
     const hours = String(date.getHours()).padStart(2, "0");
     const minutes = String(date.getMinutes()).padStart(2, "0");
     return `calibration_${day}${month}${year}_${hours}${minutes}H`;
-  };
-
-  const concatUint8Arrays = (chunks: Uint8Array[]) => {
-    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const result = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return result;
   };
 
   const buildWavePath = (points: number[], height: number, stepX: number) => {
