@@ -1,6 +1,5 @@
 import { router, useLocalSearchParams } from "expo-router";
 import {
-  AlertCircle,
   ArrowLeft,
   Check,
   FlaskConical,
@@ -29,10 +28,6 @@ import { ENABLE_MOCK_MODE } from "@/config/mock-config";
 import { getCalibrationSignalQuality } from "@/services/calibration-quality";
 import { useBluetoothService } from "@/services/bluetooth-service";
 import {
-  logDbLocation,
-  saveCalibrationRun,
-} from "@/services/ecg-storage";
-import {
   concatUint8Arrays,
   ECG_PACKET_BYTES,
   ECG_SAMPLES_PER_PACKET,
@@ -46,10 +41,9 @@ type CalibrationStep = "guidance" | "ready" | "calibrating" | "result";
 export default function CalibrationScreen() {
   const params = useLocalSearchParams<{ fromOnboarding?: string }>();
   const isFromOnboarding = params.fromOnboarding === "true";
-  const targetPacketCount = ENABLE_MOCK_MODE ? 100 : 400;
-  const calibrationSeconds = ENABLE_MOCK_MODE ? 5 : 20;
+  const targetPacketCount = 400;
+  const calibrationSeconds = 20;
   const expectedPacketBytes = ECG_PACKET_BYTES;
-  const SHOW_CALIBRATION_GRAPH = true;
 
   const [step, setStep] = useState<CalibrationStep>("guidance");
   const [calibrationStatus, setCalibrationStatus] =
@@ -57,7 +51,6 @@ export default function CalibrationScreen() {
   const [progress, setProgress] = useState(0);
   const [resultMessage, setResultMessage] = useState("");
   const [signalQuality, setSignalQuality] = useState(0);
-  const [recommendations, setRecommendations] = useState<string[]>([]);
   const [packetCount, setPacketCount] = useState(0);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [lastPacketBytes, setLastPacketBytes] = useState<Uint8Array | null>(
@@ -116,11 +109,11 @@ export default function CalibrationScreen() {
   };
 
   const handleStartCalibration = async () => {
+    stopEcgNotifications();
     setStep("calibrating");
     setCalibrationStatus("in-progress");
     setProgress(0);
     setResultMessage("");
-    setRecommendations([]);
     setSignalQuality(0);
     setPacketCount(0);
     setElapsedMs(0);
@@ -160,10 +153,6 @@ export default function CalibrationScreen() {
           packetsRef.current.map((packet) => packet.data),
         );
         const quality = await getCalibrationSignalQuality(bytes, runId);
-
-        await saveCalibrationRun(runId, startedAt, endedAt, packetsRef.current);
-        await logDbLocation(`calibration_saved run=${runId}`);
-
         const message = quality.signalSuitable
           ? `Signal quality ${quality.qualityPercentage}%. Calibration successful.`
           : `Signal quality ${quality.qualityPercentage}%. Calibration failed. Please adjust device placement.`;
@@ -250,7 +239,12 @@ export default function CalibrationScreen() {
           void finishSuccess();
         }
       },
-      ENABLE_MOCK_MODE ? { mockPacketsPerTick: 4 } : undefined,
+      ENABLE_MOCK_MODE
+        ? {
+            mockPacketIntervalMs: 50,
+            mockPacketsPerTick: 1,
+          }
+        : undefined,
     );
 
     if (!started) {
@@ -267,7 +261,6 @@ export default function CalibrationScreen() {
     setCalibrationStatus("not-started");
     setProgress(0);
     setResultMessage("");
-    setRecommendations([]);
     setSignalQuality(0);
     setPacketCount(0);
     setElapsedMs(0);
@@ -643,7 +636,7 @@ export default function CalibrationScreen() {
         </CardContent>
       </Card>
 
-      {calibrationStatus === "success" && SHOW_CALIBRATION_GRAPH && (
+      {calibrationStatus === "success" && (
         <Card className="mb-2">
           <CardHeader>
             <CardTitle>Calibration Preview</CardTitle>
@@ -716,29 +709,6 @@ export default function CalibrationScreen() {
           </CardContent>
         </Card>
       )}
-
-      {/* Recommendations (if failed) */}
-      {calibrationStatus === "failed" && recommendations.length > 0 && (
-        <Card className="mb-3">
-          <CardHeader>
-            <CardTitle className="flex-row items-center gap-2">
-              <AlertCircle size={18} className="text-yellow-500" />
-              <Text className="font-semibold">Recommendations</Text>
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <View className="gap-2">
-              {recommendations.map((rec, index) => (
-                <View key={index} className="flex-row items-start gap-2">
-                  <Text className="text-muted-foreground">•</Text>
-                  <Text className="text-muted-foreground flex-1">{rec}</Text>
-                </View>
-              ))}
-            </View>
-          </CardContent>
-        </Card>
-      )}
-
       {/* Action Buttons */}
       <View className="gap-2 pb-4">
         {calibrationStatus === "success" ? (

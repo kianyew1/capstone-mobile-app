@@ -2,7 +2,6 @@ import { create } from "zustand";
 import type {
   SessionStatus,
   HeartRateData,
-  ECGDataPacket,
   EventMarker,
   RunSession,
 } from "@/types";
@@ -15,13 +14,11 @@ interface SessionState {
   // Real-time data
   currentHeartRate: number;
   heartRateHistory: HeartRateData[];
-  ecgBuffer: ECGDataPacket[];
   eventMarkers: EventMarker[];
 
   // Connection status
   isReceivingData: boolean;
   lastDataTimestamp: number | null;
-  bufferedPackets: ECGDataPacket[]; // For offline buffering
 
   // Session stats
   elapsedTime: number;
@@ -42,12 +39,7 @@ interface SessionState {
 
   // Data actions
   addHeartRateData: (data: HeartRateData) => void;
-  addECGPacket: (packet: ECGDataPacket) => void;
   addEventMarker: (type: EventMarker["type"], description?: string) => void;
-
-  // Buffering actions
-  addToBuffer: (packet: ECGDataPacket) => void;
-  flushBuffer: () => ECGDataPacket[];
 
   // Timer actions
   updateElapsedTime: (time: number) => void;
@@ -78,11 +70,9 @@ const initialState = {
   sessionStatus: "idle" as SessionStatus,
   currentHeartRate: 0,
   heartRateHistory: [],
-  ecgBuffer: [],
   eventMarkers: [],
   isReceivingData: false,
   lastDataTimestamp: null,
-  bufferedPackets: [],
   elapsedTime: 0,
   averageHeartRate: 0,
   maxHeartRate: 0,
@@ -103,7 +93,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       status: "running",
       duration: 0,
       heartRateData: [],
-      ecgPackets: [],
       eventMarkers: [],
     };
 
@@ -111,7 +100,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       currentSession: session,
       sessionStatus: "running",
       heartRateHistory: [],
-      ecgBuffer: [],
       eventMarkers: [],
       elapsedTime: 0,
       averageHeartRate: 0,
@@ -130,7 +118,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         status: "completed",
         duration: state.elapsedTime,
         heartRateData: state.heartRateHistory,
-        ecgPackets: state.ecgBuffer,
         eventMarkers: state.eventMarkers,
         averageHeartRate: state.averageHeartRate,
         maxHeartRate: state.maxHeartRate,
@@ -171,13 +158,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     });
   },
 
-  addECGPacket: (packet: ECGDataPacket) => {
-    set((state) => ({
-      ecgBuffer: [...state.ecgBuffer, packet],
-      lastDataTimestamp: packet.timestamp,
-    }));
-  },
-
   addEventMarker: (type: EventMarker["type"], description?: string) => {
     const marker: EventMarker = {
       id: `marker_${Date.now()}`,
@@ -189,18 +169,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     set((state) => ({
       eventMarkers: [...state.eventMarkers, marker],
     }));
-  },
-
-  addToBuffer: (packet: ECGDataPacket) => {
-    set((state) => ({
-      bufferedPackets: [...state.bufferedPackets, packet],
-    }));
-  },
-
-  flushBuffer: () => {
-    const packets = get().bufferedPackets;
-    set({ bufferedPackets: [] });
-    return packets;
   },
 
   updateElapsedTime: (time: number) => {

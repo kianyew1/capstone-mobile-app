@@ -80,12 +80,6 @@ export interface HeartRateData {
   rrInterval?: number;
 }
 
-export interface ECGDataPacket {
-  timestamp: number;
-  data: number[];
-  sequenceNumber: number;
-}
-
 export interface EventMarker {
   id: string;
   timestamp: number;
@@ -100,7 +94,6 @@ export interface RunSession {
   status: SessionStatus;
   duration: number; // in seconds
   heartRateData: HeartRateData[];
-  ecgPackets: ECGDataPacket[];
   eventMarkers: EventMarker[];
   averageHeartRate?: number;
   maxHeartRate?: number;

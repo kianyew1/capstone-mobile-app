@@ -16,6 +16,10 @@ import {
   type Subscription,
 } from "react-native-ble-plx";
 import { useBluetoothStore } from "@/stores/bluetooth-store";
+import {
+  ECG_PACKET_BYTES,
+  ECG_SAMPLES_PER_PACKET,
+} from "@/services/ecg-utils";
 
 // Service/Characteristic UUIDs for the XIAO nRF52840 ECG firmware
 // Keep in sync with nrf52480.ino
@@ -35,12 +39,16 @@ let hasLoggedEcgStart = false;
 let hasLoggedFirstPayload = false;
 
 const MOCK_SAMPLE_RATE_HZ = 500;
-const MOCK_SAMPLES_PER_PACKET = 10;
+const MOCK_SAMPLES_PER_PACKET = ECG_SAMPLES_PER_PACKET;
 const MOCK_PACKET_INTERVAL_MS = Math.round(
   (1000 * MOCK_SAMPLES_PER_PACKET) / MOCK_SAMPLE_RATE_HZ,
 );
-const MOCK_ECG_AMPLITUDE = 1200;
-const MOCK_ECG_NOISE_AMPLITUDE = 40;
+const MOCK_ECG_AMPLITUDE_MV = 0.85;
+const MOCK_ECG_NOISE_AMPLITUDE_MV = 0.03;
+const MOCK_PACKET_STATUS = 0xc00000;
+const ADS1298_VREF = 2.4;
+const ADS1298_GAIN = 6;
+const ADS1298_MAX_CODE = (2 ** 23) - 1;
 let mockPhase = 0;
 
 const syntheticEcg = (t: number) => {
@@ -52,37 +60,72 @@ const syntheticEcg = (t: number) => {
   return p + q + r + s + tw;
 };
 
-const nextMockSample = () => {
+const clamp24Signed = (value: number) => {
+  if (value > ADS1298_MAX_CODE) return ADS1298_MAX_CODE;
+  if (value < -(2 ** 23)) return -(2 ** 23);
+  return value;
+};
+
+const millivoltsToCounts = (millivolts: number) => {
+  const fullScaleMillivolts = (ADS1298_VREF / ADS1298_GAIN) * 1000;
+  const counts = Math.round(
+    (millivolts / fullScaleMillivolts) * ADS1298_MAX_CODE,
+  );
+  return clamp24Signed(counts);
+};
+
+const write24SignedBE = (
+  buffer: Uint8Array,
+  offset: number,
+  value: number,
+) => {
+  const clamped = clamp24Signed(value);
+  const unsigned = clamped < 0 ? clamped + (1 << 24) : clamped;
+  buffer[offset] = (unsigned >> 16) & 0xff;
+  buffer[offset + 1] = (unsigned >> 8) & 0xff;
+  buffer[offset + 2] = unsigned & 0xff;
+};
+
+const nextMockTriplet = () => {
   const baseFreqHz = MOCK_HEART_RATE_CONFIG.baseHeartRate / 60;
   const phaseStep =
     (2 * Math.PI * baseFreqHz) / MOCK_SAMPLE_RATE_HZ;
 
   const t = mockPhase / (2 * Math.PI);
-  const ecg = syntheticEcg(t);
+  const ch2 =
+    syntheticEcg(t) * MOCK_ECG_AMPLITUDE_MV +
+    (Math.random() * 2 - 1) * MOCK_ECG_NOISE_AMPLITUDE_MV;
+  const ch3 =
+    syntheticEcg((t + 0.02) % 1) * (MOCK_ECG_AMPLITUDE_MV * 0.75) +
+    (Math.random() * 2 - 1) * MOCK_ECG_NOISE_AMPLITUDE_MV;
+  const ch4 =
+    syntheticEcg((t + 0.05) % 1) * (MOCK_ECG_AMPLITUDE_MV * 0.55) +
+    (Math.random() * 2 - 1) * MOCK_ECG_NOISE_AMPLITUDE_MV;
 
   mockPhase += phaseStep;
   if (mockPhase >= 2 * Math.PI) {
     mockPhase -= 2 * Math.PI;
   }
 
-  const noise =
-    Math.floor(Math.random() * (MOCK_ECG_NOISE_AMPLITUDE * 2 + 1)) -
-    MOCK_ECG_NOISE_AMPLITUDE;
-  let value = Math.round(MOCK_ECG_AMPLITUDE * ecg + noise);
-
-  if (value > 32767) value = 32767;
-  if (value < -32768) value = -32768;
-
-  return value;
+  return {
+    ch2: millivoltsToCounts(ch2),
+    ch3: millivoltsToCounts(ch3),
+    ch4: millivoltsToCounts(ch4),
+  };
 };
 
 const buildMockPacket = () => {
-  const packet = new Uint8Array(MOCK_SAMPLES_PER_PACKET * 2);
+  const packet = new Uint8Array(ECG_PACKET_BYTES);
+  write24SignedBE(packet, 0, MOCK_PACKET_STATUS);
+  const ch2OffsetBase = 3;
+  const ch3OffsetBase = ch2OffsetBase + MOCK_SAMPLES_PER_PACKET * 3;
+  const ch4OffsetBase = ch3OffsetBase + MOCK_SAMPLES_PER_PACKET * 3;
+
   for (let i = 0; i < MOCK_SAMPLES_PER_PACKET; i += 1) {
-    const sample = nextMockSample();
-    const unsigned = sample < 0 ? 0x10000 + sample : sample;
-    packet[i * 2] = unsigned & 0xff;
-    packet[i * 2 + 1] = (unsigned >> 8) & 0xff;
+    const sample = nextMockTriplet();
+    write24SignedBE(packet, ch2OffsetBase + i * 3, sample.ch2);
+    write24SignedBE(packet, ch3OffsetBase + i * 3, sample.ch3);
+    write24SignedBE(packet, ch4OffsetBase + i * 3, sample.ch4);
   }
   return packet;
 };
@@ -531,6 +574,9 @@ export function useBluetoothService() {
         const packetsPerTick = Math.max(
           1,
           options?.mockPacketsPerTick ?? 1,
+        );
+        console.log(
+          `[BLE] mock stream intervalMs=${intervalMs} packetsPerTick=${packetsPerTick} expectedPacketsPerSecond=${Math.round((1000 / intervalMs) * packetsPerTick)}`,
         );
 
         mockEcgInterval = setInterval(() => {
