@@ -130,6 +130,8 @@ type LiveResponse = {
 
 const CHANNELS = ["CH2", "CH3", "CH4"] as const;
 const REVIEW_MODES = ["CH2", "CH3", "CH4", "Vectorcardiography"] as const;
+const DEFAULT_ECG_Y_MAX_MV = 0.6;
+const DEFAULT_ECG_Y_MIN_MV = -0.3;
 const BEAT_MARKER_COLORS: Record<keyof BeatMarkers, string> = {
   P: "#1f7aec",
   Q: "#9a3412",
@@ -162,19 +164,23 @@ function createPath(
   points: number[],
   width: number,
   height: number,
+  minOverride?: number,
+  maxOverride?: number,
 ): { path: string; min: number; max: number } {
   if (points.length === 0) {
     return { path: "", min: 0, max: 0 };
   }
-  let min = points[0];
-  let max = points[0];
-  for (let index = 1; index < points.length; index += 1) {
-    const value = points[index];
-    if (value < min) {
-      min = value;
-    }
-    if (value > max) {
-      max = value;
+  let min = minOverride ?? points[0];
+  let max = maxOverride ?? points[0];
+  if (minOverride === undefined || maxOverride === undefined) {
+    for (let index = 1; index < points.length; index += 1) {
+      const value = points[index];
+      if (value < min) {
+        min = value;
+      }
+      if (value > max) {
+        max = value;
+      }
     }
   }
   const span = max - min || 1;
@@ -191,6 +197,27 @@ function createPath(
   return { path, min, max };
 }
 
+function createTicks(min: number, max: number, count: number): number[] {
+  if (count <= 1) {
+    return [min];
+  }
+  if (Math.abs(max - min) < 1e-9) {
+    return [min];
+  }
+  return Array.from({ length: count }, (_, index) => min + ((max - min) * index) / (count - 1));
+}
+
+function formatAxisValue(value: number): string {
+  const absValue = Math.abs(value);
+  if (absValue >= 1000) {
+    return value.toFixed(0);
+  }
+  if (absValue >= 100) {
+    return value.toFixed(1);
+  }
+  return value.toFixed(2);
+}
+
 function getBeatSamples(fullSignal: number[], beat: ReviewBeat | null): number[] {
   if (!beat) {
     return [];
@@ -201,20 +228,23 @@ function getBeatSamples(fullSignal: number[], beat: ReviewBeat | null): number[]
 function createVectorLoopGeometry(
   leadI: number[],
   leadII: number[],
-  maxAbsLeadI: number,
-  maxAbsLeadII: number,
   width: number,
   height: number,
+  axisMin: number,
+  axisMax: number,
 ): { path: string; axisX: number; axisY: number; points: Array<{ x: number; y: number }> } {
   const count = Math.min(leadI.length, leadII.length);
+  const span = axisMax - axisMin || 1;
+  const zeroRatio = (0 - axisMin) / span;
   if (count === 0) {
-    return { path: "", axisX: width / 2, axisY: height / 2, points: [] };
+    return { path: "", axisX: zeroRatio * width, axisY: height - zeroRatio * height, points: [] };
   }
 
-  const span = Math.max(maxAbsLeadI * 2, maxAbsLeadII * 2, 1);
   const scale = (Math.min(width, height) * 1.3) / span;
-  const plotX = (value: number) => width / 2 + value * scale;
-  const plotY = (value: number) => height / 2 - value * scale;
+  const zeroX = zeroRatio * width;
+  const zeroY = height - zeroRatio * height;
+  const plotX = (value: number) => zeroX + value * scale;
+  const plotY = (value: number) => zeroY - value * scale;
 
   const points = Array.from({ length: count }, (_, index) => ({
     x: plotX(leadI[index]),
@@ -252,6 +282,8 @@ function FullSignalChart({
   title,
   samples,
   sampleRateHz,
+  yMin,
+  yMax,
   highlightStart,
   highlightEnd,
   subtitle,
@@ -259,14 +291,23 @@ function FullSignalChart({
   title: string;
   samples: number[];
   sampleRateHz: number;
+  yMin: number;
+  yMax: number;
   highlightStart?: number | null;
   highlightEnd?: number | null;
   subtitle?: string;
 }) {
   const width = 860;
-  const height = 320;
-  const { path } = useMemo(() => createPath(samples, width, height), [samples]);
-  const step = Math.max(1, Math.floor(samples.length / 8));
+  const height = 360;
+  const margin = { top: 12, right: 18, bottom: 52, left: 64 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const { path, min, max } = useMemo(
+    () => createPath(samples, plotWidth, plotHeight, yMin, yMax),
+    [samples, plotWidth, plotHeight, yMin, yMax],
+  );
+  const xTickCount = 9;
+  const yTicks = createTicks(yMin, yMax, 5);
   const hasHighlight =
     highlightStart !== undefined &&
     highlightStart !== null &&
@@ -274,9 +315,9 @@ function FullSignalChart({
     highlightEnd !== null &&
     highlightEnd > highlightStart &&
     samples.length > 0;
-  const highlightX = hasHighlight ? (highlightStart / Math.max(samples.length - 1, 1)) * width : 0;
+  const highlightX = hasHighlight ? (highlightStart / Math.max(samples.length - 1, 1)) * plotWidth : 0;
   const highlightWidth = hasHighlight
-    ? ((highlightEnd - highlightStart) / Math.max(samples.length - 1, 1)) * width
+    ? ((highlightEnd - highlightStart) / Math.max(samples.length - 1, 1)) * plotWidth
     : 0;
 
   return (
@@ -288,32 +329,53 @@ function FullSignalChart({
         </div>
         <span>{samples.length} samples</span>
       </div>
-      <svg viewBox={`0 0 ${width} ${height + 28}`} className="signal-chart">
-        {Array.from({ length: 9 }, (_, index) => {
-          const x = (width / 8) * index;
+      <svg viewBox={`0 0 ${width} ${height}`} className="signal-chart">
+        {Array.from({ length: xTickCount }, (_, index) => {
+          const x = margin.left + (plotWidth / (xTickCount - 1)) * index;
           return (
             <g key={`grid-${index}`}>
-              <line x1={x} y1={0} x2={x} y2={height} className="grid-line" />
-              <text x={x + 4} y={height + 18} className="axis-label">
-                {((index * step) / sampleRateHz).toFixed(1)}s
+              <line x1={x} y1={margin.top} x2={x} y2={margin.top + plotHeight} className="grid-line" />
+              <text x={x + 4} y={height - 24} className="axis-label">
+                {(((samples.length - 1) / sampleRateHz) * index / (xTickCount - 1)).toFixed(1)}s
               </text>
             </g>
           );
         })}
-        {Array.from({ length: 5 }, (_, index) => {
-          const y = (height / 4) * index;
-          return <line key={`hgrid-${index}`} x1={0} y1={y} x2={width} y2={y} className="grid-line" />;
+        {yTicks.map((tickValue, index) => {
+          const y = margin.top + plotHeight - ((tickValue - min) / Math.max(max - min || 1, 1)) * plotHeight;
+          return (
+            <g key={`hgrid-${index}`}>
+              <line x1={margin.left} y1={y} x2={margin.left + plotWidth} y2={y} className="grid-line" />
+              <text x={margin.left - 8} y={y + 4} textAnchor="end" className="axis-label">
+                {formatAxisValue(tickValue)}
+              </text>
+            </g>
+          );
         })}
+        <text x={margin.left + plotWidth / 2} y={height - 6} textAnchor="middle" className="axis-unit-label">
+          Time (s)
+        </text>
+        <text
+          x={18}
+          y={margin.top + plotHeight / 2}
+          textAnchor="middle"
+          transform={`rotate(-90 18 ${margin.top + plotHeight / 2})`}
+          className="axis-unit-label"
+        >
+          mV
+        </text>
         {hasHighlight ? (
           <rect
-            x={highlightX}
-            y={0}
+            x={margin.left + highlightX}
+            y={margin.top}
             width={Math.max(highlightWidth, 3)}
-            height={height}
+            height={plotHeight}
             className="highlight-window"
           />
         ) : null}
-        <path d={path} className="signal-path" />
+        <g transform={`translate(${margin.left} ${margin.top})`}>
+          <path d={path} className="signal-path" />
+        </g>
       </svg>
     </div>
   );
@@ -323,18 +385,30 @@ function LiveSignalChart({
   samples,
   markers,
   sampleRateHz,
+  yMin,
+  yMax,
 }: {
   samples: number[];
   markers: LiveMarkers;
   sampleRateHz: number;
+  yMin: number;
+  yMax: number;
 }) {
   const width = 980;
-  const height = 360;
-  const { path, min, max } = useMemo(() => createPath(samples, width, height), [samples]);
+  const height = 400;
+  const margin = { top: 12, right: 18, bottom: 52, left: 64 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const { path, min, max } = useMemo(
+    () => createPath(samples, plotWidth, plotHeight, yMin, yMax),
+    [samples, plotWidth, plotHeight, yMin, yMax],
+  );
   const span = max - min || 1;
-  const step = Math.max(1, Math.floor(samples.length / 8));
-  const pointToY = (value: number) => height - ((value - min) / span) * height;
-  const pointToX = (index: number) => (samples.length > 1 ? (index / (samples.length - 1)) * width : 0);
+  const xTickCount = 9;
+  const yTicks = createTicks(yMin, yMax, 5);
+  const pointToY = (value: number) => margin.top + plotHeight - ((value - min) / span) * plotHeight;
+  const pointToX = (index: number) =>
+    margin.left + (samples.length > 1 ? (index / (samples.length - 1)) * plotWidth : 0);
 
   return (
     <div className="chart-card live-chart-card">
@@ -342,31 +416,52 @@ function LiveSignalChart({
         <h3>Rolling Session Buffer</h3>
         <span>{samples.length} samples</span>
       </div>
-      <svg viewBox={`0 0 ${width} ${height + 28}`} className="signal-chart live-chart">
-        {Array.from({ length: 9 }, (_, index) => {
-          const x = (width / 8) * index;
+      <svg viewBox={`0 0 ${width} ${height}`} className="signal-chart live-chart">
+        {Array.from({ length: xTickCount }, (_, index) => {
+          const x = margin.left + (plotWidth / (xTickCount - 1)) * index;
           return (
             <g key={`live-grid-${index}`}>
-              <line x1={x} y1={0} x2={x} y2={height} className="grid-line" />
-              <text x={x + 4} y={height + 18} className="axis-label">
-                {((index * step) / sampleRateHz).toFixed(1)}s
+              <line x1={x} y1={margin.top} x2={x} y2={margin.top + plotHeight} className="grid-line" />
+              <text x={x + 4} y={height - 24} className="axis-label">
+                {(((samples.length - 1) / sampleRateHz) * index / (xTickCount - 1)).toFixed(1)}s
               </text>
             </g>
           );
         })}
-        {Array.from({ length: 5 }, (_, index) => {
-          const y = (height / 4) * index;
-          return <line key={`live-hgrid-${index}`} x1={0} y1={y} x2={width} y2={y} className="grid-line" />;
+        {yTicks.map((tickValue, index) => {
+          const y = margin.top + plotHeight - ((tickValue - min) / span) * plotHeight;
+          return (
+            <g key={`live-hgrid-${index}`}>
+              <line x1={margin.left} y1={y} x2={margin.left + plotWidth} y2={y} className="grid-line" />
+              <text x={margin.left - 8} y={y + 4} textAnchor="end" className="axis-label">
+                {formatAxisValue(tickValue)}
+              </text>
+            </g>
+          );
         })}
-        <path d={path} className="signal-path live-path" />
+        <text x={margin.left + plotWidth / 2} y={height - 6} textAnchor="middle" className="axis-unit-label">
+          Time (s)
+        </text>
+        <text
+          x={18}
+          y={margin.top + plotHeight / 2}
+          textAnchor="middle"
+          transform={`rotate(-90 18 ${margin.top + plotHeight / 2})`}
+          className="axis-unit-label"
+        >
+          mV
+        </text>
+        <g transform={`translate(${margin.left} ${margin.top})`}>
+          <path d={path} className="signal-path live-path" />
+        </g>
         {(Object.entries(markers) as Array<[keyof LiveMarkers, number[]]>).map(([label, positions]) =>
           positions.map((position, idx) => (
             <g key={`${label}-${position}-${idx}`}>
               <line
                 x1={pointToX(position)}
-                y1={0}
+                y1={margin.top}
                 x2={pointToX(position)}
-                y2={height}
+                y2={margin.top + plotHeight}
                 className="marker-line"
                 style={{ stroke: LIVE_MARKER_COLORS[label] }}
               />
@@ -398,14 +493,23 @@ function BeatChart({
   beat,
   samples,
   beatCount,
+  sampleRateHz,
+  yMin,
+  yMax,
 }: {
   title: string;
   beat: ReviewBeat | null;
   samples: number[];
   beatCount: number;
+  sampleRateHz: number;
+  yMin: number;
+  yMax: number;
 }) {
-  const width = 420;
-  const height = 240;
+  const width = 460;
+  const height = 280;
+  const margin = { top: 12, right: 18, bottom: 52, left: 64 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
   const beatCounterText =
     beatCount > 0 ? `Beat ${beat?.index ?? 1} of ${beatCount}` : "No beats";
   const isExcluded = beat?.exclude_from_analysis ?? false;
@@ -422,9 +526,13 @@ function BeatChart({
     );
   }
 
-  const { path, min, max } = createPath(samples, width, height);
+  const { path, min, max } = createPath(samples, plotWidth, plotHeight, yMin, yMax);
   const span = max - min || 1;
-  const pointToY = (value: number) => height - ((value - min) / span) * height;
+  const pointToY = (value: number) => margin.top + plotHeight - ((value - min) / span) * plotHeight;
+  const pointToX = (index: number) =>
+    margin.left + (samples.length > 1 ? (index / (samples.length - 1)) * plotWidth : 0);
+  const yTicks = createTicks(yMin, yMax, 5);
+  const xTickCount = 5;
 
   return (
     <div className="chart-card beat-card">
@@ -435,13 +543,43 @@ function BeatChart({
         </div>
       </div>
       <svg viewBox={`0 0 ${width} ${height}`} className="beat-chart">
-        {Array.from({ length: 5 }, (_, index) => {
-          const y = (height / 4) * index;
-          return <line key={`beat-grid-${index}`} x1={0} y1={y} x2={width} y2={y} className="grid-line" />;
+        {Array.from({ length: xTickCount }, (_, index) => {
+          const x = margin.left + (plotWidth / (xTickCount - 1)) * index;
+          return (
+            <g key={`beat-xgrid-${index}`}>
+              <line x1={x} y1={margin.top} x2={x} y2={margin.top + plotHeight} className="grid-line" />
+              <text x={x + 4} y={height - 24} className="axis-label">
+                {((((samples.length - 1) / sampleRateHz) * 1000 * index) / (xTickCount - 1)).toFixed(0)}ms
+              </text>
+            </g>
+          );
         })}
+        {yTicks.map((tickValue, index) => {
+          const y = margin.top + plotHeight - ((tickValue - min) / span) * plotHeight;
+          return (
+            <g key={`beat-grid-${index}`}>
+              <line x1={margin.left} y1={y} x2={margin.left + plotWidth} y2={y} className="grid-line" />
+              <text x={margin.left - 8} y={y + 4} textAnchor="end" className="axis-label">
+                {formatAxisValue(tickValue)}
+              </text>
+            </g>
+          );
+        })}
+        <text x={margin.left + plotWidth / 2} y={height - 6} textAnchor="middle" className="axis-unit-label">
+          Time (ms)
+        </text>
+        <text
+          x={18}
+          y={margin.top + plotHeight / 2}
+          textAnchor="middle"
+          transform={`rotate(-90 18 ${margin.top + plotHeight / 2})`}
+          className="axis-unit-label"
+        >
+          mV
+        </text>
         {isExcluded ? (
           <g>
-            <rect x={0} y={0} width={width} height={height} className="excluded-overlay" />
+            <rect x={margin.left} y={margin.top} width={plotWidth} height={plotHeight} className="excluded-overlay" />
             <text x={width / 2} y={height / 2 - 10} textAnchor="middle" className="excluded-overlay-text">
               Excluded from analysis
             </text>
@@ -452,18 +590,20 @@ function BeatChart({
             ) : null}
           </g>
         ) : null}
-        <path d={path} className="signal-path beat-path" />
+        <g transform={`translate(${margin.left} ${margin.top})`}>
+          <path d={path} className="signal-path beat-path" />
+        </g>
         {(Object.entries(beat.markers) as Array<[keyof BeatMarkers, number[]]>).map(([label, positions]) =>
           positions.map((position, idx) => {
-            const x = samples.length > 1 ? (position / (samples.length - 1)) * width : 0;
+            const x = pointToX(position);
             const y = pointToY(samples[position] ?? 0);
             return (
               <g key={`${label}-${idx}-${position}`}>
                 <line
                   x1={x}
-                  y1={0}
+                  y1={margin.top}
                   x2={x}
-                  y2={height}
+                  y2={margin.top + plotHeight}
                   className="marker-line"
                   style={{ stroke: BEAT_MARKER_COLORS[label] }}
                 />
@@ -506,21 +646,30 @@ function VectorLoopChart({
   title,
   data,
   progressPercent,
+  yMin,
+  yMax,
 }: {
   title: string;
   data: VectorBeatResponse | null;
   progressPercent: number;
+  yMin: number;
+  yMax: number;
 }) {
   const width = 970;
   const height = 666;
+  const margin = { top: 20, right: 28, bottom: 72, left: 72 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
   const leadI = data?.lead_i ?? [];
   const leadII = data?.lead_ii ?? [];
-  const maxAbsLeadI = data?.max_abs_lead_i ?? 0;
-  const maxAbsLeadII = data?.max_abs_lead_ii ?? 0;
+  const axisMin = yMin;
+  const axisMax = yMax;
   const { path, axisX, axisY, points } = useMemo(
-    () => createVectorLoopGeometry(leadI, leadII, maxAbsLeadI, maxAbsLeadII, width, height),
-    [leadI, leadII, maxAbsLeadI, maxAbsLeadII],
+    () => createVectorLoopGeometry(leadI, leadII, plotWidth, plotHeight, axisMin, axisMax),
+    [leadI, leadII, plotWidth, plotHeight, axisMin, axisMax],
   );
+  const axisSpan = axisMax - axisMin || 1;
+  const axisTicks = createTicks(axisMin, axisMax, 5);
   const visiblePointCount = Math.max(
     1,
     Math.min(points.length, Math.floor((points.length * Math.min(Math.max(progressPercent, 0), 100)) / 100)),
@@ -550,9 +699,45 @@ function VectorLoopChart({
         <span>{Math.min(data.lead_i.length, data.lead_ii.length)} samples</span>
       </div>
       <svg viewBox={`0 0 ${width} ${height}`} className="vector-chart">
-        <line x1={axisX} y1={0} x2={axisX} y2={height} className="grid-line" />
-        <line x1={0} y1={axisY} x2={width} y2={axisY} className="grid-line" />
-        <path d={visiblePath || path} className="signal-path vector-path" />
+        {axisTicks.map((tickValue, index) => {
+          const x = margin.left + ((tickValue - axisMin) / axisSpan) * plotWidth;
+          return (
+            <g key={`vector-x-${index}`}>
+              <line x1={x} y1={margin.top} x2={x} y2={margin.top + plotHeight} className="grid-line" />
+              <text x={x} y={height - 30} textAnchor="middle" className="axis-label">
+                {formatAxisValue(tickValue)}
+              </text>
+            </g>
+          );
+        })}
+        {axisTicks.map((tickValue, index) => {
+          const y = margin.top + plotHeight - ((tickValue - axisMin) / axisSpan) * plotHeight;
+          return (
+            <g key={`vector-y-${index}`}>
+              <line x1={margin.left} y1={y} x2={margin.left + plotWidth} y2={y} className="grid-line" />
+              <text x={margin.left - 10} y={y + 4} textAnchor="end" className="axis-label">
+                {formatAxisValue(tickValue)}
+              </text>
+            </g>
+          );
+        })}
+        <text x={margin.left + plotWidth / 2} y={height - 8} textAnchor="middle" className="axis-unit-label">
+          Lead I / CH2 (mV)
+        </text>
+        <text
+          x={20}
+          y={margin.top + plotHeight / 2}
+          textAnchor="middle"
+          transform={`rotate(-90 20 ${margin.top + plotHeight / 2})`}
+          className="axis-unit-label"
+        >
+          Lead II / CH3 (mV)
+        </text>
+        <g transform={`translate(${margin.left} ${margin.top})`}>
+          <line x1={axisX} y1={0} x2={axisX} y2={plotHeight} className="grid-line" />
+          <line x1={0} y1={axisY} x2={plotWidth} y2={axisY} className="grid-line" />
+          <path d={visiblePath || path} className="signal-path vector-path" />
+        </g>
         {(Object.entries(data.markers) as Array<[keyof BeatMarkers, number[]]>).map(([label, positions]) =>
           (["P", "Q", "R", "S", "T"] as Array<keyof BeatMarkers>).includes(label)
             ? positions.map((position, idx) => {
@@ -561,8 +746,8 @@ function VectorLoopChart({
                 if (!point) return null;
                 return (
                   <g key={`${label}-${idx}-${position}`}>
-                    <circle cx={point.x} cy={point.y} r={8} fill={BEAT_MARKER_COLORS[label]} className="vector-marker-dot" />
-                    <text x={point.x + 8} y={point.y - 8} className="marker-label">
+                    <circle cx={margin.left + point.x} cy={margin.top + point.y} r={8} fill={BEAT_MARKER_COLORS[label]} className="vector-marker-dot" />
+                    <text x={margin.left + point.x + 8} y={margin.top + point.y - 8} className="marker-label">
                       {label}
                     </text>
                   </g>
@@ -572,7 +757,7 @@ function VectorLoopChart({
         )}
         {data.exclude_from_analysis ? (
           <g>
-            <rect x={0} y={0} width={width} height={height} className="excluded-overlay" />
+            <rect x={margin.left} y={margin.top} width={plotWidth} height={plotHeight} className="excluded-overlay" />
             <text x={width / 2} y={height / 2 - 10} textAnchor="middle" className="excluded-overlay-text">
               Excluded from analysis
             </text>
@@ -595,6 +780,8 @@ function VectorReviewSection({
   data,
   loading,
   movementPercent,
+  yMin,
+  yMax,
   onBeatIndexChange,
   onMovementPercentChange,
 }: {
@@ -604,6 +791,8 @@ function VectorReviewSection({
   data: VectorBeatResponse | null;
   loading: boolean;
   movementPercent: number;
+  yMin: number;
+  yMax: number;
   onBeatIndexChange: (value: number) => void;
   onMovementPercentChange: (value: number) => void;
 }) {
@@ -617,7 +806,7 @@ function VectorReviewSection({
       </div>
       <div className="vector-section-grid">
         <div className="signal-column">
-          <VectorLoopChart title={`${title} Morphology`} data={data} progressPercent={movementPercent} />
+          <VectorLoopChart title={`${title} Morphology`} data={data} progressPercent={movementPercent} yMin={yMin} yMax={yMax} />
           <div className="chart-card vector-controls-row-card">
             <div className="vector-controls-header">
               <strong>{`${title} Beat Selector`}</strong>
@@ -684,12 +873,16 @@ function ReviewSectionCard({
   section,
   sampleRateHz,
   beatIndex,
+  yMin,
+  yMax,
   onBeatIndexChange,
 }: {
   title: string;
   section: ReviewSection;
   sampleRateHz: number;
   beatIndex: number;
+  yMin: number;
+  yMax: number;
   onBeatIndexChange: (value: number) => void;
 }) {
   const beat = section.beats.items.find((item) => item.index === beatIndex) ?? section.beats.items[0] ?? null;
@@ -714,6 +907,8 @@ function ReviewSectionCard({
             title={`${title} Full Signal`}
             samples={section.signal.full}
             sampleRateHz={sampleRateHz}
+            yMin={yMin}
+            yMax={yMax}
             highlightStart={highlightStart}
             highlightEnd={highlightEnd}
           />
@@ -724,6 +919,9 @@ function ReviewSectionCard({
             beat={beat}
             samples={beatSamples}
             beatCount={section.beats.count}
+            sampleRateHz={sampleRateHz}
+            yMin={yMin}
+            yMax={yMax}
           />
           <div className="window-controls beat-controls">
             <button
@@ -778,11 +976,15 @@ function SessionReviewCard({
   section,
   sampleRateHz,
   beatIndex,
+  yMin,
+  yMax,
   onBeatIndexChange,
 }: {
   section: ReviewSection;
   sampleRateHz: number;
   beatIndex: number;
+  yMin: number;
+  yMax: number;
   onBeatIndexChange: (value: number) => void;
 }) {
   const beats = section.beats.items;
@@ -819,13 +1021,23 @@ function SessionReviewCard({
             title="Session 20s Window"
             samples={windowSamples}
             sampleRateHz={sampleRateHz}
+            yMin={yMin}
+            yMax={yMax}
             highlightStart={highlightStart}
             highlightEnd={highlightEnd}
             subtitle={`Samples ${displayWindowStart}-${displayWindowEnd} | Window ${beat?.window_index ?? 1} of ${section.window_count}`}
           />
         </div>
         <div className="beat-column">
-          <BeatChart title="Session Heartbeat" beat={beat} samples={beatSamples} beatCount={section.beats.count} />
+          <BeatChart
+            title="Session Heartbeat"
+            beat={beat}
+            samples={beatSamples}
+            beatCount={section.beats.count}
+            sampleRateHz={sampleRateHz}
+            yMin={yMin}
+            yMax={yMax}
+          />
           <div className="window-controls">
             <button
               className="window-button"
@@ -878,6 +1090,8 @@ function SessionReviewCard({
 
 function ReviewPage({ currentPath }: { currentPath: string }) {
   const [reviewMode, setReviewMode] = useState<(typeof REVIEW_MODES)[number]>("CH2");
+  const [yMaxMv, setYMaxMv] = useState(DEFAULT_ECG_Y_MAX_MV);
+  const [yMinMv, setYMinMv] = useState(DEFAULT_ECG_Y_MIN_MV);
   const [data, setData] = useState<ReviewResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1014,16 +1228,31 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
           <h1>Calibration and Session Review</h1>
           <p className="subtitle">NeuroKit2-backed signal review for calibration and exercise session traces.</p>
         </div>
-        <label className="channel-select">
-          <span>View</span>
-          <select value={reviewMode} onChange={(event) => setReviewMode(event.target.value as (typeof REVIEW_MODES)[number])}>
-            {REVIEW_MODES.map((item) => (
-              <option key={item} value={item}>
-                {item}
-              </option>
-            ))}
-          </select>
-        </label>
+        <div className="topbar-controls">
+          <label className="channel-select">
+            <span>View</span>
+            <select value={reviewMode} onChange={(event) => setReviewMode(event.target.value as (typeof REVIEW_MODES)[number])}>
+              {REVIEW_MODES.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="scale-card">
+            <span>Y scale (mV)</span>
+            <div className="scale-inputs">
+              <label className="scale-field">
+                <span>Min</span>
+                <input type="number" step="0.1" value={yMinMv} onChange={(event) => setYMinMv(Number(event.target.value) || 0)} />
+              </label>
+              <label className="scale-field">
+                <span>Max</span>
+                <input type="number" step="0.1" value={yMaxMv} onChange={(event) => setYMaxMv(Number(event.target.value) || 0)} />
+              </label>
+            </div>
+          </div>
+        </div>
       </header>
 
       {loading && <div className="status-panel">Loading review data...</div>}
@@ -1045,6 +1274,8 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
                 data={calibrationVector}
                 loading={loadingCalibrationVector}
                 movementPercent={calibrationVectorMovement}
+                yMin={yMinMv}
+                yMax={yMaxMv}
                 onBeatIndexChange={setCalibrationBeat}
                 onMovementPercentChange={setCalibrationVectorMovement}
               />
@@ -1055,6 +1286,8 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
                 data={sessionVector}
                 loading={loadingSessionVector}
                 movementPercent={sessionVectorMovement}
+                yMin={yMinMv}
+                yMax={yMaxMv}
                 onBeatIndexChange={setSessionBeat}
                 onMovementPercentChange={setSessionVectorMovement}
               />
@@ -1066,12 +1299,16 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
                 section={data.calibration}
                 sampleRateHz={data.sample_rate_hz}
                 beatIndex={calibrationBeat}
+                yMin={yMinMv}
+                yMax={yMaxMv}
                 onBeatIndexChange={setCalibrationBeat}
               />
               <SessionReviewCard
                 section={data.session}
                 sampleRateHz={data.sample_rate_hz}
                 beatIndex={sessionBeat}
+                yMin={yMinMv}
+                yMax={yMaxMv}
                 onBeatIndexChange={setSessionBeat}
               />
             </>
@@ -1196,7 +1433,13 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
           ) : null}
           <section className="review-section live-section">
             <div className="live-layout">
-              <LiveSignalChart samples={data.signal.full} markers={data.markers} sampleRateHz={500} />
+              <LiveSignalChart
+                samples={data.signal.full}
+                markers={data.markers}
+                sampleRateHz={500}
+                yMin={DEFAULT_ECG_Y_MIN_MV}
+                yMax={DEFAULT_ECG_Y_MAX_MV}
+              />
               <aside className="metrics-sidebar">
                 <div className="interval-card">
                   <div className="card-header">

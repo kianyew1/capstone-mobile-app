@@ -44,6 +44,13 @@ select {
   margin-bottom: 24px;
 }
 
+.topbar-controls {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
 .route-nav {
   display: inline-flex;
   gap: 10px;
@@ -118,6 +125,46 @@ h1 {
 .channel-select select,
 .beat-input input,
 .record-input-card input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #bfd0dd;
+  border-radius: 12px;
+  background: #f8fbfd;
+  color: #17324d;
+}
+
+.scale-card {
+  min-width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 18px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(98, 138, 170, 0.18);
+  box-shadow: 0 18px 38px rgba(24, 53, 78, 0.08);
+}
+
+.scale-card > span,
+.scale-field span {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #567386;
+}
+
+.scale-inputs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.scale-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.scale-field input {
   width: 100%;
   padding: 10px 12px;
   border: 1px solid #bfd0dd;
@@ -399,8 +446,14 @@ h1 {
 
 .axis-label,
 .marker-label {
-  font-size: 16px;
+  font-size: 12px;
   fill: #60798d;
+}
+
+.axis-unit-label {
+  font-size: 15px;
+  font-weight: 600;
+  fill: #476477;
 }
 
 .marker-line {
