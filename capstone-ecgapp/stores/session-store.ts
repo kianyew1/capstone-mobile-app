@@ -58,10 +58,9 @@ interface SessionState {
 }
 
 type PendingUpload = {
-  recordId: string;
+  recordId: string | null;
   sessionId: string;
   startTimeIso: string | null;
-  packets: Uint8Array[];
   useMock: boolean;
 };
 

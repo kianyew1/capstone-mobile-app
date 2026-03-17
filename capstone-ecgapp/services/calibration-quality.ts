@@ -20,7 +20,7 @@ export async function getCalibrationSignalQuality(
 ): Promise<CalibrationPreviewResponse> {
   const body = Uint8Array.from(bytes).buffer as ArrayBuffer;
   const url = `${BACKEND_BASE_URL}/calibration_signal_quality_check`;
-  console.log(`LOG ${url}`);
+  console.log(`[BACKEND] POST ${url} bytes=${bytes.length} run_id=${runId}`);
   const response = await fetch(url, {
     method: "POST",
     headers: {
@@ -36,6 +36,13 @@ export async function getCalibrationSignalQuality(
   }
 
   const data = await response.json();
+  console.log(
+    `[BACKEND] calibration_signal_quality_check response quality=${Number(data.quality_percentage ?? 0)} signal_suitable=${Boolean(data.signal_suitable)} packet_count=${Number(data.packet_count ?? 0)} sample_count_per_channel=${Number(data.sample_count_per_channel ?? 0)} preview_lengths=${JSON.stringify({
+      CH2: Array.isArray(data.preview?.CH2) ? data.preview.CH2.length : 0,
+      CH3: Array.isArray(data.preview?.CH3) ? data.preview.CH3.length : 0,
+      CH4: Array.isArray(data.preview?.CH4) ? data.preview.CH4.length : 0,
+    })}`,
+  );
   return {
     qualityPercentage: Math.round(Number(data.quality_percentage ?? 0)),
     signalSuitable: Boolean(data.signal_suitable),

@@ -39,12 +39,21 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Text } from "@/components/ui/text";
 import { ENABLE_MOCK_MODE } from "@/config/mock-config";
-import { startSessionRecord } from "@/services/backend-ecg";
+import {
+  checkSessionSignalQuality,
+  startSessionRecord,
+} from "@/services/backend-ecg";
 import { useBluetoothService } from "@/services/bluetooth-service";
 import {
+  concatUint8Arrays,
   ECG_PACKET_BYTES,
   ECG_SAMPLES_PER_PACKET,
 } from "@/services/ecg-utils";
+import {
+  appendSessionPacket,
+  beginSessionCapture,
+  setSessionCaptureRecordId,
+} from "@/services/session-packet-storage";
 import { useAppStore } from "@/stores/app-store";
 import { useSessionStore } from "@/stores/session-store";
 
@@ -53,6 +62,7 @@ export default function RunSessionScreen() {
   const [isAppActive, setIsAppActive] = useState(true);
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const sessionCheckTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const expectedPacketBytes = ECG_PACKET_BYTES;
 
   const {
@@ -84,12 +94,14 @@ export default function RunSessionScreen() {
   const isConnected = connectionStatus === "connected";
   const userId = user?.email ?? "unknown@local";
 
-  const sessionPacketsRef = useRef<Uint8Array[]>([]);
+  const sessionCheckPacketsRef = useRef<Uint8Array[]>([]);
   const sessionPacketCountRef = useRef(0);
   const invalidPacketCountRef = useRef(0);
   const sessionStartRef = useRef<Date | null>(null);
   const isStreamingRef = useRef(false);
+  const isSessionCheckInFlightRef = useRef(false);
   const hasPreparedUploadRef = useRef(false);
+  const hasInitializedSessionCaptureRef = useRef(false);
   const recordIdRef = useRef<string | null>(null);
   const sessionIdRef = useRef<string | null>(null);
 
@@ -138,6 +150,13 @@ export default function RunSessionScreen() {
 
       const sessionId = formatSessionId(sessionStartRef.current ?? new Date());
       sessionIdRef.current = sessionId;
+      void beginSessionCapture({
+        sessionId,
+        recordId: null,
+        startTimeIso: sessionStartRef.current?.toISOString() ?? null,
+      }).catch((error) => {
+        console.error("Failed to initialize session SQLite capture:", error);
+      });
       const calibrationObjectKey = calibrationResult?.calibrationObjectKey;
       if (!calibrationObjectKey) {
         hasPreparedUploadRef.current = false;
@@ -157,6 +176,15 @@ export default function RunSessionScreen() {
             console.log(
               `[SESSION] Supabase record created record_id=${recordIdRef.current}`,
             );
+            void setSessionCaptureRecordId(
+              sessionId,
+              record.recordId,
+            ).catch((error) => {
+              console.error(
+                "Failed to persist session record id to SQLite:",
+                error,
+              );
+            });
           }
         })
         .catch((error) => {
@@ -166,12 +194,17 @@ export default function RunSessionScreen() {
 
     if (isStreamingRef.current) return;
     isStreamingRef.current = true;
-    sessionPacketsRef.current = [];
-    sessionPacketCountRef.current = 0;
-    invalidPacketCountRef.current = 0;
-    console.log(
-      `[SESSION] start stream expectedBytes=${expectedPacketBytes}`,
-    );
+    if (!hasInitializedSessionCaptureRef.current) {
+      hasInitializedSessionCaptureRef.current = true;
+      sessionCheckPacketsRef.current = [];
+      sessionPacketCountRef.current = 0;
+      invalidPacketCountRef.current = 0;
+      console.log(
+        `[SESSION] start stream expectedBytes=${expectedPacketBytes}`,
+      );
+    } else {
+      console.log("[SESSION] resume stream");
+    }
 
     startEcgNotifications((payloadBase64) => {
       if (!isStreamingRef.current) return;
@@ -186,9 +219,20 @@ export default function RunSessionScreen() {
         }
         return;
       }
-      sessionPacketsRef.current.push(bytes);
+      sessionCheckPacketsRef.current.push(bytes);
       sessionPacketCountRef.current += 1;
       const count = sessionPacketCountRef.current;
+      const sessionId = sessionIdRef.current;
+      if (sessionId) {
+        void appendSessionPacket({
+          sessionId,
+          packetIndex: count,
+          receivedAtMs: Date.now(),
+          bytes,
+        }).catch((error) => {
+          console.error("Failed to append session packet to SQLite:", error);
+        });
+      }
       if (count === 1) {
         console.log(
           `[SESSION] first packet bytes=${bytes.length}`,
@@ -202,12 +246,72 @@ export default function RunSessionScreen() {
   }, [calibrationResult?.calibrationObjectKey, sessionStatus, startEcgNotifications, userId]);
 
   useEffect(() => {
+    if (sessionStatus !== "running") {
+      if (sessionCheckTimerRef.current) {
+        clearInterval(sessionCheckTimerRef.current);
+        sessionCheckTimerRef.current = null;
+      }
+      if (sessionStatus === "paused") {
+        isStreamingRef.current = false;
+        stopEcgNotifications();
+        console.log("[SESSION] paused stream");
+      }
+      return;
+    }
+
+    const flushSessionCheck = async () => {
+      if (isSessionCheckInFlightRef.current) return;
+      const recordId = recordIdRef.current;
+      const sessionId = sessionIdRef.current;
+      if (!recordId || !sessionId) {
+        return;
+      }
+      const chunkPackets = sessionCheckPacketsRef.current;
+      if (chunkPackets.length === 0) {
+        return;
+      }
+
+      sessionCheckPacketsRef.current = [];
+      const bytes = concatUint8Arrays(chunkPackets);
+      isSessionCheckInFlightRef.current = true;
+      try {
+        const result = await checkSessionSignalQuality({
+          recordId,
+          sessionId,
+          bytes,
+        });
+        console.log(
+          `[SESSION] live check result abnormal=${result.abnormalDetected} signal_ok=${result.signalOk} quality=${result.qualityPercentage.toFixed(2)} hr=${result.heartRateBpm ?? "null"} reasons=${result.reasonCodes.join("|") || "none"} buffered_packets=${result.totalPacketsBuffered}`,
+        );
+      } catch (error) {
+        console.error("Failed to run live session check:", error);
+      } finally {
+        isSessionCheckInFlightRef.current = false;
+      }
+    };
+
+    sessionCheckTimerRef.current = setInterval(() => {
+      void flushSessionCheck();
+    }, 2000);
+
+    return () => {
+      if (sessionCheckTimerRef.current) {
+        clearInterval(sessionCheckTimerRef.current);
+        sessionCheckTimerRef.current = null;
+      }
+    };
+  }, [sessionStatus, stopEcgNotifications]);
+
+  useEffect(() => {
     if (sessionStatus === "idle" || sessionStatus === "completed") {
       hasPreparedUploadRef.current = false;
+      hasInitializedSessionCaptureRef.current = false;
       isStreamingRef.current = false;
+      isSessionCheckInFlightRef.current = false;
       recordIdRef.current = null;
       sessionIdRef.current = null;
       sessionStartRef.current = null;
+      sessionCheckPacketsRef.current = [];
       stopEcgNotifications();
     }
   }, [sessionStatus, stopEcgNotifications]);
@@ -215,6 +319,11 @@ export default function RunSessionScreen() {
   useEffect(() => {
     return () => {
       isStreamingRef.current = false;
+      isSessionCheckInFlightRef.current = false;
+      if (sessionCheckTimerRef.current) {
+        clearInterval(sessionCheckTimerRef.current);
+        sessionCheckTimerRef.current = null;
+      }
       stopEcgNotifications();
     };
   }, [stopEcgNotifications]);
@@ -281,21 +390,24 @@ export default function RunSessionScreen() {
 
   const handleEnd = async () => {
     isStreamingRef.current = false;
+    if (sessionCheckTimerRef.current) {
+      clearInterval(sessionCheckTimerRef.current);
+      sessionCheckTimerRef.current = null;
+    }
     stopEcgNotifications();
 
-    const chunks = sessionPacketsRef.current;
-    sessionPacketsRef.current = [];
     const recordId = recordIdRef.current;
     const sessionId = sessionIdRef.current;
 
-    if (!recordId || !sessionId) {
-      console.warn("Missing session identifiers; upload will be skipped.");
+    if (!sessionId) {
+      console.warn("Missing session identifier; upload will be skipped.");
     } else {
-      const samplesPerChannel = chunks.length * ECG_SAMPLES_PER_PACKET;
+      const samplesPerChannel =
+        sessionPacketCountRef.current * ECG_SAMPLES_PER_PACKET;
       console.log(
-        `[SESSION] end packets=${chunks.length} samplesPerChannel=${samplesPerChannel} invalidPackets=${invalidPacketCountRef.current}`,
+        `[SESSION] end packets=${sessionPacketCountRef.current} samplesPerChannel=${samplesPerChannel} invalidPackets=${invalidPacketCountRef.current}`,
       );
-      if (chunks.length === 0 && !ENABLE_MOCK_MODE) {
+      if (sessionPacketCountRef.current === 0 && !ENABLE_MOCK_MODE) {
         console.warn("No session bytes captured; upload will be skipped.");
       }
 
@@ -303,7 +415,6 @@ export default function RunSessionScreen() {
         recordId,
         sessionId,
         startTimeIso: sessionStartRef.current?.toISOString() ?? null,
-        packets: chunks,
         useMock: false,
       });
     }

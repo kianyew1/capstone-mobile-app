@@ -1,0 +1,12 @@
+{
+  "name": "capstone-ecgapp-workspace",
+  "private": true,
+  "scripts": {
+    "backend": "cd backend && .venv\\Scripts\\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8001 --reload",
+    "review-web": "cd ecg-review-web && npm run dev -- --host 127.0.0.1 --port 5173",
+    "dev:review": "concurrently -n backend,web -c blue,green \"npm run backend\" \"npm run review-web\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

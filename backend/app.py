@@ -4,8 +4,8 @@ import json
 import logging
 import os
 import warnings
-from math import sqrt
-from typing import Any, Dict, List, Optional, Union
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -55,6 +55,13 @@ LAST_ANALYSIS_PLOT: Dict[str, Any] = {
     },
     "record_id": None,
 }
+LIVE_SESSION_STATE: Dict[str, Dict[str, Any]] = {}
+LIVE_SESSION_WINDOW_SECONDS = 10
+LIVE_SESSION_WINDOW_PACKETS = LIVE_SESSION_WINDOW_SECONDS * 20
+DEFAULT_SAMPLE_RATE_HZ = 500
+REVIEW_PROCESSING_VERSION = "review_v6"
+REVIEW_ARTIFACT_CACHE: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+MAX_QR_MS = 40
 
 
 def _get_supabase_config() -> Dict[str, str]:
@@ -183,6 +190,21 @@ def _fetch_storage_bytes(object_key: str) -> bytes:
         ) from exc
 
 
+def _fetch_storage_json(object_key: str) -> Dict[str, Any]:
+    payload = _fetch_storage_bytes(object_key)
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Stored JSON artifact is invalid for object_key={object_key}: {exc}",
+        ) from exc
+
+
+def _review_cache_key(record_id: str, channel: str) -> tuple[str, str, str]:
+    return (record_id, channel.upper(), REVIEW_PROCESSING_VERSION)
+
+
 def _supabase_headers(json_content: bool = True) -> Dict[str, str]:
     config = _get_supabase_config()
     headers = {
@@ -207,6 +229,32 @@ def _upload_storage_bytes(object_key: str, payload: bytes) -> None:
     try:
         with httpx.Client(timeout=60) as client:
             response = client.post(url, headers=headers, content=payload)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase Storage upload error: {exc.response.status_code} {exc.response.text}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase Storage upload unreachable: {exc}",
+        ) from exc
+
+
+def _upload_storage_json(object_key: str, payload: Dict[str, Any]) -> None:
+    config = _get_supabase_config()
+    url = f"{config['url']}/storage/v1/object/{config['bucket']}/{object_key}"
+    headers = {
+        "apikey": config["key"],
+        "Authorization": f"Bearer {config['key']}",
+        "Content-Type": "application/json",
+        "x-upsert": "true",
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    try:
+        with httpx.Client(timeout=60) as client:
+            response = client.post(url, headers=headers, content=body)
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
@@ -266,6 +314,107 @@ def _update_recording_row(record_id: str, payload: Dict[str, Any]) -> None:
         ) from exc
 
 
+def _upsert_table_row(table: str, payload: Dict[str, Any], conflict_columns: str) -> List[Dict[str, Any]]:
+    config = _get_supabase_config()
+    url = f"{config['url']}/rest/v1/{table}?on_conflict={conflict_columns}"
+    headers = _supabase_headers(json_content=True)
+    headers["Prefer"] = "return=representation,resolution=merge-duplicates"
+    try:
+        with httpx.Client(timeout=30) as client:
+            response = client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json() or []
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase upsert error ({table}): {exc.response.status_code} {exc.response.text}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase upsert unreachable ({table}): {exc}",
+        ) from exc
+
+
+def _fetch_processed_record(record_id: str) -> Optional[Dict[str, Any]]:
+    config = _get_supabase_config()
+    url = f"{config['url']}/rest/v1/ecg_processed_records"
+    params = {
+        "record_id": f"eq.{record_id}",
+        "select": "record_id,status,processing_version,updated_at,error_message",
+        "limit": 1,
+    }
+    headers = _supabase_headers(json_content=False)
+    headers["Accept"] = "application/json"
+    try:
+        with httpx.Client(timeout=15) as client:
+            response = client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:  # pragma: no cover - safeguard
+        logger.error("[PROCESSING] fetch_record failed record_id=%s error=%s", record_id, exc)
+        return None
+    return data[0] if data else None
+
+
+def _upsert_processed_record(
+    record_id: str,
+    status: str,
+    error_message: Optional[str] = None,
+) -> None:
+    _upsert_table_row(
+        "ecg_processed_records",
+        {
+            "record_id": record_id,
+            "status": status,
+            "processing_version": REVIEW_PROCESSING_VERSION,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "error_message": error_message,
+        },
+        "record_id",
+    )
+
+
+def _fetch_processed_artifact_key(record_id: str, artifact_type: str) -> Optional[str]:
+    config = _get_supabase_config()
+    url = f"{config['url']}/rest/v1/ecg_processed_artifacts"
+    params = {
+        "record_id": f"eq.{record_id}",
+        "artifact_type": f"eq.{artifact_type}",
+        "select": "object_key,updated_at",
+        "limit": 1,
+    }
+    headers = _supabase_headers(json_content=False)
+    headers["Accept"] = "application/json"
+    try:
+        with httpx.Client(timeout=15) as client:
+            response = client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:  # pragma: no cover - safeguard
+        logger.error(
+            "[PROCESSING] fetch_artifact failed record_id=%s artifact_type=%s error=%s",
+            record_id,
+            artifact_type,
+            exc,
+        )
+        return None
+    return data[0].get("object_key") if data else None
+
+
+def _upsert_processed_artifact(record_id: str, artifact_type: str, object_key: str) -> None:
+    _upsert_table_row(
+        "ecg_processed_artifacts",
+        {
+            "record_id": record_id,
+            "artifact_type": artifact_type,
+            "object_key": object_key,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "record_id,artifact_type",
+    )
+
+
 def _decode_int16_le(payload: bytes) -> List[int]:
     if len(payload) % 2 != 0:
         logger.warning("[DECODE] odd byte count len=%s", len(payload))
@@ -314,6 +463,27 @@ def _decode_ads1298_packets(payload: bytes) -> Dict[str, List[float]]:
     return channels
 
 
+def _quality_to_percentage(quality_score: Optional[float]) -> float:
+    if quality_score is None:
+        return 0.0
+    if quality_score <= 1.0:
+        return max(0.0, min(100.0, quality_score * 100.0))
+    return max(0.0, min(100.0, quality_score))
+
+
+def _clean_series(samples: List[float], sample_rate_hz: int) -> List[float]:
+    if not samples:
+        return []
+    try:
+        cleaned = nk.ecg_clean(samples, sampling_rate=sample_rate_hz)
+        if hasattr(cleaned, "tolist"):
+            return cleaned.tolist()
+        return list(cleaned)
+    except Exception as exc:  # pragma: no cover - safeguard
+        logger.warning("[CLEAN] fallback raw error=%s", exc)
+        return list(samples)
+
+
 def _preview_series(samples: List[float], preview_samples: int = 2500) -> List[float]:
     limited = samples[:preview_samples]
     if not limited:
@@ -321,6 +491,18 @@ def _preview_series(samples: List[float], preview_samples: int = 2500) -> List[f
     mean = sum(limited) / len(limited)
     max_abs = max(abs(value - mean) for value in limited) or 1.0
     return [(value - mean) / max_abs for value in limited]
+
+
+def _build_cleaned_previews(
+    channels: Dict[str, List[float]],
+    sample_rate_hz: int,
+    preview_samples: int = 2500,
+) -> Dict[str, List[float]]:
+    previews: Dict[str, List[float]] = {}
+    for label in CHANNEL_LABELS:
+        cleaned = _clean_series(channels.get(label, []), sample_rate_hz)
+        previews[label] = _preview_series(cleaned, preview_samples=preview_samples)
+    return previews
 
 
 def _packet_stats(payload: bytes) -> Dict[str, int]:
@@ -367,32 +549,6 @@ def _metrics_from_info(
         "avg_hr_bpm": None,
         "min_hr_bpm": None,
         "max_hr_bpm": None,
-        "hrv_rmssd_ms": None,
-        "hrv_sdnn_ms": None,
-        "hrv_meannn_ms": None,
-        "hrv_mediannn_ms": None,
-        "hrv_min_nn_ms": None,
-        "hrv_max_nn_ms": None,
-        "hrv_pnn50_pct": None,
-        "hrv_pnn20_pct": None,
-        "hrv_cvnn_pct": None,
-        "hrv_cvsd_pct": None,
-        "hrv_sdrmssd": None,
-        "hrv_iqrnn_ms": None,
-        "hrv_lf_ms2": None,
-        "hrv_hf_ms2": None,
-        "hrv_vlf_ms2": None,
-        "hrv_lf_hf_ratio": None,
-        "hrv_lfnu": None,
-        "hrv_hfnu": None,
-        "hrv_total_power": None,
-        "hrv_sd1": None,
-        "hrv_sd2": None,
-        "hrv_sd1_sd2": None,
-        "hrv_sampen": None,
-        "hrv_apen": None,
-        "hrv_dfa_alpha1": None,
-        "hrv_dfa_alpha2": None,
         "r_peak_count": None,
     }
     r_peaks = info.get("ECG_R_Peaks", [])
@@ -407,47 +563,6 @@ def _metrics_from_info(
             metrics["avg_hr_bpm"] = float(sum(rate) / len(rate))
             metrics["min_hr_bpm"] = float(min(rate))
             metrics["max_hr_bpm"] = float(max(rate))
-        hrv = nk.hrv_time(info, sampling_rate=sample_rate_hz)
-        if not hrv.empty:
-            row = hrv.iloc[0]
-            metrics["hrv_rmssd_ms"] = float(row.get("RMSSD", None)) if "RMSSD" in row else None
-            metrics["hrv_sdnn_ms"] = float(row.get("SDNN", None)) if "SDNN" in row else None
-            metrics["hrv_meannn_ms"] = float(row.get("MeanNN", None)) if "MeanNN" in row else None
-            metrics["hrv_mediannn_ms"] = float(row.get("MedianNN", None)) if "MedianNN" in row else None
-            metrics["hrv_min_nn_ms"] = float(row.get("MinNN", None)) if "MinNN" in row else None
-            metrics["hrv_max_nn_ms"] = float(row.get("MaxNN", None)) if "MaxNN" in row else None
-            metrics["hrv_pnn50_pct"] = float(row.get("pNN50", None)) if "pNN50" in row else None
-            metrics["hrv_pnn20_pct"] = float(row.get("pNN20", None)) if "pNN20" in row else None
-            metrics["hrv_cvnn_pct"] = float(row.get("CVNN", None)) if "CVNN" in row else None
-            metrics["hrv_cvsd_pct"] = float(row.get("CVSD", None)) if "CVSD" in row else None
-            metrics["hrv_sdrmssd"] = float(row.get("SDRMSSD", None)) if "SDRMSSD" in row else None
-            metrics["hrv_iqrnn_ms"] = float(row.get("IQRNN", None)) if "IQRNN" in row else None
-        try:
-            hrv_freq = nk.hrv_frequency(info, sampling_rate=sample_rate_hz)
-            if not hrv_freq.empty:
-                row = hrv_freq.iloc[0]
-                metrics["hrv_lf_ms2"] = float(row.get("LF", None)) if "LF" in row else None
-                metrics["hrv_hf_ms2"] = float(row.get("HF", None)) if "HF" in row else None
-                metrics["hrv_vlf_ms2"] = float(row.get("VLF", None)) if "VLF" in row else None
-                metrics["hrv_lf_hf_ratio"] = float(row.get("LFHF", None)) if "LFHF" in row else None
-                metrics["hrv_lfnu"] = float(row.get("LFnu", None)) if "LFnu" in row else None
-                metrics["hrv_hfnu"] = float(row.get("HFnu", None)) if "HFnu" in row else None
-                metrics["hrv_total_power"] = float(row.get("TP", None)) if "TP" in row else None
-        except Exception as exc:  # pragma: no cover - neurokit variance
-            logger.warning("[HRV] frequency failed error=%s", exc)
-        try:
-            hrv_nl = nk.hrv_nonlinear(info, sampling_rate=sample_rate_hz)
-            if not hrv_nl.empty:
-                row = hrv_nl.iloc[0]
-                metrics["hrv_sd1"] = float(row.get("SD1", None)) if "SD1" in row else None
-                metrics["hrv_sd2"] = float(row.get("SD2", None)) if "SD2" in row else None
-                metrics["hrv_sd1_sd2"] = float(row.get("SD1SD2", None)) if "SD1SD2" in row else None
-                metrics["hrv_sampen"] = float(row.get("SampEn", None)) if "SampEn" in row else None
-                metrics["hrv_apen"] = float(row.get("ApEn", None)) if "ApEn" in row else None
-                metrics["hrv_dfa_alpha1"] = float(row.get("DFA_alpha1", None)) if "DFA_alpha1" in row else None
-                metrics["hrv_dfa_alpha2"] = float(row.get("DFA_alpha2", None)) if "DFA_alpha2" in row else None
-        except Exception as exc:  # pragma: no cover - neurokit variance
-            logger.warning("[HRV] nonlinear failed error=%s", exc)
     return metrics
 
 
@@ -523,6 +638,655 @@ def _process_window(
         }
 
 
+def _sanitize_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        number = float(value)
+        if number != number:
+            return None
+        return number
+    except Exception:
+        return None
+
+
+def _delineate_single_beat(
+    beat_values: List[float],
+    sample_rate_hz: int,
+) -> Dict[str, List[int]]:
+    minimum_length = max(5, int(sample_rate_hz * 0.12))
+    if len(beat_values) < minimum_length:
+        return {
+            "P": [],
+            "Q": [],
+            "R": [],
+            "S": [],
+            "T": [],
+            "P_Onsets": [],
+            "P_Offsets": [],
+            "R_Onsets": [],
+            "R_Offsets": [],
+            "T_Onsets": [],
+            "T_Offsets": [],
+        }
+
+    local_r_peak = int(max(range(len(beat_values)), key=lambda idx: beat_values[idx]))
+    try:
+        delineate_result = nk.ecg_delineate(
+            beat_values,
+            [local_r_peak],
+            sampling_rate=sample_rate_hz,
+            method="dwt",
+        )
+        if isinstance(delineate_result, tuple):
+            _, delineate = delineate_result
+        else:
+            delineate = delineate_result
+    except Exception as exc:  # pragma: no cover - safeguard
+        if "too small to be segmented" not in str(exc).lower():
+            logger.warning("[DELINEATE] beat failed error=%s", exc)
+        delineate = {}
+
+    def _extract_positions(key: str) -> List[int]:
+        values = delineate.get(key, []) if isinstance(delineate, dict) else []
+        if values is None:
+            return []
+        if hasattr(values, "tolist"):
+            values = values.tolist()
+        positions: List[int] = []
+        for value in list(values):
+            numeric = _sanitize_float(value)
+            if numeric is None:
+                continue
+            index = int(round(numeric))
+            if 0 <= index < len(beat_values):
+                positions.append(index)
+        return positions
+
+    return {
+        "P": _extract_positions("ECG_P_Peaks"),
+        "Q": _extract_positions("ECG_Q_Peaks"),
+        "R": [local_r_peak],
+        "S": _extract_positions("ECG_S_Peaks"),
+        "T": _extract_positions("ECG_T_Peaks"),
+        "P_Onsets": _extract_positions("ECG_P_Onsets"),
+        "P_Offsets": _extract_positions("ECG_P_Offsets"),
+        "R_Onsets": _extract_positions("ECG_R_Onsets"),
+        "R_Offsets": _extract_positions("ECG_R_Offsets"),
+        "T_Onsets": _extract_positions("ECG_T_Onsets"),
+        "T_Offsets": _extract_positions("ECG_T_Offsets"),
+    }
+
+
+def _delineate_signal_peaks(
+    cleaned: List[float],
+    r_peaks: List[int],
+    sample_rate_hz: int,
+) -> Dict[str, List[int]]:
+    if not cleaned or not r_peaks:
+        return {
+            "P": [],
+            "Q": [],
+            "R": list(r_peaks or []),
+            "S": [],
+            "T": [],
+        }
+
+    try:
+        delineate_result = nk.ecg_delineate(
+            cleaned,
+            r_peaks,
+            sampling_rate=sample_rate_hz,
+            method="dwt",
+        )
+        if isinstance(delineate_result, tuple):
+            _, delineate = delineate_result
+        else:
+            delineate = delineate_result
+    except Exception as exc:  # pragma: no cover - safeguard
+        logger.warning("[DELINEATE] signal failed error=%s", exc)
+        delineate = {}
+
+    def _extract_positions(key: str) -> List[int]:
+        values = delineate.get(key, []) if isinstance(delineate, dict) else []
+        if values is None:
+            return []
+        if hasattr(values, "tolist"):
+            values = values.tolist()
+        positions: List[int] = []
+        for value in list(values):
+            numeric = _sanitize_float(value)
+            if numeric is None:
+                continue
+            index = int(round(numeric))
+            if 0 <= index < len(cleaned):
+                positions.append(index)
+        return positions
+
+    return {
+        "P": _extract_positions("ECG_P_Peaks"),
+        "Q": _extract_positions("ECG_Q_Peaks"),
+        "R": [peak for peak in r_peaks if 0 <= peak < len(cleaned)],
+        "S": _extract_positions("ECG_S_Peaks"),
+        "T": _extract_positions("ECG_T_Peaks"),
+    }
+
+
+def _empty_beat_markers() -> Dict[str, List[int]]:
+    return {
+        "P": [],
+        "Q": [],
+        "R": [],
+        "S": [],
+        "T": [],
+        "P_Onsets": [],
+        "P_Offsets": [],
+        "R_Onsets": [],
+        "R_Offsets": [],
+        "T_Onsets": [],
+        "T_Offsets": [],
+    }
+
+
+def _slice_markers_for_beat(
+    signal_markers: Optional[Dict[str, List[int]]],
+    start_index: int,
+    end_index: int,
+    local_r_peak: Optional[int] = None,
+) -> Dict[str, List[int]]:
+    markers = _empty_beat_markers()
+    if signal_markers:
+        for label in markers.keys():
+            positions = signal_markers.get(label, [])
+            local_positions: List[int] = []
+            for position in positions:
+                if start_index <= position < end_index:
+                    local_positions.append(position - start_index)
+            markers[label] = local_positions
+    if local_r_peak is not None and 0 <= local_r_peak < max(0, end_index - start_index):
+        if local_r_peak not in markers["R"]:
+            markers["R"].append(local_r_peak)
+        markers["R"] = sorted(set(markers["R"]))
+    return markers
+
+
+def _evaluate_beat_exclusion(
+    markers: Dict[str, List[int]],
+    sample_rate_hz: int,
+) -> Dict[str, Any]:
+    q_positions = sorted(markers.get("Q", []))
+    r_positions = sorted(markers.get("R", []))
+    qr_duration_samples: Optional[int] = None
+    qr_duration_ms: Optional[float] = None
+    exclusion_reasons: List[str] = []
+
+    if q_positions and r_positions:
+        q_position = q_positions[0]
+        r_position = r_positions[0]
+        if r_position >= q_position:
+            qr_duration_samples = r_position - q_position
+            qr_duration_ms = (qr_duration_samples / sample_rate_hz) * 1000.0
+            max_qr_samples = int(round((MAX_QR_MS / 1000.0) * sample_rate_hz))
+            if qr_duration_samples > max_qr_samples:
+                exclusion_reasons.append("qr_too_long")
+
+    return {
+        "exclude_from_analysis": len(exclusion_reasons) > 0,
+        "exclusion_reasons": exclusion_reasons,
+        "qr_duration_samples": qr_duration_samples,
+        "qr_duration_ms": qr_duration_ms,
+    }
+
+
+def _compute_beat_bounds(signal_length: int, r_peaks: List[int]) -> List[Dict[str, int]]:
+    if signal_length <= 0 or not r_peaks:
+        return []
+    sorted_peaks = sorted(peak for peak in r_peaks if 0 <= peak < signal_length)
+    if not sorted_peaks:
+        return []
+
+    bounds: List[Dict[str, int]] = []
+    for index, peak in enumerate(sorted_peaks):
+        if index == 0:
+            start = 0
+        else:
+            start = int((sorted_peaks[index - 1] + peak) / 2)
+        if index == len(sorted_peaks) - 1:
+            end = signal_length
+        else:
+            end = int((peak + sorted_peaks[index + 1]) / 2)
+        start = max(0, min(start, signal_length))
+        end = max(start + 1, min(end, signal_length))
+        bounds.append(
+            {
+                "index": index + 1,
+                "peak": peak,
+                "start": start,
+                "end": end,
+            }
+        )
+    return bounds
+
+
+def _build_beats_from_cleaned(
+    cleaned: List[float],
+    r_peaks: List[int],
+    sample_rate_hz: int,
+    signal_markers: Optional[Dict[str, List[int]]] = None,
+    window_samples: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    beats: List[Dict[str, Any]] = []
+    for item in _compute_beat_bounds(len(cleaned), r_peaks):
+        beat_values = cleaned[item["start"] : item["end"]]
+        if len(beat_values) < max(5, int(sample_rate_hz * 0.12)):
+            continue
+        local_peak = item["peak"] - item["start"]
+        markers = _slice_markers_for_beat(
+            signal_markers,
+            item["start"],
+            item["end"],
+            local_r_peak=local_peak,
+        )
+        if not any(markers[label] for label in ["P", "Q", "S", "T"]):
+            fallback_markers = _delineate_single_beat(beat_values, sample_rate_hz)
+            for label, positions in fallback_markers.items():
+                if positions:
+                    markers[label] = positions
+        window_index = 1
+        window_start_sample = 1
+        window_end_sample = len(cleaned)
+        if window_samples and window_samples > 0:
+            window_index = (item["start"] // window_samples) + 1
+            window_start = (window_index - 1) * window_samples
+            window_end = min(len(cleaned), window_start + window_samples)
+            window_start_sample = window_start + 1
+            window_end_sample = window_end
+        exclusion = _evaluate_beat_exclusion(markers, sample_rate_hz)
+        beats.append(
+            {
+                "index": item["index"],
+                "start_sample": item["start"] + 1,
+                "end_sample": item["end"],
+                "window_index": window_index,
+                "window_start_sample": window_start_sample,
+                "window_end_sample": window_end_sample,
+                "markers": markers,
+                **exclusion,
+            }
+        )
+    return beats
+
+
+def _segment_heartbeats(
+    cleaned: List[float],
+    r_peaks: List[int],
+    sample_rate_hz: int,
+) -> List[Dict[str, Any]]:
+    if not cleaned or not r_peaks:
+        return []
+    try:
+        with warnings.catch_warnings():
+            try:
+                from pandas.errors import ChainedAssignmentError
+            except Exception:  # pragma: no cover - pandas compatibility
+                ChainedAssignmentError = Warning  # type: ignore
+            warnings.filterwarnings("ignore", category=ChainedAssignmentError)
+            warnings.filterwarnings("ignore", message=".*ChainedAssignmentError.*")
+            segments = nk.ecg_segment(
+                cleaned,
+                rpeaks=r_peaks,
+                sampling_rate=sample_rate_hz,
+            )
+    except Exception as exc:  # pragma: no cover - safeguard
+        logger.error("[SEGMENT] failed error=%s", exc)
+        return []
+
+    beats: List[Dict[str, Any]] = []
+    for idx, (_, dataframe) in enumerate(segments.items(), start=1):
+        if dataframe is None or getattr(dataframe, "empty", False):
+            continue
+        column_name = None
+        for candidate in ["Signal", "ECG_Clean", "ECG_Raw", "ECG"]:
+            if candidate in dataframe.columns:
+                column_name = candidate
+                break
+        if column_name is None:
+            numeric_columns = list(dataframe.columns)
+            if not numeric_columns:
+                continue
+            column_name = numeric_columns[0]
+
+        values_series = dataframe[column_name].dropna()
+        beat_values = [
+            float(value)
+            for value in values_series.tolist()
+            if _sanitize_float(value) is not None
+        ]
+        if len(beat_values) < max(5, int(sample_rate_hz * 0.12)):
+            continue
+
+        x_values = [float(i) for i in range(len(beat_values))]
+        beats.append(
+            {
+                "index": idx,
+                "x": x_values,
+                "y": beat_values,
+                "markers": _delineate_single_beat(beat_values, sample_rate_hz),
+            }
+        )
+    return beats
+
+
+def _interval_row_from_result(
+    result: Dict[str, Any],
+    sample_count: int,
+    sample_rate_hz: int,
+    interval_index: int,
+    start_s: float,
+    end_s: float,
+) -> Optional[Dict[str, Any]]:
+    if not result or not result.get("cleaned"):
+        return None
+    metrics = result.get("metrics", {})
+    if not metrics:
+        return None
+    return {
+        "interval_index": interval_index,
+        "start_s": round(start_s, 2),
+        "end_s": round(end_s, 2),
+        "sample_count": sample_count,
+        "ECG_Rate_Mean": _sanitize_float(metrics.get("avg_hr_bpm")),
+    }
+
+
+def _interval_related_single(
+    samples: List[float],
+    sample_count: int,
+    sample_rate_hz: int,
+) -> Optional[Dict[str, Any]]:
+    if not samples:
+        return None
+    result = _process_window(samples, sample_rate_hz)
+    return _interval_row_from_result(
+        result,
+        sample_count=sample_count,
+        sample_rate_hz=sample_rate_hz,
+        interval_index=1,
+        start_s=0.0,
+        end_s=sample_count / sample_rate_hz,
+    )
+
+
+def _interval_related_epochs(
+    samples: List[float],
+    sample_rate_hz: int,
+    epoch_seconds: int = 20,
+) -> List[Dict[str, Any]]:
+    if not samples:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    epoch_samples = sample_rate_hz * epoch_seconds
+    total_samples = len(samples)
+
+    for start_index in range(0, total_samples, epoch_samples):
+        end_index = min(total_samples, start_index + epoch_samples)
+        window_samples = samples[start_index:end_index]
+        if len(window_samples) < max(2, int(sample_rate_hz * 0.5)):
+            continue
+        result = _process_window(window_samples, sample_rate_hz)
+        row = _interval_row_from_result(
+            result,
+            sample_count=len(window_samples),
+            sample_rate_hz=sample_rate_hz,
+            interval_index=(start_index // epoch_samples) + 1,
+            start_s=start_index / sample_rate_hz,
+            end_s=end_index / sample_rate_hz,
+        )
+        if row is not None:
+            rows.append(row)
+
+    return rows
+
+
+def _build_review_section_from_samples(
+    object_key: str,
+    byte_length: int,
+    samples: List[float],
+    sample_rate_hz: int,
+    include_interval_rows: bool = False,
+    window_seconds: int = 20,
+) -> Dict[str, Any]:
+    processed = _process_window(samples, sample_rate_hz)
+    cleaned = processed.get("cleaned", []) or list(samples)
+    r_peaks = processed.get("r_peaks", [])
+    signal_markers = _delineate_signal_peaks(cleaned, r_peaks, sample_rate_hz)
+    window_samples = sample_rate_hz * window_seconds
+    beats = _build_beats_from_cleaned(
+        cleaned,
+        r_peaks,
+        sample_rate_hz,
+        signal_markers=signal_markers,
+        window_samples=window_samples,
+    )
+    excluded_reason_counts: Dict[str, int] = {}
+    for beat in beats:
+        for reason in beat.get("exclusion_reasons", []):
+            excluded_reason_counts[reason] = excluded_reason_counts.get(reason, 0) + 1
+    beat_count_total = len(beats)
+    beat_count_excluded = sum(1 for beat in beats if beat.get("exclude_from_analysis"))
+    beat_count_included = beat_count_total - beat_count_excluded
+    return {
+        "meta": {
+            "object_key": object_key,
+            "byte_length": byte_length,
+            "sample_count": len(samples),
+        },
+        "signal": {
+            "full": cleaned,
+            "r_peaks": r_peaks,
+            "markers": signal_markers,
+        },
+        "beats": {
+            "count": len(beats),
+            "items": beats,
+        },
+        "beat_count_total": beat_count_total,
+        "beat_count_included": beat_count_included,
+        "beat_count_excluded": beat_count_excluded,
+        "excluded_reason_counts": excluded_reason_counts,
+        "window_count": max(1, (len(cleaned) + window_samples - 1) // window_samples),
+        "window_start_sample": 1,
+        "window_end_sample": len(cleaned),
+        "interval_related": _interval_related_single(cleaned, len(cleaned), sample_rate_hz),
+        "interval_related_rows": _interval_related_epochs(cleaned, sample_rate_hz)
+        if include_interval_rows
+        else [],
+    }
+
+
+def _build_review_artifact(
+    record_id: str,
+    channel: str,
+    calibration_key: str,
+    calibration_bytes: bytes,
+    calibration_samples: List[float],
+    session_key: str,
+    session_bytes: bytes,
+    session_samples: List[float],
+    sample_rate_hz: int,
+) -> Dict[str, Any]:
+    return {
+        "record_id": record_id,
+        "channel": channel,
+        "sample_rate_hz": sample_rate_hz,
+        "calibration": _build_review_section_from_samples(
+            calibration_key,
+            len(calibration_bytes),
+            calibration_samples,
+            sample_rate_hz,
+            include_interval_rows=False,
+        ),
+        "session": _build_review_section_from_samples(
+            session_key,
+            len(session_bytes),
+            session_samples,
+            sample_rate_hz,
+            include_interval_rows=True,
+        ),
+    }
+
+
+def _artifact_type_for_channel(channel: str) -> str:
+    return f"review_{channel.lower()}"
+
+
+def _process_review_artifacts_for_record(record_id: str) -> None:
+    logger.info("[PROCESSING] start record_id=%s", record_id)
+    _upsert_processed_record(record_id, status="processing", error_message=None)
+    try:
+        record = _fetch_recording_by_id(record_id)
+        session_key = record.get("session_object_key")
+        calibration_key = record.get("calibration_object_key")
+        if not session_key or not calibration_key:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing session_object_key or calibration_object_key in record.",
+            )
+
+        sample_rate_hz = int(record.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
+        session_bytes = _fetch_storage_bytes(session_key)
+        calibration_bytes = _fetch_storage_bytes(calibration_key)
+        decoded_session = _decode_ads1298_packets(session_bytes)
+        decoded_calibration = _decode_ads1298_packets(calibration_bytes)
+
+        for channel in CHANNEL_LABELS:
+            artifact = _build_review_artifact(
+                record_id=record_id,
+                channel=channel,
+                calibration_key=calibration_key,
+                calibration_bytes=calibration_bytes,
+                calibration_samples=decoded_calibration.get(channel, []),
+                session_key=session_key,
+                session_bytes=session_bytes,
+                session_samples=decoded_session.get(channel, []),
+                sample_rate_hz=sample_rate_hz,
+            )
+            object_key = f"processed/{record_id}/{_artifact_type_for_channel(channel)}.json"
+            _upload_storage_json(object_key, artifact)
+            _upsert_processed_artifact(record_id, _artifact_type_for_channel(channel), object_key)
+            REVIEW_ARTIFACT_CACHE[_review_cache_key(record_id, channel)] = artifact
+        _upsert_processed_record(record_id, status="ready", error_message=None)
+        logger.info("[PROCESSING] ready record_id=%s", record_id)
+    except Exception as exc:
+        _upsert_processed_record(record_id, status="error", error_message=str(exc))
+        logger.exception("[PROCESSING] failed record_id=%s", record_id)
+        raise
+
+
+def _load_review_artifact(record_id: str, channel: str) -> Dict[str, Any]:
+    cache_key = _review_cache_key(record_id, channel)
+    cached = REVIEW_ARTIFACT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    processed = _fetch_processed_record(record_id)
+    artifact_type = _artifact_type_for_channel(channel)
+    artifact_key = _fetch_processed_artifact_key(record_id, artifact_type)
+
+    if (
+        not processed
+        or processed.get("status") != "ready"
+        or processed.get("processing_version") != REVIEW_PROCESSING_VERSION
+        or not artifact_key
+    ):
+        _process_review_artifacts_for_record(record_id)
+        artifact_key = _fetch_processed_artifact_key(record_id, artifact_type)
+        if not artifact_key:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Processed review artifact missing for record_id={record_id}, channel={channel}.",
+            )
+    artifact = _fetch_storage_json(artifact_key)
+    REVIEW_ARTIFACT_CACHE[cache_key] = artifact
+    return artifact
+
+
+def _build_review_section(
+    object_key: str,
+    raw_bytes: bytes,
+    channel: str,
+    sample_rate_hz: int,
+    window_index: int = 1,
+    window_seconds: Optional[int] = None,
+) -> Dict[str, Any]:
+    decoded_channels = _decode_ads1298_packets(raw_bytes)
+    all_samples = decoded_channels.get(channel, [])
+    selected_samples = all_samples
+    window_count = 1
+    bounded_window_index = 1
+    window_start_sample = 1
+    window_end_sample = len(selected_samples)
+
+    if window_seconds is not None and window_seconds > 0:
+        window_sample_count = window_seconds * sample_rate_hz
+        window_count = max(1, (len(all_samples) + window_sample_count - 1) // window_sample_count)
+        bounded_window_index = max(1, min(window_index, window_count))
+        window_start = (bounded_window_index - 1) * window_sample_count
+        window_end = min(len(all_samples), window_start + window_sample_count)
+        selected_samples = all_samples[window_start:window_end]
+        window_start_sample = window_start + 1 if selected_samples else 1
+        window_end_sample = window_end
+
+    processed = _process_window(selected_samples, sample_rate_hz)
+    cleaned = processed.get("cleaned", [])
+    r_peaks = processed.get("r_peaks", [])
+    signal_markers = _delineate_signal_peaks(cleaned, r_peaks, sample_rate_hz)
+    beats = _segment_heartbeats(cleaned, r_peaks, sample_rate_hz)
+    interval_related = _interval_related_single(selected_samples, len(selected_samples), sample_rate_hz)
+    interval_related_rows = _interval_related_epochs(all_samples, sample_rate_hz)
+    return {
+        "meta": {
+            "object_key": object_key,
+            "byte_length": len(raw_bytes),
+            "sample_count": len(all_samples),
+        },
+        "signal": {
+            "full": cleaned if cleaned else selected_samples,
+            "r_peaks": r_peaks,
+            "markers": signal_markers,
+        },
+        "beats": {
+            "count": len(beats),
+            "items": beats,
+        },
+        "window_index": bounded_window_index,
+        "window_count": window_count,
+        "window_start_sample": window_start_sample,
+        "window_end_sample": window_end_sample,
+        "interval_related": interval_related,
+        "interval_related_rows": interval_related_rows,
+    }
+
+
+def _latest_live_record_id() -> Optional[str]:
+    latest_record_id: Optional[str] = None
+    latest_updated_at = ""
+    for record_id, state in LIVE_SESSION_STATE.items():
+        snapshot = state.get("snapshot")
+        updated_at = snapshot.get("updated_at", "") if isinstance(snapshot, dict) else ""
+        if snapshot and updated_at >= latest_updated_at:
+            latest_record_id = record_id
+            latest_updated_at = updated_at
+    return latest_record_id
+
+
+def _live_session_status(state: Optional[Dict[str, Any]]) -> str:
+    if not state:
+        return "missing"
+    return "active" if bool(state.get("is_active")) else "ended"
+
+
 def _delineate_summary(
     cleaned: List[float],
     info: Dict[str, Any],
@@ -530,6 +1294,8 @@ def _delineate_summary(
 ) -> Dict[str, int]:
     try:
         rpeaks = info.get("ECG_R_Peaks", [])
+        if len(cleaned) < max(5, int(sample_rate_hz * 0.12)) or not rpeaks:
+            return {"p_peaks": 0, "qrs_peaks": 0, "t_peaks": 0}
         delineate_result = nk.ecg_delineate(
             cleaned,
             rpeaks,
@@ -546,7 +1312,8 @@ def _delineate_summary(
             "t_peaks": len(delineate.get("ECG_T_Peaks", []) or []),
         }
     except Exception as exc:  # pragma: no cover - safeguard
-        logger.error("[DELINEATE] failed error=%s", exc)
+        if "too small to be segmented" not in str(exc).lower():
+            logger.error("[DELINEATE] failed error=%s", exc)
         return {"p_peaks": 0, "qrs_peaks": 0, "t_peaks": 0}
 
 
@@ -690,6 +1457,131 @@ class SessionUploadResponse(BaseModel):
     duration_ms: int
 
 
+class ReviewMeta(BaseModel):
+    object_key: str
+    byte_length: int
+    sample_count: int
+
+
+class ReviewSignal(BaseModel):
+    full: List[float]
+    r_peaks: List[int]
+    markers: Dict[str, List[int]] = Field(default_factory=dict)
+
+
+class BeatMarkers(BaseModel):
+    P: List[int] = Field(default_factory=list)
+    Q: List[int] = Field(default_factory=list)
+    R: List[int] = Field(default_factory=list)
+    S: List[int] = Field(default_factory=list)
+    T: List[int] = Field(default_factory=list)
+    P_Onsets: List[int] = Field(default_factory=list)
+    P_Offsets: List[int] = Field(default_factory=list)
+    R_Onsets: List[int] = Field(default_factory=list)
+    R_Offsets: List[int] = Field(default_factory=list)
+    T_Onsets: List[int] = Field(default_factory=list)
+    T_Offsets: List[int] = Field(default_factory=list)
+
+
+class ReviewBeat(BaseModel):
+    index: int
+    start_sample: int = 1
+    end_sample: int = 1
+    window_index: int = 1
+    window_start_sample: int = 1
+    window_end_sample: int = 1
+    markers: BeatMarkers
+    exclude_from_analysis: bool = False
+    exclusion_reasons: List[str] = Field(default_factory=list)
+    qr_duration_samples: Optional[int] = None
+    qr_duration_ms: Optional[float] = None
+
+
+class ReviewBeats(BaseModel):
+    count: int
+    items: List[ReviewBeat]
+
+
+class ReviewIntervalRow(BaseModel):
+    interval_index: int
+    start_s: float
+    end_s: float
+    sample_count: int
+    ECG_Rate_Mean: Optional[float] = None
+
+
+class ReviewSection(BaseModel):
+    meta: ReviewMeta
+    signal: ReviewSignal
+    beats: ReviewBeats
+    beat_count_total: int = 0
+    beat_count_included: int = 0
+    beat_count_excluded: int = 0
+    excluded_reason_counts: Dict[str, int] = Field(default_factory=dict)
+    window_count: int = 1
+    window_start_sample: int = 1
+    window_end_sample: int = 0
+    interval_related: Optional[ReviewIntervalRow] = None
+    interval_related_rows: List[ReviewIntervalRow] = Field(default_factory=list)
+
+
+class ReviewResponse(BaseModel):
+    record_id: str
+    channel: str
+    sample_rate_hz: int
+    calibration: ReviewSection
+    session: ReviewSection
+
+
+class ReviewSessionWindowResponse(BaseModel):
+    record_id: str
+    channel: str
+    sample_rate_hz: int
+    session: ReviewSection
+
+
+class SessionSignalQualityResponse(BaseModel):
+    record_id: str
+    session_id: Optional[str] = None
+    packet_count_received: int
+    total_packets_buffered: int
+    samples_analyzed: int
+    window_seconds: float
+    quality_percentage: float
+    signal_ok: bool
+    abnormal_detected: bool
+    reason_codes: List[str]
+    heart_rate_bpm: Optional[float] = None
+
+
+class LiveSessionMarkers(BaseModel):
+    P: List[int] = Field(default_factory=list)
+    Q: List[int] = Field(default_factory=list)
+    R: List[int] = Field(default_factory=list)
+    S: List[int] = Field(default_factory=list)
+    T: List[int] = Field(default_factory=list)
+
+
+class LiveSessionSnapshotResponse(BaseModel):
+    record_id: str
+    session_id: Optional[str] = None
+    status: str
+    channel: str
+    updated_at: str
+    ended_at: Optional[str] = None
+    total_packets_buffered: int
+    samples_analyzed: int
+    window_seconds: float
+    quality_percentage: float
+    signal_ok: bool
+    abnormal_detected: bool
+    reason_codes: List[str]
+    heart_rate_bpm: Optional[float] = None
+    signal: ReviewSignal
+    markers: LiveSessionMarkers
+    interval_related: Optional[ReviewIntervalRow] = None
+
+
 class SessionAnalysisJob(BaseModel):
     job_id: str
     status: str
@@ -783,113 +1675,233 @@ async def calibration_signal_quality_check(
     ch2 = channels.get("CH2", [])
     if not ch2:
         raise HTTPException(status_code=400, detail="Decoded calibration signal is empty.")
-
-    sum_sq = 0.0
-    min_val = None
-    max_val = None
-    for value in ch2:
-        sum_sq += float(value * value)
-        if min_val is None or value < min_val:
-            min_val = value
-        if max_val is None or value > max_val:
-            max_val = value
-
-    rms = sqrt(sum_sq / len(ch2))
-    quality = max(0.0, min(100.0, (rms / 0.5) * 100.0))
-    signal_suitable = quality >= 70.0
+    calibration_result = _process_window(ch2, DEFAULT_SAMPLE_RATE_HZ)
+    quality_percentage = round(
+        _quality_to_percentage(calibration_result.get("quality")),
+        2,
+    )
+    signal_suitable = (
+        quality_percentage >= 70.0
+        and bool(calibration_result.get("cleaned"))
+        and bool(calibration_result.get("r_peaks"))
+    )
+    previews = _build_cleaned_previews(channels, DEFAULT_SAMPLE_RATE_HZ)
 
     LAST_CALIBRATION_SAMPLES.clear()
-    LAST_CALIBRATION_SAMPLES.extend(ch2)
+    LAST_CALIBRATION_SAMPLES.extend(calibration_result.get("cleaned", []))
     LAST_CALIBRATION_META["byte_length"] = stats["byte_length"]
     LAST_CALIBRATION_META["sample_count"] = stats["sample_count_per_channel"]
 
-    _upload_storage_bytes(object_key, data)
+    stored_object_key = ""
+    if signal_suitable:
+        _upload_storage_bytes(object_key, data)
+        stored_object_key = object_key
+
+    logger.info(
+        "[CALIBRATION] response run_id=%s quality_percentage=%.2f signal_suitable=%s stored_object_key=%s cleaned_samples=%s r_peaks=%s preview_lengths=%s",
+        run_id,
+        quality_percentage,
+        signal_suitable,
+        stored_object_key or "none",
+        len(calibration_result.get("cleaned", [])),
+        len(calibration_result.get("r_peaks", [])),
+        {label: len(previews.get(label, [])) for label in CHANNEL_LABELS},
+    )
 
     return CalibrationSignalQualityResponse(
-        quality_percentage=round(100, 2),
-        signal_suitable=True,
-        calibration_object_key=object_key,
+        quality_percentage=quality_percentage,
+        signal_suitable=signal_suitable,
+        calibration_object_key=stored_object_key,
         byte_length=stats["byte_length"],
         packet_count=stats["packet_count"],
         sample_count_per_channel=stats["sample_count_per_channel"],
-        preview={
-            "CH2": _preview_series(channels.get("CH2", [])),
-            "CH3": _preview_series(channels.get("CH3", [])),
-            "CH4": _preview_series(channels.get("CH4", [])),
-        },
+        preview=previews,
     )
 
 
-@app.post("/session_signal_quality_check")
+@app.post("/session_signal_quality_check", response_model=SessionSignalQualityResponse)
 async def session_signal_quality_check(
     request: Request,
-) -> Dict[str, Union[float, bool]]:
+) -> SessionSignalQualityResponse:
     data = await request.body()
-    byte_length = len(data)
-    sample_count = byte_length // 2
-    remainder = byte_length % 2
+    stats = _packet_stats(data)
+    record_id = request.headers.get("X-Record-Id") or "unknown-record"
+    session_id = request.headers.get("X-Session-Id")
 
-    decoded_samples = [
-        int.from_bytes(data[i : i + 2], "little", signed=True)
-        for i in range(0, sample_count * 2, 2)
-    ]
-    request_dump = {
-        "method": request.method,
-        "url": str(request.url),
-        "headers": dict(request.headers),
-        "byte_length": byte_length,
-        "samples": decoded_samples,
+    logger.info(
+        "[SESSION_CHECK] received record_id=%s session_id=%s byte_length=%s packet_count=%s sample_count_per_channel=%s remainder=%s",
+        record_id,
+        session_id,
+        stats["byte_length"],
+        stats["packet_count"],
+        stats["sample_count_per_channel"],
+        stats["remainder"],
+    )
+
+    if stats["packet_count"] == 0:
+        raise HTTPException(status_code=400, detail="No complete ECG packets received.")
+    if stats["remainder"] != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Payload length is not a multiple of packet size {PACKET_BYTES}.",
+        )
+
+    state = LIVE_SESSION_STATE.setdefault(
+        record_id,
+        {
+            "session_id": session_id,
+            "buffer": bytearray(),
+            "total_packets_received": 0,
+            "last_hr_bpm": None,
+            "snapshot": None,
+            "is_active": True,
+            "ended_at": None,
+        },
+    )
+    state["session_id"] = session_id or state.get("session_id")
+    state["is_active"] = True
+    state["ended_at"] = None
+    state["buffer"].extend(data)
+    state["total_packets_received"] += stats["packet_count"]
+
+    max_buffer_bytes = LIVE_SESSION_WINDOW_PACKETS * PACKET_BYTES
+    if len(state["buffer"]) > max_buffer_bytes:
+        state["buffer"] = state["buffer"][-max_buffer_bytes:]
+
+    buffered_payload = bytes(state["buffer"])
+    buffered_stats = _packet_stats(buffered_payload)
+    channels = _decode_ads1298_packets(buffered_payload)
+    ch2 = channels.get("CH2", [])
+    result = _process_window(ch2, DEFAULT_SAMPLE_RATE_HZ)
+    quality_percentage = round(_quality_to_percentage(result.get("quality")), 2)
+    heart_rate_bpm = result.get("metrics", {}).get("avg_hr_bpm")
+    reason_codes: List[str] = []
+
+    if quality_percentage < 50.0:
+        reason_codes.append("poor_signal_quality")
+    if heart_rate_bpm is not None and heart_rate_bpm < 45.0:
+        reason_codes.append("bradycardia")
+    if heart_rate_bpm is not None and heart_rate_bpm > 190.0:
+        reason_codes.append("tachycardia")
+    previous_hr = state.get("last_hr_bpm")
+    if (
+        previous_hr is not None
+        and heart_rate_bpm is not None
+        and abs(float(heart_rate_bpm) - float(previous_hr)) >= 40.0
+    ):
+        reason_codes.append("abrupt_hr_shift")
+    if len(result.get("r_peaks", [])) < 2 and len(ch2) >= DEFAULT_SAMPLE_RATE_HZ * 4:
+        reason_codes.append("insufficient_r_peaks")
+    if result.get("cleaned"):
+        recent = result["cleaned"][-DEFAULT_SAMPLE_RATE_HZ :]
+        if recent and (max(recent) - min(recent)) < 0.05:
+            reason_codes.append("possible_flatline")
+
+    state["last_hr_bpm"] = heart_rate_bpm
+    signal_ok = quality_percentage >= 50.0
+    abnormal_detected = len(reason_codes) > 0
+    window_seconds = round(
+        buffered_stats["sample_count_per_channel"] / DEFAULT_SAMPLE_RATE_HZ,
+        2,
+    )
+    interval_related = _interval_related_single(
+        result.get("signals"),
+        buffered_stats["sample_count_per_channel"],
+        DEFAULT_SAMPLE_RATE_HZ,
+    )
+    markers = _delineate_signal_peaks(
+        result.get("cleaned", []),
+        result.get("r_peaks", []),
+        DEFAULT_SAMPLE_RATE_HZ,
+    )
+    updated_at = datetime.now(timezone.utc).isoformat()
+
+    state["snapshot"] = {
+        "record_id": record_id,
+        "session_id": state.get("session_id"),
+        "status": _live_session_status(state),
+        "channel": "CH2",
+        "updated_at": updated_at,
+        "ended_at": state.get("ended_at"),
+        "total_packets_buffered": buffered_stats["packet_count"],
+        "samples_analyzed": buffered_stats["sample_count_per_channel"],
+        "window_seconds": window_seconds,
+        "quality_percentage": quality_percentage,
+        "signal_ok": signal_ok,
+        "abnormal_detected": abnormal_detected,
+        "reason_codes": list(reason_codes),
+        "heart_rate_bpm": heart_rate_bpm,
+        "signal": {
+            "full": result.get("cleaned", []),
+            "r_peaks": result.get("r_peaks", []),
+        },
+        "markers": markers,
+        "interval_related": interval_related,
     }
-    dump_path = os.path.join(os.path.dirname(__file__), "session_request.json")
-    with open(dump_path, "w", encoding="utf-8") as handle:
-        json.dump(request_dump, handle, indent=2)
 
-    print("[SESSION] Received session signal")
-    print(f"[SESSION] byte_length={byte_length} sample_count={sample_count}")
-    if remainder:
-        print(f"[SESSION] WARNING: odd byte count (remainder={remainder})")
-
-    if sample_count == 0:
-        print("[SESSION] No samples received -> quality=0, suitable=False")
-        return {"quality_percentage": 0.0, "signal_suitable": False}
-
-    sum_sq = 0.0
-    min_val = None
-    max_val = None
-    for value in decoded_samples:
-        sum_sq += float(value * value)
-        if min_val is None or value < min_val:
-            min_val = value
-        if max_val is None or value > max_val:
-            max_val = value
-
-    rms = sqrt(sum_sq / sample_count)
-    quality = max(0.0, min(100.0, (rms / 1000.0) * 100.0))
-    signal_suitable = quality >= 70.0
-
-    print(
-        "[SESSION] Computation details:"
-        f" min={min_val} max={max_val} rms={rms:.2f}"
+    response = SessionSignalQualityResponse(
+        record_id=record_id,
+        session_id=state.get("session_id"),
+        packet_count_received=stats["packet_count"],
+        total_packets_buffered=buffered_stats["packet_count"],
+        samples_analyzed=buffered_stats["sample_count_per_channel"],
+        window_seconds=window_seconds,
+        quality_percentage=quality_percentage,
+        signal_ok=signal_ok,
+        abnormal_detected=abnormal_detected,
+        reason_codes=reason_codes,
+        heart_rate_bpm=heart_rate_bpm,
     )
-    print(
-        "[SESSION] Quality mapping:"
-        f" quality_percentage={quality:.2f} threshold=70.0"
+    logger.info(
+        "[SESSION_CHECK] response record_id=%s quality_percentage=%.2f signal_ok=%s abnormal_detected=%s reasons=%s heart_rate_bpm=%s samples_analyzed=%s marker_counts=%s",
+        record_id,
+        response.quality_percentage,
+        response.signal_ok,
+        response.abnormal_detected,
+        ",".join(response.reason_codes) if response.reason_codes else "none",
+        response.heart_rate_bpm,
+        response.samples_analyzed,
+        {key: len(value) for key, value in markers.items()},
     )
-    print(
-        "[SESSION] Result:"
-        f" signal_suitable={signal_suitable}"
-    )
+    return response
 
-    return {
-        "quality_percentage": round(quality, 2),
-        "signal_suitable": signal_suitable,
-    }
+
+@app.get("/session/live", response_model=LiveSessionSnapshotResponse)
+async def session_live(record_id: Optional[str] = None) -> LiveSessionSnapshotResponse:
+    selected_record_id = record_id or _latest_live_record_id()
+    if not selected_record_id:
+        raise HTTPException(status_code=404, detail="No live session snapshot available.")
+
+    state = LIVE_SESSION_STATE.get(selected_record_id)
+    snapshot = state.get("snapshot") if state else None
+    if not isinstance(snapshot, dict):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No live session snapshot available for record_id={selected_record_id}.",
+        )
+
+    logger.info(
+        "[SESSION_LIVE] served record_id=%s updated_at=%s samples_analyzed=%s quality_percentage=%.2f abnormal_detected=%s",
+        selected_record_id,
+        snapshot.get("updated_at"),
+        snapshot.get("samples_analyzed"),
+        float(snapshot.get("quality_percentage", 0.0)),
+        snapshot.get("abnormal_detected"),
+    )
+    return LiveSessionSnapshotResponse(**snapshot)
 
 
 @app.post("/session/start", response_model=SessionStartResponse)
 async def session_start(payload: SessionStartRequest) -> SessionStartResponse:
     config = _get_supabase_config()
     session_object_key = f"session/{payload.session_id}.bin"
+    logger.info(
+        "[SESSION_START] received user_id=%s session_id=%s calibration_object_key=%s start_time=%s",
+        payload.user_id,
+        payload.session_id,
+        payload.calibration_object_key,
+        payload.start_time,
+    )
     record = _insert_recording_row(
         {
             "user_id": payload.user_id,
@@ -913,10 +1925,25 @@ async def session_start(payload: SessionStartRequest) -> SessionStartResponse:
             ),
         }
     )
-    return SessionStartResponse(
+    response = SessionStartResponse(
         record_id=str(record["id"]),
         session_object_key=session_object_key,
     )
+    LIVE_SESSION_STATE[str(record["id"])] = {
+        "session_id": payload.session_id,
+        "buffer": bytearray(),
+        "total_packets_received": 0,
+        "last_hr_bpm": None,
+        "snapshot": None,
+        "is_active": True,
+        "ended_at": None,
+    }
+    logger.info(
+        "[SESSION_START] response record_id=%s session_object_key=%s",
+        response.record_id,
+        response.session_object_key,
+    )
+    return response
 
 
 @app.post("/session/{record_id}/upload", response_model=SessionUploadResponse)
@@ -932,6 +1959,16 @@ async def session_upload(record_id: str, request: Request) -> SessionUploadRespo
         )
 
     stats = _packet_stats(payload)
+    logger.info(
+        "[SESSION_UPLOAD] received record_id=%s session_id=%s user_id=%s byte_length=%s packet_count=%s sample_count_per_channel=%s remainder=%s",
+        record_id,
+        session_id,
+        user_id,
+        stats["byte_length"],
+        stats["packet_count"],
+        stats["sample_count_per_channel"],
+        stats["remainder"],
+    )
     if stats["packet_count"] == 0:
         raise HTTPException(status_code=400, detail="No complete ECG packets received.")
     if stats["remainder"] != 0:
@@ -966,7 +2003,11 @@ async def session_upload(record_id: str, request: Request) -> SessionUploadRespo
             ),
         },
     )
-    return SessionUploadResponse(
+    try:
+        _process_review_artifacts_for_record(record_id)
+    except Exception as exc:  # pragma: no cover - safeguard
+        logger.error("[SESSION_UPLOAD] review_processing_failed record_id=%s error=%s", record_id, exc)
+    response = SessionUploadResponse(
         record_id=record_id,
         session_object_key=session_object_key,
         byte_length=stats["byte_length"],
@@ -974,6 +2015,23 @@ async def session_upload(record_id: str, request: Request) -> SessionUploadRespo
         sample_count_per_channel=stats["sample_count_per_channel"],
         duration_ms=duration_ms,
     )
+    state = LIVE_SESSION_STATE.get(record_id)
+    if state is not None:
+        ended_at = datetime.now(timezone.utc).isoformat()
+        state["is_active"] = False
+        state["ended_at"] = ended_at
+        snapshot = state.get("snapshot")
+        if isinstance(snapshot, dict):
+            snapshot["status"] = "ended"
+            snapshot["ended_at"] = ended_at
+            snapshot["updated_at"] = ended_at
+    logger.info(
+        "[SESSION_UPLOAD] response record_id=%s session_object_key=%s duration_ms=%s",
+        response.record_id,
+        response.session_object_key,
+        response.duration_ms,
+    )
+    return response
 
 def _session_analysis_job(job_id: str, record_id: str) -> None:
     logger.info("[JOB] start job_id=%s record_id=%s", job_id, record_id)
@@ -1246,6 +2304,119 @@ async def session_insights(payload: SessionAnalysisRequest) -> List[Insight]:
     ]
 
 
+@app.get("/review/latest", response_model=ReviewResponse)
+async def review_latest(channel: str = "CH2", session_window_index: int = 1) -> ReviewResponse:
+    latest_id = _fetch_latest_recording_id()
+    if not latest_id:
+        raise HTTPException(status_code=404, detail="No recordings found.")
+    return await review_record(
+        latest_id,
+        channel=channel,
+        session_window_index=session_window_index,
+    )
+
+
+@app.get("/review/{record_id}", response_model=ReviewResponse)
+async def review_record(
+    record_id: str,
+    channel: str = "CH2",
+    session_window_index: int = 1,
+) -> ReviewResponse:
+    selected_channel = (channel or "CH2").upper()
+    if selected_channel not in CHANNEL_LABELS:
+        raise HTTPException(status_code=400, detail="Invalid channel.")
+
+    logger.info(
+        "[REVIEW] request record_id=%s channel=%s",
+        record_id,
+        selected_channel,
+    )
+    artifact = _load_review_artifact(record_id, selected_channel)
+    calibration_section = artifact.get("calibration", {})
+    session_section = artifact.get("session", {})
+    sample_rate_hz = int(artifact.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
+
+    logger.info(
+        "[REVIEW] response record_id=%s channel=%s calibration_samples=%s calibration_beats=%s session_samples=%s session_beats=%s session_intervals=%s",
+        record_id,
+        selected_channel,
+        calibration_section["meta"]["sample_count"],
+        calibration_section["beats"]["count"],
+        session_section["meta"]["sample_count"],
+        session_section["beats"]["count"],
+        len(session_section["interval_related_rows"]),
+    )
+    return ReviewResponse(
+        record_id=record_id,
+        channel=selected_channel,
+        sample_rate_hz=sample_rate_hz,
+        calibration=ReviewSection(**calibration_section),
+        session=ReviewSection(**session_section),
+    )
+
+
+@app.get("/review/{record_id}/session_window", response_model=ReviewSessionWindowResponse)
+async def review_session_window(
+    record_id: str,
+    channel: str = "CH2",
+    session_window_index: int = 1,
+) -> ReviewSessionWindowResponse:
+    selected_channel = (channel or "CH2").upper()
+    if selected_channel not in CHANNEL_LABELS:
+        raise HTTPException(status_code=400, detail="Invalid channel.")
+
+    logger.info(
+        "[REVIEW] session_window request record_id=%s channel=%s session_window_index=%s",
+        record_id,
+        selected_channel,
+        session_window_index,
+    )
+    artifact = _load_review_artifact(record_id, selected_channel)
+    sample_rate_hz = int(artifact.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
+    session_section = artifact.get("session", {})
+    signal = session_section.get("signal", {}).get("full", []) or []
+    window_samples = sample_rate_hz * 20
+    window_count = max(1, (len(signal) + window_samples - 1) // window_samples)
+    bounded_window_index = max(1, min(session_window_index, window_count))
+    start_index = (bounded_window_index - 1) * window_samples
+    end_index = min(len(signal), start_index + window_samples)
+    session_beats = session_section.get("beats", {}).get("items", []) or []
+    session_window = {
+        **session_section,
+        "signal": {
+            **(session_section.get("signal", {}) or {}),
+            "full": signal[start_index:end_index],
+            "r_peaks": [
+                peak - start_index
+                for peak in (session_section.get("signal", {}).get("r_peaks", []) or [])
+                if start_index <= peak < end_index
+            ],
+        },
+        "beats": {
+            "count": len([beat for beat in session_beats if beat.get("window_index") == bounded_window_index]),
+            "items": [beat for beat in session_beats if beat.get("window_index") == bounded_window_index],
+        },
+        "window_count": window_count,
+        "window_start_sample": start_index + 1 if signal else 1,
+        "window_end_sample": end_index,
+    }
+    logger.info(
+        "[REVIEW] session_window response record_id=%s channel=%s session_window=%s/%s session_window_samples=%s session_beats=%s",
+        record_id,
+        selected_channel,
+        bounded_window_index,
+        window_count,
+        len(session_window["signal"]["full"]),
+        session_window["beats"]["count"],
+    )
+    return ReviewSessionWindowResponse(
+        record_id=record_id,
+        channel=selected_channel,
+        sample_rate_hz=sample_rate_hz,
+        session=ReviewSection(**session_window),
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request) -> str:
     try:
@@ -1297,9 +2468,6 @@ def root(request: Request) -> str:
             _format_metric("Avg HR", metrics.get("avg_hr_bpm"), " bpm"),
             _format_metric("Min HR", metrics.get("min_hr_bpm"), " bpm"),
             _format_metric("Max HR", metrics.get("max_hr_bpm"), " bpm"),
-            _format_metric("HRV RMSSD", metrics.get("hrv_rmssd_ms"), " ms"),
-            _format_metric("HRV SDNN", metrics.get("hrv_sdnn_ms"), " ms"),
-            _format_metric("HRV MeanNN", metrics.get("hrv_meannn_ms"), " ms"),
             _format_metric("R Peaks", metrics.get("r_peak_count"), ""),
         ]
         return "<ul class='metrics'>" + "".join(items) + "</ul>"
@@ -1323,32 +2491,6 @@ def root(request: Request) -> str:
         ("Min HR", "min_hr_bpm", " bpm"),
         ("Max HR", "max_hr_bpm", " bpm"),
         ("R Peaks", "r_peak_count", ""),
-        ("Mean NN", "hrv_meannn_ms", " ms"),
-        ("Median NN", "hrv_mediannn_ms", " ms"),
-        ("Min NN", "hrv_min_nn_ms", " ms"),
-        ("Max NN", "hrv_max_nn_ms", " ms"),
-        ("SDNN", "hrv_sdnn_ms", " ms"),
-        ("RMSSD", "hrv_rmssd_ms", " ms"),
-        ("SDRMSSD", "hrv_sdrmssd", ""),
-        ("IQRNN", "hrv_iqrnn_ms", " ms"),
-        ("pNN50", "hrv_pnn50_pct", " %"),
-        ("pNN20", "hrv_pnn20_pct", " %"),
-        ("CVNN", "hrv_cvnn_pct", " %"),
-        ("CVSD", "hrv_cvsd_pct", " %"),
-        ("VLF", "hrv_vlf_ms2", " ms2"),
-        ("LF", "hrv_lf_ms2", " ms2"),
-        ("HF", "hrv_hf_ms2", " ms2"),
-        ("LF/HF", "hrv_lf_hf_ratio", ""),
-        ("LFnu", "hrv_lfnu", ""),
-        ("HFnu", "hrv_hfnu", ""),
-        ("Total Power", "hrv_total_power", " ms2"),
-        ("SD1", "hrv_sd1", ""),
-        ("SD2", "hrv_sd2", ""),
-        ("SD1/SD2", "hrv_sd1_sd2", ""),
-        ("Sample Entropy", "hrv_sampen", ""),
-        ("ApEn", "hrv_apen", ""),
-        ("DFA α1", "hrv_dfa_alpha1", ""),
-        ("DFA α2", "hrv_dfa_alpha2", ""),
     ]
     calibration_metrics = channel_data.get("calibration_metrics") if channel_data else {}
     window_metrics = [w.get("metrics", {}) for w in best_windows[:3]]

@@ -34,10 +34,11 @@ import {
   useSessionHistoryStore,
 } from "@/stores/session-store";
 import { useAppStore } from "@/stores/app-store";
-import {
-  concatUint8Arrays,
-} from "@/services/ecg-utils";
 import { finalizeSessionRecord } from "@/services/backend-ecg";
+import {
+  clearSessionCapture,
+  loadSessionCapture,
+} from "@/services/session-packet-storage";
 import { startSessionAnalysis } from "@/services/session-analysis";
 import {
   getSessionAnalysis,
@@ -88,14 +89,18 @@ export default function RunSummaryScreen() {
         throw new Error("No pending upload data found.");
       }
 
-      const { recordId, sessionId, packets, startTimeIso } =
+      const { recordId: pendingRecordId, sessionId, startTimeIso } =
         pendingUpload;
       const userId = user?.email ?? "unknown@local";
-
-      const bytes = concatUint8Arrays(packets);
+      const persistedCapture = await loadSessionCapture(sessionId);
+      const recordId = pendingRecordId ?? persistedCapture.recordId;
+      const bytes = persistedCapture.bytes;
 
       if (bytes.length === 0) {
         throw new Error("No session bytes available for upload.");
+      }
+      if (!recordId) {
+        throw new Error("No persisted session record id available for upload.");
       }
 
       setSyncProgress(40);
@@ -104,8 +109,11 @@ export default function RunSummaryScreen() {
         userId,
         sessionId,
         bytes,
-        startTime: startTimeIso ? new Date(startTimeIso) : null,
+        startTime: (startTimeIso ?? persistedCapture.startTimeIso)
+          ? new Date(startTimeIso ?? persistedCapture.startTimeIso ?? "")
+          : null,
       });
+      await clearSessionCapture(sessionId);
       setSyncProgress(70);
 
       await startSessionAnalysis(recordId);
