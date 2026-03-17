@@ -561,7 +561,7 @@ function VectorLoopChart({
                 if (!point) return null;
                 return (
                   <g key={`${label}-${idx}-${position}`}>
-                    <circle cx={point.x} cy={point.y} r={4} fill={BEAT_MARKER_COLORS[label]} className="vector-marker-dot" />
+                    <circle cx={point.x} cy={point.y} r={8} fill={BEAT_MARKER_COLORS[label]} className="vector-marker-dot" />
                     <text x={point.x + 8} y={point.y - 8} className="marker-label">
                       {label}
                     </text>
