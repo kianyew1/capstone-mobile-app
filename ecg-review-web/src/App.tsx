@@ -79,6 +79,24 @@ type ReviewResponse = {
   session: ReviewSection;
 };
 
+type VectorBeatResponse = {
+  record_id: string;
+  section: "calibration" | "session";
+  sample_rate_hz: number;
+  beat_count: number;
+  beat_index: number;
+  start_sample: number;
+  end_sample: number;
+  exclude_from_analysis: boolean;
+  exclusion_reasons: string[];
+  qr_duration_ms: number | null;
+  markers: BeatMarkers;
+  max_abs_lead_i: number;
+  max_abs_lead_ii: number;
+  lead_i: number[];
+  lead_ii: number[];
+};
+
 type LiveMarkers = {
   P: number[];
   Q: number[];
@@ -111,6 +129,7 @@ type LiveResponse = {
 };
 
 const CHANNELS = ["CH2", "CH3", "CH4"] as const;
+const REVIEW_MODES = ["CH2", "CH3", "CH4", "Vectorcardiography"] as const;
 const BEAT_MARKER_COLORS: Record<keyof BeatMarkers, string> = {
   P: "#1f7aec",
   Q: "#9a3412",
@@ -177,6 +196,40 @@ function getBeatSamples(fullSignal: number[], beat: ReviewBeat | null): number[]
     return [];
   }
   return fullSignal.slice(Math.max(0, beat.start_sample - 1), Math.max(0, beat.end_sample));
+}
+
+function createVectorLoopGeometry(
+  leadI: number[],
+  leadII: number[],
+  maxAbsLeadI: number,
+  maxAbsLeadII: number,
+  width: number,
+  height: number,
+): { path: string; axisX: number; axisY: number; points: Array<{ x: number; y: number }> } {
+  const count = Math.min(leadI.length, leadII.length);
+  if (count === 0) {
+    return { path: "", axisX: width / 2, axisY: height / 2, points: [] };
+  }
+
+  const span = Math.max(maxAbsLeadI * 2, maxAbsLeadII * 2, 1);
+  const scale = (Math.min(width, height) * 1.3) / span;
+  const plotX = (value: number) => width / 2 + value * scale;
+  const plotY = (value: number) => height / 2 - value * scale;
+
+  const points = Array.from({ length: count }, (_, index) => ({
+    x: plotX(leadI[index]),
+    y: plotY(leadII[index]),
+  }));
+  const path = points
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
+    .join(" ");
+
+  return {
+    path,
+    axisX: plotX(0),
+    axisY: plotY(0),
+    points,
+  };
 }
 
 function TopNav({ currentPath }: { currentPath: string }) {
@@ -449,6 +502,183 @@ function IntervalSummary({ row }: { row: ReviewIntervalRow | null }) {
   );
 }
 
+function VectorLoopChart({
+  title,
+  data,
+  progressPercent,
+}: {
+  title: string;
+  data: VectorBeatResponse | null;
+  progressPercent: number;
+}) {
+  const width = 970;
+  const height = 666;
+  const leadI = data?.lead_i ?? [];
+  const leadII = data?.lead_ii ?? [];
+  const maxAbsLeadI = data?.max_abs_lead_i ?? 0;
+  const maxAbsLeadII = data?.max_abs_lead_ii ?? 0;
+  const { path, axisX, axisY, points } = useMemo(
+    () => createVectorLoopGeometry(leadI, leadII, maxAbsLeadI, maxAbsLeadII, width, height),
+    [leadI, leadII, maxAbsLeadI, maxAbsLeadII],
+  );
+  const visiblePointCount = Math.max(
+    1,
+    Math.min(points.length, Math.floor((points.length * Math.min(Math.max(progressPercent, 0), 100)) / 100)),
+  );
+  const visiblePath = points
+    .slice(0, visiblePointCount)
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
+    .join(" ");
+  if (!data) {
+    return (
+      <div className="chart-card vector-card">
+        <div className="card-header">
+          <h3>{title}</h3>
+        </div>
+        <div className="empty-state">No vector beat available.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="chart-card vector-card">
+      <div className="card-header">
+        <div>
+          <h3>{title}</h3>
+          <span className="chart-subtitle">X = Lead I (CH2) | Y = Lead II (CH3)</span>
+        </div>
+        <span>{Math.min(data.lead_i.length, data.lead_ii.length)} samples</span>
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} className="vector-chart">
+        <line x1={axisX} y1={0} x2={axisX} y2={height} className="grid-line" />
+        <line x1={0} y1={axisY} x2={width} y2={axisY} className="grid-line" />
+        <path d={visiblePath || path} className="signal-path vector-path" />
+        {(Object.entries(data.markers) as Array<[keyof BeatMarkers, number[]]>).map(([label, positions]) =>
+          (["P", "Q", "R", "S", "T"] as Array<keyof BeatMarkers>).includes(label)
+            ? positions.map((position, idx) => {
+                if (position >= visiblePointCount) return null;
+                const point = points[position];
+                if (!point) return null;
+                return (
+                  <g key={`${label}-${idx}-${position}`}>
+                    <circle cx={point.x} cy={point.y} r={4} fill={BEAT_MARKER_COLORS[label]} className="vector-marker-dot" />
+                    <text x={point.x + 8} y={point.y - 8} className="marker-label">
+                      {label}
+                    </text>
+                  </g>
+                );
+              })
+            : null,
+        )}
+        {data.exclude_from_analysis ? (
+          <g>
+            <rect x={0} y={0} width={width} height={height} className="excluded-overlay" />
+            <text x={width / 2} y={height / 2 - 10} textAnchor="middle" className="excluded-overlay-text">
+              Excluded from analysis
+            </text>
+            {data.qr_duration_ms !== null ? (
+              <text x={width / 2} y={height / 2 + 14} textAnchor="middle" className="excluded-overlay-subtext">
+                {`Q-R ${data.qr_duration_ms.toFixed(1)} ms`}
+              </text>
+            ) : null}
+          </g>
+        ) : null}
+      </svg>
+    </div>
+  );
+}
+
+function VectorReviewSection({
+  title,
+  beatIndex,
+  beatCount,
+  data,
+  loading,
+  movementPercent,
+  onBeatIndexChange,
+  onMovementPercentChange,
+}: {
+  title: string;
+  beatIndex: number;
+  beatCount: number;
+  data: VectorBeatResponse | null;
+  loading: boolean;
+  movementPercent: number;
+  onBeatIndexChange: (value: number) => void;
+  onMovementPercentChange: (value: number) => void;
+}) {
+  return (
+    <section className="review-section">
+      <div className="section-header">
+        <div>
+          <h2>{title}</h2>
+          <p className="meta-line">2D beat morphology from Lead I (CH2) and Lead II (CH3).</p>
+        </div>
+      </div>
+      <div className="vector-section-grid">
+        <div className="signal-column">
+          <VectorLoopChart title={`${title} Morphology`} data={data} progressPercent={movementPercent} />
+          <div className="chart-card vector-controls-row-card">
+            <div className="vector-controls-header">
+              <strong>{`${title} Beat Selector`}</strong>
+              <span>{`Beat ${Math.min(Math.max(beatIndex, 1), Math.max(beatCount, 1))} of ${Math.max(beatCount, 1)}`}</span>
+            </div>
+            <div className="window-controls compact-controls compact-controls-centered">
+                <button
+                  className="window-button"
+                  disabled={beatCount <= 0 || beatIndex <= 1}
+                  onClick={() => onBeatIndexChange(Math.max(1, beatIndex - 1))}
+                >
+                  Prev Beat
+                </button>
+                <label className="beat-input window-input">
+                  <input
+                    type="number"
+                    min={1}
+                    max={Math.max(beatCount, 1)}
+                    value={Math.min(Math.max(beatIndex, 1), Math.max(beatCount, 1))}
+                    onChange={(event) =>
+                      onBeatIndexChange(
+                        Math.min(Math.max(Number(event.target.value) || 1, 1), Math.max(beatCount, 1)),
+                      )
+                    }
+                  />
+                </label>
+                <button
+                  className="window-button"
+                  disabled={beatCount <= 0 || beatIndex >= beatCount}
+                  onClick={() => onBeatIndexChange(Math.min(beatCount, beatIndex + 1))}
+                >
+                  Next Beat
+                </button>
+            </div>
+            <div className="vector-slider-row">
+              <label className="vector-slider-label" htmlFor={`${title}-movement`}>
+                Vector movement
+              </label>
+              <input
+                id={`${title}-movement`}
+                className="vector-slider"
+                type="range"
+                min={1}
+                max={100}
+                step={1}
+                value={movementPercent}
+                onChange={(event) => onMovementPercentChange(Number(event.target.value) || 1)}
+              />
+              <span className="vector-slider-value">{movementPercent}%</span>
+            </div>
+            {loading ? <div className="section-loading">Loading vector beat...</div> : null}
+            {data?.exclude_from_analysis ? (
+              <div className="status-panel">Excluded from analysis: {data.exclusion_reasons.join(", ")}</div>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function ReviewSectionCard({
   title,
   section,
@@ -647,19 +877,28 @@ function SessionReviewCard({
 }
 
 function ReviewPage({ currentPath }: { currentPath: string }) {
-  const [channel, setChannel] = useState<(typeof CHANNELS)[number]>("CH2");
+  const [reviewMode, setReviewMode] = useState<(typeof REVIEW_MODES)[number]>("CH2");
   const [data, setData] = useState<ReviewResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [calibrationBeat, setCalibrationBeat] = useState(1);
   const [sessionBeat, setSessionBeat] = useState(1);
+  const [calibrationVector, setCalibrationVector] = useState<VectorBeatResponse | null>(null);
+  const [sessionVector, setSessionVector] = useState<VectorBeatResponse | null>(null);
+  const [loadingCalibrationVector, setLoadingCalibrationVector] = useState(false);
+  const [loadingSessionVector, setLoadingSessionVector] = useState(false);
+  const [calibrationVectorMovement, setCalibrationVectorMovement] = useState(100);
+  const [sessionVectorMovement, setSessionVectorMovement] = useState(100);
+
+  const selectedChannel: (typeof CHANNELS)[number] = reviewMode === "Vectorcardiography" ? "CH2" : reviewMode;
+  const showVectorMode = reviewMode === "Vectorcardiography";
 
   useEffect(() => {
     let active = true;
     async function load() {
       setLoading(true);
       setError(null);
-      const url = `/api/review/latest?channel=${channel}`;
+      const url = `/api/review/latest?channel=${selectedChannel}`;
       console.log(`[REVIEW] GET ${url}`);
       try {
         const response = await fetch(url);
@@ -675,6 +914,8 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
         setData(payload);
         setCalibrationBeat(1);
         setSessionBeat(1);
+        setCalibrationVectorMovement(100);
+        setSessionVectorMovement(100);
       } catch (err) {
         if (!active) return;
         setError(err instanceof Error ? err.message : "Unknown review error");
@@ -688,7 +929,81 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     return () => {
       active = false;
     };
-  }, [channel]);
+  }, [selectedChannel]);
+
+  useEffect(() => {
+    if (!data || !showVectorMode) {
+      setCalibrationVector(null);
+      return;
+    }
+    const recordId = data.record_id;
+    let active = true;
+    async function loadCalibrationVector() {
+      setLoadingCalibrationVector(true);
+      const url = `/api/review/${recordId}/vector_beat?section=calibration&beat_index=${calibrationBeat}`;
+      console.log(`[VECTOR] GET ${url}`);
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Vector fetch failed: ${response.status} ${text}`);
+        }
+        const payload = (await response.json()) as VectorBeatResponse;
+        console.log(
+          `[VECTOR] response section=${payload.section} beat=${payload.beat_index}/${payload.beat_count} samples=${Math.min(payload.lead_i.length, payload.lead_ii.length)} excluded=${payload.exclude_from_analysis}`,
+        );
+        if (!active) return;
+        setCalibrationVector(payload);
+      } catch (err) {
+        if (!active) return;
+        console.error("[VECTOR] calibration error", err);
+        setCalibrationVector(null);
+      } finally {
+        if (active) setLoadingCalibrationVector(false);
+      }
+    }
+    void loadCalibrationVector();
+    return () => {
+      active = false;
+    };
+  }, [data, calibrationBeat, showVectorMode]);
+
+  useEffect(() => {
+    if (!data || !showVectorMode) {
+      setSessionVector(null);
+      return;
+    }
+    const recordId = data.record_id;
+    let active = true;
+    async function loadSessionVector() {
+      setLoadingSessionVector(true);
+      const url = `/api/review/${recordId}/vector_beat?section=session&beat_index=${sessionBeat}`;
+      console.log(`[VECTOR] GET ${url}`);
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Vector fetch failed: ${response.status} ${text}`);
+        }
+        const payload = (await response.json()) as VectorBeatResponse;
+        console.log(
+          `[VECTOR] response section=${payload.section} beat=${payload.beat_index}/${payload.beat_count} samples=${Math.min(payload.lead_i.length, payload.lead_ii.length)} excluded=${payload.exclude_from_analysis}`,
+        );
+        if (!active) return;
+        setSessionVector(payload);
+      } catch (err) {
+        if (!active) return;
+        console.error("[VECTOR] session error", err);
+        setSessionVector(null);
+      } finally {
+        if (active) setLoadingSessionVector(false);
+      }
+    }
+    void loadSessionVector();
+    return () => {
+      active = false;
+    };
+  }, [data, sessionBeat, showVectorMode]);
 
   return (
     <main className="app-shell">
@@ -700,9 +1015,9 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
           <p className="subtitle">NeuroKit2-backed signal review for calibration and exercise session traces.</p>
         </div>
         <label className="channel-select">
-          <span>Channel</span>
-          <select value={channel} onChange={(event) => setChannel(event.target.value as (typeof CHANNELS)[number])}>
-            {CHANNELS.map((item) => (
+          <span>View</span>
+          <select value={reviewMode} onChange={(event) => setReviewMode(event.target.value as (typeof REVIEW_MODES)[number])}>
+            {REVIEW_MODES.map((item) => (
               <option key={item} value={item}>
                 {item}
               </option>
@@ -715,25 +1030,52 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
       {error && <div className="status-panel error">{error}</div>}
 
       {!loading && !error && data && (
-        <div className="content-stack">
+        <div className={showVectorMode ? "content-stack vector-mode-content" : "content-stack"}>
           <div className="record-meta">
             <span>Record ID: {data.record_id}</span>
-            <span>Channel: {data.channel}</span>
+            <span>{showVectorMode ? "View: Vectorcardiography" : `Channel: ${data.channel}`}</span>
             <span>Sample Rate: {data.sample_rate_hz} Hz</span>
           </div>
-          <ReviewSectionCard
-            title="Calibration Signal"
-            section={data.calibration}
-            sampleRateHz={data.sample_rate_hz}
-            beatIndex={calibrationBeat}
-            onBeatIndexChange={setCalibrationBeat}
-          />
-          <SessionReviewCard
-            section={data.session}
-            sampleRateHz={data.sample_rate_hz}
-            beatIndex={sessionBeat}
-            onBeatIndexChange={setSessionBeat}
-          />
+          {showVectorMode ? (
+            <div className="vector-sections-row">
+              <VectorReviewSection
+                title="Calibration Vectorcardiography"
+                beatIndex={calibrationBeat}
+                beatCount={data.calibration.beats.count}
+                data={calibrationVector}
+                loading={loadingCalibrationVector}
+                movementPercent={calibrationVectorMovement}
+                onBeatIndexChange={setCalibrationBeat}
+                onMovementPercentChange={setCalibrationVectorMovement}
+              />
+              <VectorReviewSection
+                title="Session Vectorcardiography"
+                beatIndex={sessionBeat}
+                beatCount={data.session.beats.count}
+                data={sessionVector}
+                loading={loadingSessionVector}
+                movementPercent={sessionVectorMovement}
+                onBeatIndexChange={setSessionBeat}
+                onMovementPercentChange={setSessionVectorMovement}
+              />
+            </div>
+          ) : (
+            <>
+              <ReviewSectionCard
+                title="Calibration Signal"
+                section={data.calibration}
+                sampleRateHz={data.sample_rate_hz}
+                beatIndex={calibrationBeat}
+                onBeatIndexChange={setCalibrationBeat}
+              />
+              <SessionReviewCard
+                section={data.session}
+                sampleRateHz={data.sample_rate_hz}
+                beatIndex={sessionBeat}
+                onBeatIndexChange={setSessionBeat}
+              />
+            </>
+          )}
         </div>
       )}
     </main>

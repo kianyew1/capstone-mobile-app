@@ -1540,6 +1540,24 @@ class ReviewSessionWindowResponse(BaseModel):
     session: ReviewSection
 
 
+class VectorBeatResponse(BaseModel):
+    record_id: str
+    section: str
+    sample_rate_hz: int
+    beat_count: int
+    beat_index: int
+    start_sample: int
+    end_sample: int
+    exclude_from_analysis: bool = False
+    exclusion_reasons: List[str] = Field(default_factory=list)
+    qr_duration_ms: Optional[float] = None
+    markers: BeatMarkers
+    max_abs_lead_i: float = 0.0
+    max_abs_lead_ii: float = 0.0
+    lead_i: List[float] = Field(default_factory=list)
+    lead_ii: List[float] = Field(default_factory=list)
+
+
 class SessionSignalQualityResponse(BaseModel):
     record_id: str
     session_id: Optional[str] = None
@@ -2414,6 +2432,73 @@ async def review_session_window(
         channel=selected_channel,
         sample_rate_hz=sample_rate_hz,
         session=ReviewSection(**session_window),
+    )
+
+
+@app.get("/review/{record_id}/vector_beat", response_model=VectorBeatResponse)
+async def review_vector_beat(
+    record_id: str,
+    section: str = "calibration",
+    beat_index: int = 1,
+) -> VectorBeatResponse:
+    selected_section = (section or "calibration").lower()
+    if selected_section not in {"calibration", "session"}:
+        raise HTTPException(status_code=400, detail="Invalid section.")
+
+    logger.info(
+        "[VECTOR] request record_id=%s section=%s beat_index=%s",
+        record_id,
+        selected_section,
+        beat_index,
+    )
+
+    lead_i_artifact = _load_review_artifact(record_id, "CH2")
+    lead_ii_artifact = _load_review_artifact(record_id, "CH3")
+    sample_rate_hz = int(lead_i_artifact.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
+
+    lead_i_section = lead_i_artifact.get(selected_section, {})
+    lead_ii_section = lead_ii_artifact.get(selected_section, {})
+    lead_i_signal = lead_i_section.get("signal", {}).get("full", []) or []
+    lead_ii_signal = lead_ii_section.get("signal", {}).get("full", []) or []
+    max_abs_lead_i = max((abs(float(value)) for value in lead_i_signal), default=0.0)
+    max_abs_lead_ii = max((abs(float(value)) for value in lead_ii_signal), default=0.0)
+    beats = lead_i_section.get("beats", {}).get("items", []) or []
+    beat_count = len(beats)
+    if beat_count == 0:
+        raise HTTPException(status_code=404, detail="No beats available for vector visualization.")
+
+    bounded_index = max(1, min(beat_index, beat_count))
+    beat = next((item for item in beats if int(item.get("index", 0)) == bounded_index), beats[0])
+    start_sample = int(beat.get("start_sample") or 1)
+    end_sample = int(beat.get("end_sample") or start_sample)
+
+    lead_i = lead_i_signal[max(0, start_sample - 1) : max(0, end_sample)]
+    lead_ii = lead_ii_signal[max(0, start_sample - 1) : max(0, end_sample)]
+
+    logger.info(
+        "[VECTOR] response record_id=%s section=%s beat_index=%s samples=%s excluded=%s",
+        record_id,
+        selected_section,
+        bounded_index,
+        min(len(lead_i), len(lead_ii)),
+        bool(beat.get("exclude_from_analysis")),
+    )
+    return VectorBeatResponse(
+        record_id=record_id,
+        section=selected_section,
+        sample_rate_hz=sample_rate_hz,
+        beat_count=beat_count,
+        beat_index=int(beat.get("index") or bounded_index),
+        start_sample=start_sample,
+        end_sample=end_sample,
+        exclude_from_analysis=bool(beat.get("exclude_from_analysis")),
+        exclusion_reasons=list(beat.get("exclusion_reasons", []) or []),
+        qr_duration_ms=_sanitize_float(beat.get("qr_duration_ms")),
+        markers=BeatMarkers(**(beat.get("markers", {}) or {})),
+        max_abs_lead_i=max_abs_lead_i,
+        max_abs_lead_ii=max_abs_lead_ii,
+        lead_i=[float(value) for value in lead_i],
+        lead_ii=[float(value) for value in lead_ii],
     )
 
 

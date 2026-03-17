@@ -130,6 +130,10 @@
   - each beat now stores `exclusion_reasons`, `qr_duration_samples`, and `qr_duration_ms`
   - each section now stores included/excluded beat counts and excluded reason totals
   - React beat charts show a grey overlay when the selected beat is excluded
+- Added lightweight vectorcardiography beat visualization:
+  - backend endpoint `GET /review/{record_id}/vector_beat` slices Lead I from CH2 and Lead II from CH3 using CH2 beat bounds
+  - React review page now shows large calibration/session 2D morphology plots with beat controls on the right
+  - vector sections reuse the same beat selectors and exclusion overlay logic
 
 ## Next Verification
 
