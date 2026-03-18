@@ -31,6 +31,8 @@ const DESIRED_MTU = 247;
 let bleManagerInstance: BleManager | null = null;
 let ecgSubscription: Subscription | null = null;
 let ecgListener: ((payloadBase64: string) => void) | null = null;
+let ecgTransactionId: string | null = null;
+let ecgMonitorDeviceId: string | null = null;
 let lastEcgPacketAtMs = 0;
 let lastEcgPayload: string | null = null;
 const MIN_ECG_PACKET_INTERVAL_MS = 10;
@@ -454,6 +456,10 @@ export function useBluetoothService() {
             disconnectedDevice?.name,
             disconnectError,
           );
+          ecgListener = null;
+          ecgSubscription = null;
+          ecgTransactionId = null;
+          ecgMonitorDeviceId = null;
           setConnectedDevice(null);
           setConnectionStatus("disconnected");
         });
@@ -474,6 +480,9 @@ export function useBluetoothService() {
   const disconnectDevice = useCallback(async (): Promise<void> => {
     try {
       ecgListener = null;
+      ecgSubscription = null;
+      ecgTransactionId = null;
+      ecgMonitorDeviceId = null;
 
       // Mock mode: Simulate disconnection
       if (ENABLE_MOCK_MODE) {
@@ -539,10 +548,6 @@ export function useBluetoothService() {
 
   const stopEcgNotifications = useCallback(() => {
     ecgListener = null;
-    if (ecgSubscription) {
-      ecgSubscription.remove();
-      ecgSubscription = null;
-    }
     if (mockEcgInterval) {
       clearInterval(mockEcgInterval);
       mockEcgInterval = null;
@@ -628,9 +633,19 @@ export function useBluetoothService() {
       ecgListener = onData;
 
       if (ecgSubscription) {
-        ecgSubscription.remove();
+        if (ecgMonitorDeviceId === device.id) {
+          return true;
+        }
+        // If a stale subscription remains for another device, drop the JS refs
+        // and let the old native subscription die with the device connection.
         ecgSubscription = null;
+        ecgTransactionId = null;
+        ecgMonitorDeviceId = null;
       }
+
+      const transactionId = `ecg-monitor-${device.id}-${Date.now()}`;
+      ecgTransactionId = transactionId;
+      ecgMonitorDeviceId = device.id;
 
       ecgSubscription = device.monitorCharacteristicForService(
         ECG_SERVICE_UUID,
@@ -640,6 +655,8 @@ export function useBluetoothService() {
             console.error("ECG monitor error:", monitorError);
             setError(monitorError.message);
             ecgSubscription = null;
+            ecgTransactionId = null;
+            ecgMonitorDeviceId = null;
             return;
           }
 
@@ -665,6 +682,7 @@ export function useBluetoothService() {
             ecgListener?.(payload);
           }
         },
+        transactionId,
       );
 
       return true;

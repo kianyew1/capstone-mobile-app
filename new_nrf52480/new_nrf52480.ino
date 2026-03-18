@@ -623,6 +623,8 @@ bool initADS1298() {
       Serial.println("  ✓ ADS1298 detected");
     } else if ((deviceID & 0xF8) == 0x90) {
       Serial.println("  ✓ ADS1296 detected");
+    } else if ((deviceID & 0xF8) == 0x80) {
+      Serial.println("  ask jean what is this");
     } else if ((deviceID & 0xF8) == 0x88) {
       Serial.println("  ✓ ADS1294 detected");
     } else {
