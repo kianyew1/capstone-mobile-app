@@ -97,6 +97,24 @@ type VectorBeatResponse = {
   lead_ii: number[];
 };
 
+type Vector3DBeatResponse = {
+  record_id: string;
+  section: "calibration" | "session";
+  sample_rate_hz: number;
+  beat_count: number;
+  beat_index: number;
+  start_sample: number;
+  end_sample: number;
+  exclude_from_analysis: boolean;
+  exclusion_reasons: string[];
+  qr_duration_ms: number | null;
+  markers: BeatMarkers;
+  image_png_base64: string;
+  progress_percent: number;
+  y_min_mv: number;
+  y_max_mv: number;
+};
+
 type LiveMarkers = {
   P: number[];
   Q: number[];
@@ -129,7 +147,7 @@ type LiveResponse = {
 };
 
 const CHANNELS = ["CH2", "CH3", "CH4"] as const;
-const REVIEW_MODES = ["CH2", "CH3", "CH4", "Vectorcardiography"] as const;
+const REVIEW_MODES = ["CH2", "CH3", "CH4", "Vectorcardiography", "3D Vectorgraphy"] as const;
 const DEFAULT_ECG_Y_MAX_MV = 0.6;
 const DEFAULT_ECG_Y_MIN_MV = -0.3;
 const BEAT_MARKER_COLORS: Record<keyof BeatMarkers, string> = {
@@ -773,6 +791,52 @@ function VectorLoopChart({
   );
 }
 
+function Vector3DChart({
+  title,
+  data,
+}: {
+  title: string;
+  data: Vector3DBeatResponse | null;
+}) {
+  if (!data) {
+    return (
+      <div className="chart-card vector-card">
+        <div className="card-header">
+          <h3>{title}</h3>
+        </div>
+        <div className="empty-state">No 3D vector beat available.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="chart-card vector-card">
+      <div className="card-header">
+        <div>
+          <h3>{title}</h3>
+          <span className="chart-subtitle">X = CH2 | Y = CH4 | Z = CH3</span>
+        </div>
+        <span>{`Progress ${data.progress_percent}%`}</span>
+      </div>
+      <div className="vector3d-frame">
+        <img
+          className="vector3d-image"
+          src={`data:image/png;base64,${data.image_png_base64}`}
+          alt={`${title} 3D vectorgraphy`}
+        />
+        {data.exclude_from_analysis ? (
+          <div className="vector3d-overlay">
+            <span className="vector3d-overlay-title">Excluded from analysis</span>
+            {data.qr_duration_ms !== null ? (
+              <span className="vector3d-overlay-subtitle">{`Q-R ${data.qr_duration_ms.toFixed(1)} ms`}</span>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function VectorReviewSection({
   title,
   beatIndex,
@@ -858,6 +922,115 @@ function VectorReviewSection({
               <span className="vector-slider-value">{movementPercent}%</span>
             </div>
             {loading ? <div className="section-loading">Loading vector beat...</div> : null}
+            {data?.exclude_from_analysis ? (
+              <div className="status-panel">Excluded from analysis: {data.exclusion_reasons.join(", ")}</div>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function Vector3DReviewSection({
+  title,
+  beatIndex,
+  beatCount,
+  data,
+  loading,
+  movementPercent,
+  onBeatIndexChange,
+  onMovementPercentChange,
+}: {
+  title: string;
+  beatIndex: number;
+  beatCount: number;
+  data: Vector3DBeatResponse | null;
+  loading: boolean;
+  movementPercent: number;
+  onBeatIndexChange: (value: number) => void;
+  onMovementPercentChange: (value: number) => void;
+}) {
+  const [draftMovementPercent, setDraftMovementPercent] = useState(movementPercent);
+
+  useEffect(() => {
+    setDraftMovementPercent(movementPercent);
+  }, [movementPercent]);
+
+  function commitMovementPercent(nextValue: number) {
+    const boundedValue = Math.min(Math.max(nextValue, 1), 100);
+    setDraftMovementPercent(boundedValue);
+    if (boundedValue !== movementPercent) {
+      onMovementPercentChange(boundedValue);
+    }
+  }
+
+  return (
+    <section className="review-section">
+      <div className="section-header">
+        <div>
+          <h2>{title}</h2>
+          <p className="meta-line">3D beat morphology rendered with Matplotlib using CH2 as X, CH4 as Y, and CH3 as Z.</p>
+        </div>
+      </div>
+      <div className="vector-section-grid">
+        <div className="signal-column">
+          <Vector3DChart title={`${title} Morphology`} data={data} />
+          <div className="chart-card vector-controls-row-card">
+            <div className="vector-controls-header">
+              <strong>{`${title} Beat Selector`}</strong>
+              <span>{`Beat ${Math.min(Math.max(beatIndex, 1), Math.max(beatCount, 1))} of ${Math.max(beatCount, 1)}`}</span>
+            </div>
+            <div className="window-controls compact-controls compact-controls-centered">
+              <button
+                className="window-button"
+                disabled={beatCount <= 0 || beatIndex <= 1}
+                onClick={() => onBeatIndexChange(Math.max(1, beatIndex - 1))}
+              >
+                Prev Beat
+              </button>
+              <label className="beat-input window-input">
+                <input
+                  type="number"
+                  min={1}
+                  max={Math.max(beatCount, 1)}
+                  value={Math.min(Math.max(beatIndex, 1), Math.max(beatCount, 1))}
+                  onChange={(event) =>
+                    onBeatIndexChange(
+                      Math.min(Math.max(Number(event.target.value) || 1, 1), Math.max(beatCount, 1)),
+                    )
+                  }
+                />
+              </label>
+              <button
+                className="window-button"
+                disabled={beatCount <= 0 || beatIndex >= beatCount}
+                onClick={() => onBeatIndexChange(Math.min(beatCount, beatIndex + 1))}
+              >
+                Next Beat
+              </button>
+            </div>
+            <div className="vector-slider-row">
+              <label className="vector-slider-label" htmlFor={`${title}-3d-movement`}>
+                Vector movement
+              </label>
+              <input
+                id={`${title}-3d-movement`}
+                className="vector-slider"
+                type="range"
+                min={1}
+                max={100}
+                step={1}
+                value={draftMovementPercent}
+                onChange={(event) => setDraftMovementPercent(Number(event.target.value) || 1)}
+                onMouseUp={(event) => commitMovementPercent(Number((event.target as HTMLInputElement).value) || 1)}
+                onTouchEnd={(event) => commitMovementPercent(Number((event.target as HTMLInputElement).value) || 1)}
+                onKeyUp={(event) => commitMovementPercent(Number((event.target as HTMLInputElement).value) || 1)}
+                onBlur={(event) => commitMovementPercent(Number((event.target as HTMLInputElement).value) || 1)}
+              />
+              <span className="vector-slider-value">{draftMovementPercent}%</span>
+            </div>
+            {loading ? <div className="section-loading">Loading 3D vector beat...</div> : null}
             {data?.exclude_from_analysis ? (
               <div className="status-panel">Excluded from analysis: {data.exclusion_reasons.join(", ")}</div>
             ) : null}
@@ -1099,13 +1272,20 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
   const [sessionBeat, setSessionBeat] = useState(1);
   const [calibrationVector, setCalibrationVector] = useState<VectorBeatResponse | null>(null);
   const [sessionVector, setSessionVector] = useState<VectorBeatResponse | null>(null);
+  const [calibrationVector3d, setCalibrationVector3d] = useState<Vector3DBeatResponse | null>(null);
+  const [sessionVector3d, setSessionVector3d] = useState<Vector3DBeatResponse | null>(null);
   const [loadingCalibrationVector, setLoadingCalibrationVector] = useState(false);
   const [loadingSessionVector, setLoadingSessionVector] = useState(false);
+  const [loadingCalibrationVector3d, setLoadingCalibrationVector3d] = useState(false);
+  const [loadingSessionVector3d, setLoadingSessionVector3d] = useState(false);
   const [calibrationVectorMovement, setCalibrationVectorMovement] = useState(100);
   const [sessionVectorMovement, setSessionVectorMovement] = useState(100);
 
-  const selectedChannel: (typeof CHANNELS)[number] = reviewMode === "Vectorcardiography" ? "CH2" : reviewMode;
+  const selectedChannel: (typeof CHANNELS)[number] =
+    reviewMode === "Vectorcardiography" || reviewMode === "3D Vectorgraphy" ? "CH2" : reviewMode;
   const showVectorMode = reviewMode === "Vectorcardiography";
+  const showVector3DMode = reviewMode === "3D Vectorgraphy";
+  const showWideVectorMode = showVectorMode || showVector3DMode;
 
   useEffect(() => {
     let active = true;
@@ -1219,6 +1399,106 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     };
   }, [data, sessionBeat, showVectorMode]);
 
+  useEffect(() => {
+    if (!data || !showVector3DMode) {
+      setCalibrationVector3d(null);
+      return;
+    }
+    const recordId = data.record_id;
+    let active = true;
+    async function loadCalibrationVector3d() {
+      setLoadingCalibrationVector3d(true);
+      const url = `/api/review/${recordId}/vector3d_beat?section=calibration&beat_index=${calibrationBeat}&progress_percent=${calibrationVectorMovement}&y_min_mv=${yMinMv}&y_max_mv=${yMaxMv}`;
+      console.log(`[VECTOR3D] GET ${url}`);
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`3D vector fetch failed: ${response.status} ${text}`);
+        }
+        const payload = (await response.json()) as Vector3DBeatResponse;
+        console.log(
+          `[VECTOR3D] response section=${payload.section} beat=${payload.beat_index}/${payload.beat_count} progress=${payload.progress_percent} excluded=${payload.exclude_from_analysis}`,
+        );
+        if (!active) return;
+        setCalibrationVector3d(payload);
+      } catch (err) {
+        if (!active) return;
+        console.error("[VECTOR3D] calibration error", err);
+        setCalibrationVector3d(null);
+      } finally {
+        if (active) setLoadingCalibrationVector3d(false);
+      }
+    }
+    void loadCalibrationVector3d();
+    return () => {
+      active = false;
+    };
+  }, [data, calibrationBeat, calibrationVectorMovement, showVector3DMode, yMinMv, yMaxMv]);
+
+  useEffect(() => {
+    if (!data || !showVector3DMode) {
+      setSessionVector3d(null);
+      return;
+    }
+    const recordId = data.record_id;
+    let active = true;
+    async function loadSessionVector3d() {
+      setLoadingSessionVector3d(true);
+      const url = `/api/review/${recordId}/vector3d_beat?section=session&beat_index=${sessionBeat}&progress_percent=${sessionVectorMovement}&y_min_mv=${yMinMv}&y_max_mv=${yMaxMv}`;
+      console.log(`[VECTOR3D] GET ${url}`);
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`3D vector fetch failed: ${response.status} ${text}`);
+        }
+        const payload = (await response.json()) as Vector3DBeatResponse;
+        console.log(
+          `[VECTOR3D] response section=${payload.section} beat=${payload.beat_index}/${payload.beat_count} progress=${payload.progress_percent} excluded=${payload.exclude_from_analysis}`,
+        );
+        if (!active) return;
+        setSessionVector3d(payload);
+      } catch (err) {
+        if (!active) return;
+        console.error("[VECTOR3D] session error", err);
+        setSessionVector3d(null);
+      } finally {
+        if (active) setLoadingSessionVector3d(false);
+      }
+    }
+    void loadSessionVector3d();
+    return () => {
+      active = false;
+    };
+  }, [data, sessionBeat, sessionVectorMovement, showVector3DMode, yMinMv, yMaxMv]);
+
+  useEffect(() => {
+    if (!data || !showVector3DMode) {
+      return;
+    }
+    const recordId = data.record_id;
+    const requests = [
+      `/api/review/${recordId}/vector3d_preload?section=calibration&start_beat_index=${calibrationBeat}&progress_percent=${calibrationVectorMovement}&y_min_mv=${yMinMv}&y_max_mv=${yMaxMv}`,
+      `/api/review/${recordId}/vector3d_preload?section=session&start_beat_index=${sessionBeat}&progress_percent=${sessionVectorMovement}&y_min_mv=${yMinMv}&y_max_mv=${yMaxMv}`,
+    ];
+    requests.forEach((url) => {
+      console.log(`[VECTOR3D] PRELOAD ${url}`);
+      void fetch(url, { method: "POST" }).catch((error) => {
+        console.error("[VECTOR3D] preload error", error);
+      });
+    });
+  }, [
+    data,
+    showVector3DMode,
+    calibrationBeat,
+    calibrationVectorMovement,
+    sessionBeat,
+    sessionVectorMovement,
+    yMinMv,
+    yMaxMv,
+  ]);
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -1259,10 +1539,10 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
       {error && <div className="status-panel error">{error}</div>}
 
       {!loading && !error && data && (
-        <div className={showVectorMode ? "content-stack vector-mode-content" : "content-stack"}>
+        <div className={showWideVectorMode ? "content-stack vector-mode-content" : "content-stack"}>
           <div className="record-meta">
             <span>Record ID: {data.record_id}</span>
-            <span>{showVectorMode ? "View: Vectorcardiography" : `Channel: ${data.channel}`}</span>
+            <span>{showVectorMode ? "View: Vectorcardiography" : showVector3DMode ? "View: 3D Vectorgraphy" : `Channel: ${data.channel}`}</span>
             <span>Sample Rate: {data.sample_rate_hz} Hz</span>
           </div>
           {showVectorMode ? (
@@ -1290,9 +1570,32 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
                 yMax={yMaxMv}
                 onBeatIndexChange={setSessionBeat}
                 onMovementPercentChange={setSessionVectorMovement}
-              />
-            </div>
-          ) : (
+                />
+              </div>
+            ) : showVector3DMode ? (
+              <div className="vector-sections-row">
+                <Vector3DReviewSection
+                  title="Calibration 3D Vectorgraphy"
+                  beatIndex={calibrationBeat}
+                  beatCount={data.calibration.beats.count}
+                  data={calibrationVector3d}
+                  loading={loadingCalibrationVector3d}
+                  movementPercent={calibrationVectorMovement}
+                  onBeatIndexChange={setCalibrationBeat}
+                  onMovementPercentChange={setCalibrationVectorMovement}
+                />
+                <Vector3DReviewSection
+                  title="Session 3D Vectorgraphy"
+                  beatIndex={sessionBeat}
+                  beatCount={data.session.beats.count}
+                  data={sessionVector3d}
+                  loading={loadingSessionVector3d}
+                  movementPercent={sessionVectorMovement}
+                  onBeatIndexChange={setSessionBeat}
+                  onMovementPercentChange={setSessionVectorMovement}
+                />
+              </div>
+            ) : (
             <>
               <ReviewSectionCard
                 title="Calibration Signal"
