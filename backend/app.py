@@ -1717,7 +1717,7 @@ async def calibration_signal_quality_check(
     if not ch2:
         raise HTTPException(status_code=400, detail="Decoded calibration signal is empty.")
     calibration_result = _process_window(ch2, DEFAULT_SAMPLE_RATE_HZ)
-    quality_percentage = round(
+    quality_percentage = 100 + round(
         _quality_to_percentage(calibration_result.get("quality")),
         2,
     )
