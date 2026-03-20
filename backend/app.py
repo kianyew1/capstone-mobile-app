@@ -50,12 +50,12 @@ LIVE_SESSION_STATE: Dict[str, Dict[str, Any]] = {}
 LIVE_SESSION_WINDOW_SECONDS = 10
 LIVE_SESSION_WINDOW_PACKETS = LIVE_SESSION_WINDOW_SECONDS * 20
 DEFAULT_SAMPLE_RATE_HZ = 500
-REVIEW_PROCESSING_VERSION = "review_v6"
+LIVE_VISUAL_DELAY_MS = 500
+REVIEW_PROCESSING_VERSION = "review_v7"
 REVIEW_ARTIFACT_CACHE: Dict[tuple[str, str, str], Dict[str, Any]] = {}
 VECTOR3D_IMAGE_CACHE: Dict[tuple[str, str, int, float, float, int], str] = {}
 VECTOR3D_PRELOAD_STATE: Dict[tuple[str, str, float, float, int], Dict[str, Any]] = {}
 VECTOR3D_PRELOAD_LOCK = threading.Lock()
-MAX_QR_MS = 40
 
 
 def _get_supabase_config() -> Dict[str, str]:
@@ -796,12 +796,9 @@ def _evaluate_beat_exclusion(
         if r_position >= q_position:
             qr_duration_samples = r_position - q_position
             qr_duration_ms = (qr_duration_samples / sample_rate_hz) * 1000.0
-            max_qr_samples = int(round((MAX_QR_MS / 1000.0) * sample_rate_hz))
-            if qr_duration_samples > max_qr_samples:
-                exclusion_reasons.append("qr_too_long")
 
     return {
-        "exclude_from_analysis": len(exclusion_reasons) > 0,
+        "exclude_from_analysis": False,
         "exclusion_reasons": exclusion_reasons,
         "qr_duration_samples": qr_duration_samples,
         "qr_duration_ms": qr_duration_ms,
@@ -1257,6 +1254,60 @@ def _live_session_status(state: Optional[Dict[str, Any]]) -> str:
     return "active" if bool(state.get("is_active")) else "ended"
 
 
+def _trim_live_visual_snapshot(
+    snapshot: Dict[str, Any],
+    window_seconds: float,
+) -> Dict[str, Any]:
+    sample_rate_hz = int(snapshot.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
+    channels = snapshot.get("channels") or {}
+    ch2 = list(channels.get("CH2") or [])
+    ch3 = list(channels.get("CH3") or [])
+    ch4 = list(channels.get("CH4") or [])
+    total_samples = min(len(ch2), len(ch3), len(ch4))
+    if total_samples <= 0:
+        trimmed_channels = {"CH2": [], "CH3": [], "CH4": []}
+        trimmed_markers = {"P": [], "Q": [], "R": [], "S": [], "T": []}
+        actual_window_seconds = 0.0
+    else:
+        requested_window_samples = max(1, int(round(window_seconds * sample_rate_hz)))
+        window_samples = min(total_samples, requested_window_samples)
+        start_index = total_samples - window_samples
+        trimmed_channels = {
+            "CH2": ch2[start_index:total_samples],
+            "CH3": ch3[start_index:total_samples],
+            "CH4": ch4[start_index:total_samples],
+        }
+        source_markers = snapshot.get("markers") or {}
+        trimmed_markers = {}
+        for label in ("P", "Q", "R", "S", "T"):
+            positions = list(source_markers.get(label) or [])
+            trimmed_markers[label] = [
+                int(position - start_index)
+                for position in positions
+                if start_index <= int(position) < total_samples
+            ]
+        actual_window_seconds = round(window_samples / sample_rate_hz, 3)
+
+    return {
+        "record_id": snapshot.get("record_id"),
+        "session_id": snapshot.get("session_id"),
+        "status": snapshot.get("status"),
+        "updated_at": snapshot.get("updated_at"),
+        "ended_at": snapshot.get("ended_at"),
+        "sample_rate_hz": sample_rate_hz,
+        "window_seconds": actual_window_seconds,
+        "delay_ms": LIVE_VISUAL_DELAY_MS,
+        "samples_per_channel": len(trimmed_channels["CH2"]),
+        "quality_percentage": float(snapshot.get("quality_percentage", 0.0)),
+        "signal_ok": bool(snapshot.get("signal_ok")),
+        "abnormal_detected": bool(snapshot.get("abnormal_detected")),
+        "reason_codes": list(snapshot.get("reason_codes") or []),
+        "heart_rate_bpm": snapshot.get("heart_rate_bpm"),
+        "channels": trimmed_channels,
+        "markers": trimmed_markers,
+    }
+
+
 def _set_job(job_id: str, **fields: Any) -> None:
     job = ANALYSIS_JOBS.get(job_id, {})
     job.update(fields)
@@ -1457,6 +1508,31 @@ class LiveSessionSnapshotResponse(BaseModel):
     signal: ReviewSignal
     markers: LiveSessionMarkers
     interval_related: Optional[ReviewIntervalRow] = None
+
+
+class LiveVisualChannels(BaseModel):
+    CH2: List[float] = Field(default_factory=list)
+    CH3: List[float] = Field(default_factory=list)
+    CH4: List[float] = Field(default_factory=list)
+
+
+class LiveSessionVisualResponse(BaseModel):
+    record_id: str
+    session_id: Optional[str] = None
+    status: str
+    updated_at: str
+    ended_at: Optional[str] = None
+    sample_rate_hz: int
+    window_seconds: float
+    delay_ms: int
+    samples_per_channel: int
+    quality_percentage: float
+    signal_ok: bool
+    abnormal_detected: bool
+    reason_codes: List[str]
+    heart_rate_bpm: Optional[float] = None
+    channels: LiveVisualChannels
+    markers: LiveSessionMarkers
 
 
 class SessionAnalysisJob(BaseModel):
@@ -1669,6 +1745,25 @@ async def session_signal_quality_check(
         "markers": markers,
         "interval_related": interval_related,
     }
+    state["visual_snapshot"] = {
+        "record_id": record_id,
+        "session_id": state.get("session_id"),
+        "status": _live_session_status(state),
+        "updated_at": updated_at,
+        "ended_at": state.get("ended_at"),
+        "sample_rate_hz": DEFAULT_SAMPLE_RATE_HZ,
+        "quality_percentage": quality_percentage,
+        "signal_ok": signal_ok,
+        "abnormal_detected": abnormal_detected,
+        "reason_codes": list(reason_codes),
+        "heart_rate_bpm": heart_rate_bpm,
+        "channels": {
+            "CH2": channels.get("CH2", []),
+            "CH3": channels.get("CH3", []),
+            "CH4": channels.get("CH4", []),
+        },
+        "markers": markers,
+    }
 
     response = SessionSignalQualityResponse(
         record_id=record_id,
@@ -1720,6 +1815,39 @@ async def session_live(record_id: Optional[str] = None) -> LiveSessionSnapshotRe
         snapshot.get("abnormal_detected"),
     )
     return LiveSessionSnapshotResponse(**snapshot)
+
+
+@app.get("/session/live/visual", response_model=LiveSessionVisualResponse)
+async def session_live_visual(
+    record_id: Optional[str] = None,
+    window_seconds: float = 8.0,
+) -> LiveSessionVisualResponse:
+    selected_record_id = record_id or _latest_live_record_id()
+    if not selected_record_id:
+        raise HTTPException(status_code=404, detail="No live session visualization available.")
+
+    state = LIVE_SESSION_STATE.get(selected_record_id)
+    snapshot = state.get("visual_snapshot") if state else None
+    if not isinstance(snapshot, dict):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No live session visualization available for record_id={selected_record_id}.",
+        )
+
+    bounded_window_seconds = min(
+        max(1.0, float(window_seconds)),
+        float(LIVE_SESSION_WINDOW_SECONDS),
+    )
+    payload = _trim_live_visual_snapshot(snapshot, bounded_window_seconds)
+    logger.info(
+        "[SESSION_LIVE_VISUAL] served record_id=%s updated_at=%s samples=%s window_seconds=%s status=%s",
+        selected_record_id,
+        payload.get("updated_at"),
+        payload.get("samples_per_channel"),
+        payload.get("window_seconds"),
+        payload.get("status"),
+    )
+    return LiveSessionVisualResponse(**payload)
 
 
 @app.post("/session/start", response_model=SessionStartResponse)
@@ -1856,6 +1984,11 @@ async def session_upload(record_id: str, request: Request) -> SessionUploadRespo
             snapshot["status"] = "ended"
             snapshot["ended_at"] = ended_at
             snapshot["updated_at"] = ended_at
+        visual_snapshot = state.get("visual_snapshot")
+        if isinstance(visual_snapshot, dict):
+            visual_snapshot["status"] = "ended"
+            visual_snapshot["ended_at"] = ended_at
+            visual_snapshot["updated_at"] = ended_at
     logger.info(
         "[SESSION_UPLOAD] response record_id=%s session_object_key=%s duration_ms=%s",
         response.record_id,

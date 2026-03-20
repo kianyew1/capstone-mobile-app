@@ -259,6 +259,38 @@ h1 {
   gap: 18px;
 }
 
+.live-dashboard-section {
+  padding-top: 18px;
+}
+
+.live-status-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.live-dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.live-quadrant-card {
+  padding: 16px;
+  border-radius: 20px;
+  background: linear-gradient(180deg, #fbfdfe 0%, #f2f7fb 100%);
+  border: 1px solid rgba(103, 141, 170, 0.18);
+}
+
+.live-canvas {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(248, 251, 253, 0.8), rgba(240, 246, 251, 0.92));
+}
+
 .vector-section-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -684,6 +716,7 @@ h1 {
 
 @media (max-width: 1200px) {
   .live-layout,
+  .live-dashboard-grid,
   .section-grid,
   .vector-sections-row {
     grid-template-columns: 1fr;
@@ -695,6 +728,10 @@ h1 {
 
   .interval-summary {
     grid-template-columns: repeat(2, minmax(140px, 1fr));
+  }
+
+  .live-status-strip {
+    grid-template-columns: repeat(2, minmax(160px, 1fr));
   }
 }
 
@@ -724,6 +761,10 @@ h1 {
   }
 
   .interval-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .live-status-strip {
     grid-template-columns: 1fr;
   }
 }
