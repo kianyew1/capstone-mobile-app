@@ -115,14 +115,6 @@ type Vector3DBeatResponse = {
   y_max_mv: number;
 };
 
-type LiveMarkers = {
-  P: number[];
-  Q: number[];
-  R: number[];
-  S: number[];
-  T: number[];
-};
-
 type LiveVisualResponse = {
   record_id: string;
   session_id: string | null;
@@ -130,27 +122,21 @@ type LiveVisualResponse = {
   updated_at: string;
   ended_at: string | null;
   sample_rate_hz: number;
-  window_seconds: number;
-  delay_ms: number;
-  samples_per_channel: number;
-  quality_percentage: number;
-  signal_ok: boolean;
-  abnormal_detected: boolean;
-  reason_codes: string[];
+  buffer_samples: number;
+  total_samples_received: number;
   heart_rate_bpm: number | null;
   channels: {
     CH2: number[];
     CH3: number[];
     CH4: number[];
   };
-  markers: LiveMarkers;
 };
 
 const CHANNELS = ["CH2", "CH3", "CH4"] as const;
 const REVIEW_MODES = ["CH2", "CH3", "CH4", "Vectorcardiography", "3D Vectorgraphy"] as const;
 const DEFAULT_ECG_Y_MAX_MV = 0.6;
 const DEFAULT_ECG_Y_MIN_MV = -0.3;
-const LIVE_VISUAL_WINDOW_SECONDS = 8;
+const LIVE_VISUAL_BUFFER_SAMPLES = 6000;
 const LIVE_FETCH_INTERVAL_MS = 500;
 const BEAT_MARKER_COLORS: Record<keyof BeatMarkers, string> = {
   P: "#1f7aec",
@@ -268,10 +254,6 @@ function createVectorLoopGeometry(
     axisY: mapY(0),
     points,
   };
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
 }
 
 function projectVector3DPoint(
@@ -523,7 +505,7 @@ function LiveWaveformCanvas({
         <h3>{title}</h3>
         <span>{samples.length} samples</span>
       </div>
-      <canvas ref={canvasRef} width={720} height={240} className="live-canvas" />
+      <canvas ref={canvasRef} width={720} height={180} className="live-canvas live-waveform-canvas" />
     </section>
   );
 }
@@ -599,12 +581,12 @@ function LiveVector3DCanvas({
   }, [xSamples, ySamples, zSamples, yMin, yMax]);
 
   return (
-    <section className="live-quadrant-card">
+    <section className="live-quadrant-card live-vector-card">
       <div className="card-header">
         <h3>3D Vectorcardiography</h3>
         <span>{Math.min(xSamples.length, ySamples.length, zSamples.length)} samples</span>
       </div>
-      <canvas ref={canvasRef} width={720} height={240} className="live-canvas" />
+      <canvas ref={canvasRef} width={720} height={720} className="live-canvas live-vector-canvas" />
     </section>
   );
 }
@@ -1734,18 +1716,6 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [pollingStopped, setPollingStopped] = useState(false);
-  const [snapshotReceivedAtMs, setSnapshotReceivedAtMs] = useState(0);
-  const [animationNowMs, setAnimationNowMs] = useState(0);
-
-  useEffect(() => {
-    let frameId = 0;
-    const animate = (now: number) => {
-      setAnimationNowMs(now);
-      frameId = window.requestAnimationFrame(animate);
-    };
-    frameId = window.requestAnimationFrame(animate);
-    return () => window.cancelAnimationFrame(frameId);
-  }, []);
 
   useEffect(() => {
     let active = true;
@@ -1757,7 +1727,6 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
       if (recordId) {
         query.set("record_id", recordId);
       }
-      query.set("window_seconds", String(LIVE_VISUAL_WINDOW_SECONDS));
       const url = `/api/session/live/visual?${query.toString()}`;
       console.log(`[LIVE] GET ${url}`);
       try {
@@ -1768,11 +1737,10 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
         }
         const payload = (await response.json()) as LiveVisualResponse;
         console.log(
-          `[LIVE] visual response recordId=${payload.record_id} status=${payload.status} samples=${payload.samples_per_channel} quality=${payload.quality_percentage.toFixed(2)} abnormal=${payload.abnormal_detected}`,
+          `[LIVE] visual response recordId=${payload.record_id} status=${payload.status} buffer=${payload.buffer_samples} total=${payload.total_samples_received} hr=${payload.heart_rate_bpm ?? "null"}`,
         );
         if (!active) return;
         setData(payload);
-        setSnapshotReceivedAtMs(performance.now());
         setError(null);
         if (payload.status === "ended") {
           stopped = true;
@@ -1788,7 +1756,7 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
         if (!active) return;
         setError(err instanceof Error ? err.message : "Unknown live session error");
       } finally {
-        if (active) {
+      if (active) {
           setLoading(false);
         }
       }
@@ -1814,44 +1782,40 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
     const nextUrl = next ? `/session?recordId=${encodeURIComponent(next)}` : "/session";
     window.history.replaceState({}, "", nextUrl);
     setRecordId(next);
+    setData(null);
     setLoading(true);
     setPollingStopped(false);
   };
 
   const playback = useMemo(() => {
     if (!data) return null;
-    const sampleRateHz = data.sample_rate_hz || 500;
-    const totalSamples = data.samples_per_channel || 0;
-    if (totalSamples <= 0) {
+    const currentCount = Math.min(
+      data.channels.CH2.length,
+      data.channels.CH3.length,
+      data.channels.CH4.length,
+      data.buffer_samples || LIVE_VISUAL_BUFFER_SAMPLES,
+    );
+    if (currentCount <= 0) {
       return {
         channels: {
           CH2: [] as number[],
           CH3: [] as number[],
           CH4: [] as number[],
         },
-        displayedSeconds: 0,
-        cursorSeconds: 0,
+        displayedSamples: 0,
       };
     }
-
-    const lagSamples = Math.round((data.delay_ms / 1000) * sampleRateHz);
-    const elapsedMs = data.status === "ended" ? data.delay_ms : Math.max(0, animationNowMs - snapshotReceivedAtMs);
-    const advancedSamples = Math.round((elapsedMs / 1000) * sampleRateHz);
-    const cursorEnd = clamp(totalSamples - lagSamples + advancedSamples, 1, totalSamples);
-    const windowSamples = Math.min(totalSamples, Math.max(1, Math.round(LIVE_VISUAL_WINDOW_SECONDS * sampleRateHz)));
-    const start = Math.max(0, cursorEnd - windowSamples);
-    const end = Math.max(start + 1, cursorEnd);
+    const currentChannels = {
+      CH2: data.channels.CH2.slice(-currentCount),
+      CH3: data.channels.CH3.slice(-currentCount),
+      CH4: data.channels.CH4.slice(-currentCount),
+    };
 
     return {
-      channels: {
-        CH2: data.channels.CH2.slice(start, end),
-        CH3: data.channels.CH3.slice(start, end),
-        CH4: data.channels.CH4.slice(start, end),
-      },
-      displayedSeconds: (end - start) / sampleRateHz,
-      cursorSeconds: end / sampleRateHz,
+      channels: currentChannels,
+      displayedSamples: currentCount,
     };
-  }, [animationNowMs, data, snapshotReceivedAtMs]);
+  }, [data]);
 
   return (
     <main className="app-shell live-dashboard-shell">
@@ -1890,47 +1854,42 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
           ) : null}
           <section className="review-section live-dashboard-section">
             <div className="live-status-strip">
-              <div className="summary-metric"><span>Buffered Delay</span><strong>{data.delay_ms} ms</strong></div>
-              <div className="summary-metric"><span>Visible Window</span><strong>{playback.displayedSeconds.toFixed(2)} s</strong></div>
-              <div className="summary-metric"><span>Quality</span><strong>{data.quality_percentage.toFixed(2)}%</strong></div>
-              <div className="summary-metric"><span>Signal OK</span><strong>{data.signal_ok ? "yes" : "no"}</strong></div>
-              <div className="summary-metric"><span>Abnormal</span><strong>{data.abnormal_detected ? "yes" : "no"}</strong></div>
+              <div className="summary-metric"><span>Buffer</span><strong>{data.buffer_samples} samples</strong></div>
               <div className="summary-metric"><span>Heart Rate</span><strong>{formatMetric(data.heart_rate_bpm, " bpm")}</strong></div>
-              <div className="summary-metric"><span>Cursor</span><strong>{playback.cursorSeconds.toFixed(2)} s</strong></div>
-              <div className="summary-metric reasons-metric">
-                <span>Reason Codes</span>
-                <strong>{data.reason_codes.length > 0 ? data.reason_codes.join(", ") : "none"}</strong>
-              </div>
             </div>
-            <div className="live-dashboard-grid">
-              <LiveWaveformCanvas
-                title="CH2"
-                samples={playback.channels.CH2}
-                sampleRateHz={data.sample_rate_hz}
-                yMin={DEFAULT_ECG_Y_MIN_MV}
-                yMax={DEFAULT_ECG_Y_MAX_MV}
-              />
-              <LiveWaveformCanvas
-                title="CH3"
-                samples={playback.channels.CH3}
-                sampleRateHz={data.sample_rate_hz}
-                yMin={DEFAULT_ECG_Y_MIN_MV}
-                yMax={DEFAULT_ECG_Y_MAX_MV}
-              />
-              <LiveWaveformCanvas
-                title="CH4"
-                samples={playback.channels.CH4}
-                sampleRateHz={data.sample_rate_hz}
-                yMin={DEFAULT_ECG_Y_MIN_MV}
-                yMax={DEFAULT_ECG_Y_MAX_MV}
-              />
-              <LiveVector3DCanvas
-                xSamples={playback.channels.CH2}
-                ySamples={playback.channels.CH4}
-                zSamples={playback.channels.CH3}
-                yMin={DEFAULT_ECG_Y_MIN_MV}
-                yMax={DEFAULT_ECG_Y_MAX_MV}
-              />
+            <div className="live-dashboard-main">
+              <div className="live-waveform-stack">
+                <LiveWaveformCanvas
+                  title="CH2"
+                  samples={playback.channels.CH2}
+                  sampleRateHz={data.sample_rate_hz}
+                  yMin={DEFAULT_ECG_Y_MIN_MV}
+                  yMax={DEFAULT_ECG_Y_MAX_MV}
+                />
+                <LiveWaveformCanvas
+                  title="CH3"
+                  samples={playback.channels.CH3}
+                  sampleRateHz={data.sample_rate_hz}
+                  yMin={DEFAULT_ECG_Y_MIN_MV}
+                  yMax={DEFAULT_ECG_Y_MAX_MV}
+                />
+                <LiveWaveformCanvas
+                  title="CH4"
+                  samples={playback.channels.CH4}
+                  sampleRateHz={data.sample_rate_hz}
+                  yMin={DEFAULT_ECG_Y_MIN_MV}
+                  yMax={DEFAULT_ECG_Y_MAX_MV}
+                />
+              </div>
+              <div className="live-vector-panel">
+                <LiveVector3DCanvas
+                  xSamples={playback.channels.CH2}
+                  ySamples={playback.channels.CH4}
+                  zSamples={playback.channels.CH3}
+                  yMin={DEFAULT_ECG_Y_MIN_MV}
+                  yMax={DEFAULT_ECG_Y_MAX_MV}
+                />
+              </div>
             </div>
           </section>
         </div>

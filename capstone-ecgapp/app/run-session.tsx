@@ -292,7 +292,7 @@ export default function RunSessionScreen() {
 
     sessionCheckTimerRef.current = setInterval(() => {
       void flushSessionCheck();
-    }, 2000);
+    }, 500);
 
     return () => {
       if (sessionCheckTimerRef.current) {

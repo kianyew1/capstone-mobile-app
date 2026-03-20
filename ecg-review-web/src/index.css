@@ -265,14 +265,22 @@ h1 {
 
 .live-status-strip {
   display: grid;
-  grid-template-columns: repeat(4, minmax(180px, 1fr));
+  grid-template-columns: repeat(2, minmax(180px, 220px));
   gap: 12px;
   margin-bottom: 18px;
 }
 
-.live-dashboard-grid {
+.live-dashboard-main {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1.1fr) minmax(420px, 0.9fr);
+  gap: 18px;
+  align-items: stretch;
+}
+
+.live-waveform-stack,
+.live-vector-panel {
+  display: flex;
+  flex-direction: column;
   gap: 18px;
 }
 
@@ -289,6 +297,19 @@ h1 {
   display: block;
   border-radius: 16px;
   background: linear-gradient(180deg, rgba(248, 251, 253, 0.8), rgba(240, 246, 251, 0.92));
+}
+
+.live-waveform-canvas {
+  min-height: 180px;
+}
+
+.live-vector-card {
+  height: 100%;
+}
+
+.live-vector-canvas {
+  aspect-ratio: 1 / 1;
+  min-height: 540px;
 }
 
 .vector-section-grid {
@@ -716,7 +737,7 @@ h1 {
 
 @media (max-width: 1200px) {
   .live-layout,
-  .live-dashboard-grid,
+  .live-dashboard-main,
   .section-grid,
   .vector-sections-row {
     grid-template-columns: 1fr;
