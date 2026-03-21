@@ -91,6 +91,12 @@ type VectorBeatResponse = {
   exclusion_reasons: string[];
   qr_duration_ms: number | null;
   markers: BeatMarkers;
+  max_abs_lead_x: number;
+  max_abs_lead_y: number;
+  max_abs_lead_z: number;
+  lead_x: number[];
+  lead_y: number[];
+  lead_z: number[];
   max_abs_lead_i: number;
   max_abs_lead_ii: number;
   lead_i: number[];
@@ -133,7 +139,7 @@ type LiveVisualResponse = {
 };
 
 const CHANNELS = ["CH2", "CH3", "CH4"] as const;
-const REVIEW_MODES = ["CH2", "CH3", "CH4", "Vectorcardiography", "3D Vectorgraphy"] as const;
+const REVIEW_MODES = ["CH2", "CH3", "CH4", "2D Vectorcardiography", "3D Vectorgraphy"] as const;
 const DEFAULT_ECG_Y_MAX_MV = 0.6;
 const DEFAULT_ECG_Y_MIN_MV = -0.3;
 const LIVE_VISUAL_BUFFER_SAMPLES = 6000;
@@ -285,6 +291,23 @@ function projectVector3DPoint(
     y: height / 2 - y1 * scale * perspective,
     depth: z2,
   };
+}
+
+function blendRollingBuffer(previous: number[], current: number[], shiftSamples: number): number[] {
+  if (!current.length) {
+    return [];
+  }
+  if (!previous.length || previous.length !== current.length) {
+    return current;
+  }
+  const boundedShift = Math.min(Math.max(Math.round(shiftSamples), 0), current.length);
+  if (boundedShift <= 0) {
+    return previous;
+  }
+  if (boundedShift >= current.length) {
+    return current;
+  }
+  return previous.slice(boundedShift).concat(current.slice(current.length - boundedShift));
 }
 
 function TopNav({ currentPath }: { currentPath: string }) {
@@ -745,31 +768,43 @@ function IntervalSummary({ row }: { row: ReviewIntervalRow | null }) {
   );
 }
 
-function VectorLoopChart({
+function VectorPlaneChart({
   title,
-  data,
+  subtitle,
+  xAxisLabel,
+  yAxisLabel,
+  xSamples,
+  ySamples,
+  markers,
   progressPercent,
   yMin,
   yMax,
+  excluded,
+  qrDurationMs,
 }: {
   title: string;
-  data: VectorBeatResponse | null;
+  subtitle: string;
+  xAxisLabel: string;
+  yAxisLabel: string;
+  xSamples: number[];
+  ySamples: number[];
+  markers: BeatMarkers;
   progressPercent: number;
   yMin: number;
   yMax: number;
+  excluded: boolean;
+  qrDurationMs: number | null;
 }) {
   const width = 970;
-  const height = 666;
+  const height = 420;
   const margin = { top: 20, right: 28, bottom: 72, left: 72 };
   const plotWidth = width - margin.left - margin.right;
   const plotHeight = height - margin.top - margin.bottom;
-  const leadI = data?.lead_i ?? [];
-  const leadII = data?.lead_ii ?? [];
   const axisMin = yMin;
   const axisMax = yMax;
   const { path, axisX, axisY, points } = useMemo(
-    () => createVectorLoopGeometry(leadI, leadII, plotWidth, plotHeight, axisMin, axisMax),
-    [leadI, leadII, plotWidth, plotHeight, axisMin, axisMax],
+    () => createVectorLoopGeometry(xSamples, ySamples, plotWidth, plotHeight, axisMin, axisMax),
+    [xSamples, ySamples, plotWidth, plotHeight, axisMin, axisMax],
   );
   const axisSpan = axisMax - axisMin || 1;
   const axisTicks = createTicks(axisMin, axisMax, 5);
@@ -781,27 +816,17 @@ function VectorLoopChart({
     .slice(0, visiblePointCount)
     .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
     .join(" ");
-  if (!data) {
-    return (
-      <div className="chart-card vector-card">
-        <div className="card-header">
-          <h3>{title}</h3>
-        </div>
-        <div className="empty-state">No vector beat available.</div>
-      </div>
-    );
-  }
 
   return (
-    <div className="chart-card vector-card">
+    <div className="chart-card vector-plane-card">
       <div className="card-header">
         <div>
           <h3>{title}</h3>
-          <span className="chart-subtitle">X = Lead I (CH2) | Y = Lead II (CH3)</span>
+          <span className="chart-subtitle">{subtitle}</span>
         </div>
-        <span>{Math.min(data.lead_i.length, data.lead_ii.length)} samples</span>
+        <span>{Math.min(xSamples.length, ySamples.length)} samples</span>
       </div>
-      <svg viewBox={`0 0 ${width} ${height}`} className="vector-chart">
+      <svg viewBox={`0 0 ${width} ${height}`} className="vector-plane-chart">
         {axisTicks.map((tickValue, index) => {
           const x = margin.left + ((tickValue - axisMin) / axisSpan) * plotWidth;
           return (
@@ -825,7 +850,7 @@ function VectorLoopChart({
           );
         })}
         <text x={margin.left + plotWidth / 2} y={height - 8} textAnchor="middle" className="axis-unit-label">
-          Lead I / CH2 (mV)
+          {xAxisLabel}
         </text>
         <text
           x={20}
@@ -834,14 +859,14 @@ function VectorLoopChart({
           transform={`rotate(-90 20 ${margin.top + plotHeight / 2})`}
           className="axis-unit-label"
         >
-          Lead II / CH3 (mV)
+          {yAxisLabel}
         </text>
         <g transform={`translate(${margin.left} ${margin.top})`}>
           <line x1={axisX} y1={0} x2={axisX} y2={plotHeight} className="grid-line" />
           <line x1={0} y1={axisY} x2={plotWidth} y2={axisY} className="grid-line" />
           <path d={visiblePath || path} className="signal-path vector-path" />
         </g>
-        {(Object.entries(data.markers) as Array<[keyof BeatMarkers, number[]]>).map(([label, positions]) =>
+        {(Object.entries(markers) as Array<[keyof BeatMarkers, number[]]>).map(([label, positions]) =>
           (["P", "Q", "R", "S", "T"] as Array<keyof BeatMarkers>).includes(label)
             ? positions.map((position, idx) => {
                 if (position >= visiblePointCount) return null;
@@ -858,20 +883,83 @@ function VectorLoopChart({
               })
             : null,
         )}
-        {data.exclude_from_analysis ? (
+        {excluded ? (
           <g>
             <rect x={margin.left} y={margin.top} width={plotWidth} height={plotHeight} className="excluded-overlay" />
             <text x={width / 2} y={height / 2 - 10} textAnchor="middle" className="excluded-overlay-text">
               Excluded from analysis
             </text>
-            {data.qr_duration_ms !== null ? (
+            {qrDurationMs !== null ? (
               <text x={width / 2} y={height / 2 + 14} textAnchor="middle" className="excluded-overlay-subtext">
-                {`Q-R ${data.qr_duration_ms.toFixed(1)} ms`}
+                {`Q-R ${qrDurationMs.toFixed(1)} ms`}
               </text>
             ) : null}
           </g>
         ) : null}
       </svg>
+    </div>
+  );
+}
+
+function VectorPlaneStack({
+  data,
+  progressPercent,
+  yMin,
+  yMax,
+}: {
+  data: VectorBeatResponse | null;
+  progressPercent: number;
+  yMin: number;
+  yMax: number;
+}) {
+  if (!data) {
+    return <div className="empty-state">No vector beat available.</div>;
+  }
+
+  return (
+    <div className="vector-plane-stack">
+      <VectorPlaneChart
+        title="Frontal Plane (X-Z)"
+        subtitle="X = CH2 | Z = CH3"
+        xAxisLabel="X / CH2 (mV)"
+        yAxisLabel="Z / CH3 (mV)"
+        xSamples={data.lead_x}
+        ySamples={data.lead_z}
+        markers={data.markers}
+        progressPercent={progressPercent}
+        yMin={yMin}
+        yMax={yMax}
+        excluded={data.exclude_from_analysis}
+        qrDurationMs={data.qr_duration_ms}
+      />
+      <VectorPlaneChart
+        title="Transverse Plane (X-Y)"
+        subtitle="X = CH2 | Y = CH4"
+        xAxisLabel="X / CH2 (mV)"
+        yAxisLabel="Y / CH4 (mV)"
+        xSamples={data.lead_x}
+        ySamples={data.lead_y}
+        markers={data.markers}
+        progressPercent={progressPercent}
+        yMin={yMin}
+        yMax={yMax}
+        excluded={data.exclude_from_analysis}
+        qrDurationMs={data.qr_duration_ms}
+      />
+      <VectorPlaneChart
+        title="Sagittal Plane (Y-Z)"
+        subtitle="Y = CH4 | Z = CH3"
+        xAxisLabel="Y / CH4 (mV)"
+        yAxisLabel="Z / CH3 (mV)"
+        xSamples={data.lead_y}
+        ySamples={data.lead_z}
+        markers={data.markers}
+        progressPercent={progressPercent}
+        yMin={yMin}
+        yMax={yMax}
+        excluded={data.exclude_from_analysis}
+        qrDurationMs={data.qr_duration_ms}
+      />
     </div>
   );
 }
@@ -950,12 +1038,12 @@ function VectorReviewSection({
       <div className="section-header">
         <div>
           <h2>{title}</h2>
-          <p className="meta-line">2D beat morphology from Lead I (CH2) and Lead II (CH3).</p>
+          <p className="meta-line">Three 2D vector planes derived from the shared X/Y/Z beat axes.</p>
         </div>
       </div>
       <div className="vector-section-grid">
         <div className="signal-column">
-          <VectorLoopChart title={`${title} Morphology`} data={data} progressPercent={movementPercent} yMin={yMin} yMax={yMax} />
+          <VectorPlaneStack data={data} progressPercent={movementPercent} yMin={yMin} yMax={yMax} />
           <div className="chart-card vector-controls-row-card">
             <div className="vector-controls-header">
               <strong>{`${title} Beat Selector`}</strong>
@@ -1367,8 +1455,8 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
   const [sessionVectorMovement, setSessionVectorMovement] = useState(100);
 
   const selectedChannel: (typeof CHANNELS)[number] =
-    reviewMode === "Vectorcardiography" || reviewMode === "3D Vectorgraphy" ? "CH2" : reviewMode;
-  const showVectorMode = reviewMode === "Vectorcardiography";
+    reviewMode === "2D Vectorcardiography" || reviewMode === "3D Vectorgraphy" ? "CH2" : reviewMode;
+  const showVectorMode = reviewMode === "2D Vectorcardiography";
   const showVector3DMode = reviewMode === "3D Vectorgraphy";
   const showWideVectorMode = showVectorMode || showVector3DMode;
 
@@ -1627,13 +1715,13 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
         <div className={showWideVectorMode ? "content-stack vector-mode-content" : "content-stack"}>
           <div className="record-meta">
             <span>Record ID: {data.record_id}</span>
-            <span>{showVectorMode ? "View: Vectorcardiography" : showVector3DMode ? "View: 3D Vectorgraphy" : `Channel: ${data.channel}`}</span>
+            <span>{showVectorMode ? "View: 2D Vectorcardiography" : showVector3DMode ? "View: 3D Vectorgraphy" : `Channel: ${data.channel}`}</span>
             <span>Sample Rate: {data.sample_rate_hz} Hz</span>
           </div>
           {showVectorMode ? (
             <div className="vector-sections-row">
               <VectorReviewSection
-                title="Calibration Vectorcardiography"
+                title="Calibration 2D Vectorcardiography"
                 beatIndex={calibrationBeat}
                 beatCount={data.calibration.beats.count}
                 data={calibrationVector}
@@ -1645,7 +1733,7 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
                 onMovementPercentChange={setCalibrationVectorMovement}
               />
               <VectorReviewSection
-                title="Session Vectorcardiography"
+                title="Session 2D Vectorcardiography"
                 beatIndex={sessionBeat}
                 beatCount={data.session.beats.count}
                 data={sessionVector}
@@ -1713,9 +1801,23 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
   const [recordIdInput, setRecordIdInput] = useState(initialRecordId);
   const [recordId, setRecordId] = useState(initialRecordId);
   const [data, setData] = useState<LiveVisualResponse | null>(null);
+  const [previousData, setPreviousData] = useState<LiveVisualResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [pollingStopped, setPollingStopped] = useState(false);
+  const [transitionStartedAtMs, setTransitionStartedAtMs] = useState(0);
+  const [animationNowMs, setAnimationNowMs] = useState(0);
+  const latestDataRef = useRef<LiveVisualResponse | null>(null);
+
+  useEffect(() => {
+    let frameId = 0;
+    const animate = (now: number) => {
+      setAnimationNowMs(now);
+      frameId = window.requestAnimationFrame(animate);
+    };
+    frameId = window.requestAnimationFrame(animate);
+    return () => window.cancelAnimationFrame(frameId);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -1740,7 +1842,10 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
           `[LIVE] visual response recordId=${payload.record_id} status=${payload.status} buffer=${payload.buffer_samples} total=${payload.total_samples_received} hr=${payload.heart_rate_bpm ?? "null"}`,
         );
         if (!active) return;
+        setPreviousData(latestDataRef.current);
+        latestDataRef.current = payload;
         setData(payload);
+        setTransitionStartedAtMs(performance.now());
         setError(null);
         if (payload.status === "ended") {
           stopped = true;
@@ -1782,7 +1887,9 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
     const nextUrl = next ? `/session?recordId=${encodeURIComponent(next)}` : "/session";
     window.history.replaceState({}, "", nextUrl);
     setRecordId(next);
+    setPreviousData(null);
     setData(null);
+    latestDataRef.current = null;
     setLoading(true);
     setPollingStopped(false);
   };
@@ -1810,12 +1917,47 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
       CH3: data.channels.CH3.slice(-currentCount),
       CH4: data.channels.CH4.slice(-currentCount),
     };
+    if (!previousData || previousData.record_id !== data.record_id || data.status === "ended") {
+      return {
+        channels: currentChannels,
+        displayedSamples: currentCount,
+      };
+    }
+    const previousCount = Math.min(
+      previousData.channels.CH2.length,
+      previousData.channels.CH3.length,
+      previousData.channels.CH4.length,
+      previousData.buffer_samples || LIVE_VISUAL_BUFFER_SAMPLES,
+    );
+    if (previousCount !== currentCount || previousCount <= 0) {
+      return {
+        channels: currentChannels,
+        displayedSamples: currentCount,
+      };
+    }
+    const newSamples = Math.min(
+      Math.max(data.total_samples_received - previousData.total_samples_received, 0),
+      LIVE_VISUAL_BUFFER_SAMPLES,
+    );
+    const transitionDurationMs = Math.max(
+      1,
+      (newSamples / Math.max(data.sample_rate_hz || 500, 1)) * 1000,
+    );
+    const transitionProgress = Math.min(
+      Math.max((animationNowMs - transitionStartedAtMs) / transitionDurationMs, 0),
+      1,
+    );
+    const shiftSamples = Math.round(newSamples * transitionProgress);
 
     return {
-      channels: currentChannels,
+      channels: {
+        CH2: blendRollingBuffer(previousData.channels.CH2.slice(-currentCount), currentChannels.CH2, shiftSamples),
+        CH3: blendRollingBuffer(previousData.channels.CH3.slice(-currentCount), currentChannels.CH3, shiftSamples),
+        CH4: blendRollingBuffer(previousData.channels.CH4.slice(-currentCount), currentChannels.CH4, shiftSamples),
+      },
       displayedSamples: currentCount,
     };
-  }, [data]);
+  }, [animationNowMs, data, previousData, transitionStartedAtMs]);
 
   return (
     <main className="app-shell live-dashboard-shell">

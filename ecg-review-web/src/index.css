@@ -434,6 +434,24 @@ h1 {
   background: linear-gradient(180deg, rgba(248, 251, 253, 0.8), rgba(240, 246, 251, 0.92));
 }
 
+.vector-plane-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.vector-plane-card {
+  margin-top: 0;
+}
+
+.vector-plane-chart {
+  width: 100%;
+  display: block;
+  min-height: 260px;
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(248, 251, 253, 0.8), rgba(240, 246, 251, 0.92));
+}
+
 .vector3d-frame {
   position: relative;
   width: 100%;

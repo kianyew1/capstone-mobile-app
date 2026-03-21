@@ -7,6 +7,7 @@ import threading
 import warnings
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -160,23 +161,45 @@ def _fetch_latest_recording_id() -> Optional[str]:
 
 def _fetch_storage_bytes(object_key: str) -> bytes:
     config = _get_supabase_config()
-    url = f"{config['url']}/storage/v1/object/{config['bucket']}/{object_key}"
+    normalized_object_key = (object_key or "").lstrip("/")
+    encoded_object_key = quote(normalized_object_key, safe="/")
+    url = f"{config['url']}/storage/v1/object/{config['bucket']}/{encoded_object_key}"
     headers = {
         "apikey": config["key"],
         "Authorization": f"Bearer {config['key']}",
     }
-    logger.info("[FETCH] storage object_key=%s", object_key)
+    logger.info(
+        "[FETCH] storage raw_object_key=%r normalized_object_key=%r url=%s",
+        object_key,
+        normalized_object_key,
+        url,
+    )
     try:
         with httpx.Client(timeout=60) as client:
             response = client.get(url, headers=headers)
             response.raise_for_status()
             return response.content
     except httpx.HTTPStatusError as exc:
+        logger.error(
+            "[FETCH] storage_http_error raw_object_key=%r normalized_object_key=%r url=%s status=%s body=%s",
+            object_key,
+            normalized_object_key,
+            url,
+            exc.response.status_code,
+            exc.response.text,
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Supabase Storage error: {exc.response.status_code} {exc.response.text}",
         ) from exc
     except httpx.RequestError as exc:
+        logger.error(
+            "[FETCH] storage_request_error raw_object_key=%r normalized_object_key=%r url=%s error=%s",
+            object_key,
+            normalized_object_key,
+            url,
+            exc,
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Supabase Storage unreachable: {exc}",
@@ -392,7 +415,16 @@ def _fetch_processed_artifact_key(record_id: str, artifact_type: str) -> Optiona
             exc,
         )
         return None
-    return data[0].get("object_key") if data else None
+    object_key = data[0].get("object_key") if data else None
+    logger.info(
+        "[PROCESSING] fetch_artifact record_id=%s artifact_type=%s url=%s params=%s object_key=%r",
+        record_id,
+        artifact_type,
+        url,
+        params,
+        object_key,
+    )
+    return object_key
 
 
 def _upsert_processed_artifact(record_id: str, artifact_type: str, object_key: str) -> None:
@@ -1173,7 +1205,25 @@ def _load_review_artifact(record_id: str, channel: str) -> Dict[str, Any]:
                 status_code=500,
                 detail=f"Processed review artifact missing for record_id={record_id}, channel={channel}.",
             )
-    artifact = _fetch_storage_json(artifact_key)
+    try:
+        artifact = _fetch_storage_json(artifact_key)
+    except HTTPException as exc:
+        if exc.status_code != 502:
+            raise
+        logger.warning(
+            "[PROCESSING] artifact fetch failed record_id=%s channel=%s object_key=%s; regenerating",
+            record_id,
+            channel,
+            artifact_key,
+        )
+        _process_review_artifacts_for_record(record_id)
+        artifact_key = _fetch_processed_artifact_key(record_id, artifact_type)
+        if not artifact_key:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Processed review artifact missing after regeneration for record_id={record_id}, channel={channel}.",
+            ) from exc
+        artifact = _fetch_storage_json(artifact_key)
     REVIEW_ARTIFACT_CACHE[cache_key] = artifact
     return artifact
 
@@ -1414,6 +1464,12 @@ class VectorBeatResponse(BaseModel):
     exclusion_reasons: List[str] = Field(default_factory=list)
     qr_duration_ms: Optional[float] = None
     markers: BeatMarkers
+    max_abs_lead_x: float = 0.0
+    max_abs_lead_y: float = 0.0
+    max_abs_lead_z: float = 0.0
+    lead_x: List[float] = Field(default_factory=list)
+    lead_y: List[float] = Field(default_factory=list)
+    lead_z: List[float] = Field(default_factory=list)
     max_abs_lead_i: float = 0.0
     max_abs_lead_ii: float = 0.0
     lead_i: List[float] = Field(default_factory=list)
@@ -2521,6 +2577,12 @@ async def review_vector_beat(
         exclusion_reasons=payload["exclusion_reasons"],
         qr_duration_ms=payload["qr_duration_ms"],
         markers=payload["markers"],
+        max_abs_lead_x=payload["max_abs_lead_x"],
+        max_abs_lead_y=payload["max_abs_lead_y"],
+        max_abs_lead_z=payload["max_abs_lead_z"],
+        lead_x=payload["lead_x"],
+        lead_y=payload["lead_y"],
+        lead_z=payload["lead_z"],
         max_abs_lead_i=payload["max_abs_lead_x"],
         max_abs_lead_ii=payload["max_abs_lead_z"],
         lead_i=payload["lead_x"],
