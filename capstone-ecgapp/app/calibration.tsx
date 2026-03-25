@@ -36,7 +36,12 @@ import { useAppStore } from "@/stores/app-store";
 import type { CalibrationStatus } from "@/types";
 import { toByteArray } from "base64-js";
 
-type CalibrationStep = "guidance" | "ready" | "calibrating" | "result";
+type CalibrationStep =
+  | "guidance"
+  | "ready"
+  | "calibrating"
+  | "processing"
+  | "result";
 
 export default function CalibrationScreen() {
   const params = useLocalSearchParams<{ fromOnboarding?: string }>();
@@ -136,16 +141,17 @@ export default function CalibrationScreen() {
       if (isFinishingRef.current) return;
       isFinishingRef.current = true;
       stopEcgNotifications();
+      setStep("processing");
+      setResultMessage("Uploading calibration and generating preview...");
+      setGraphError(null);
+      setIsGraphLoading(true);
 
       const endedAt = Date.now();
       setElapsedMs(endedAt - startedAt);
 
       try {
-        setIsGraphLoading(true);
-        setGraphError(null);
         const packetTotal = packetsRef.current.length;
-        const samplesPerChannel =
-          packetTotal * ECG_SAMPLES_PER_PACKET;
+        const samplesPerChannel = packetTotal * ECG_SAMPLES_PER_PACKET;
         console.log(
           `[CAL] packets=${packetTotal} samplesPerChannel=${samplesPerChannel}`,
         );
@@ -734,6 +740,28 @@ export default function CalibrationScreen() {
     </ScrollView>
   );
 
+  const renderProcessing = () => (
+    <View className="flex-1 items-center justify-center px-6">
+      <View className="w-32 h-32 rounded-full bg-primary/20 items-center justify-center mb-5">
+        <ActivityIndicator size="large" color="#0a7ea4" />
+      </View>
+
+      <Text variant="h3" className="text-center mb-0">
+        Processing Calibration...
+      </Text>
+      <Text className="text-muted-foreground text-center mb-3">
+        The BLE capture is finished. The app is now uploading the calibration
+        and generating the preview.
+      </Text>
+      <Text className="text-muted-foreground text-sm">
+        Packets captured: {packetCount}
+      </Text>
+      <Text className="text-muted-foreground text-sm mt-0">
+        Time: {formatSeconds(elapsedMs)}s
+      </Text>
+    </View>
+  );
+
   return (
     <SafeAreaView className="flex-1 bg-background">
       <View className="flex-1 px-6 pt-4">
@@ -767,6 +795,7 @@ export default function CalibrationScreen() {
         {step === "guidance" && renderGuidance()}
         {step === "ready" && renderReady()}
         {step === "calibrating" && renderCalibrating()}
+        {step === "processing" && renderProcessing()}
         {step === "result" && renderResult()}
       </View>
     </SafeAreaView>

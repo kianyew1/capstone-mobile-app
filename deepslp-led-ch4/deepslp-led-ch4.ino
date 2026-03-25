@@ -90,6 +90,10 @@ void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000); // Wait for serial or timeout
   
+  Serial.println("===========================================");
+  Serial.println("ADS1298 Initialization - Following Figure 93");
+  Serial.println("===========================================\n");
+  
   // Initialize ADS1298
   if (initADS1298()) {
     Serial.println("\n✓ ADS1298 Initialized Successfully!");
@@ -102,8 +106,6 @@ void setup() {
   // Attach interrupt for DRDY
   pinMode(PIN_DRDY, INPUT);
   attachInterrupt(digitalPinToInterrupt(PIN_DRDY), drdyInterrupt, FALLING);
-  enableTestSignal();
-  disableTestSignal();
   
   Serial.println("Sample# Status   CH1      CH2      CH3      CH4      CH5      CH6      CH7      CH8");
   Serial.println("-----------------------------------------------------------------------------------------");
@@ -210,6 +212,36 @@ bool initADS1298() {
     writeRegister(ADS1298_REG_CH1SET + ch, 0x00); // Normal operation
     // Use 0x01 for input short (testing)
   }
+  
+  delay(10);
+  
+  // Configure Wilson Central Terminal (WCT) registers
+  Serial.println("  • Configuring Wilson Central Terminal (WCT)...");
+  Serial.println("    WCT1 (0x18): Power up WCTA, route CH2P");
+  Serial.println("    WCT2 (0x19): Power up WCTB and WCTC, route CH2N and CH3P");
+  
+  // WCT1 (Address 0x18):
+  // Bit 7-4: aVF_CH6, aVL_CH5, aVR_CH7, aVR_CH4 = 0000 (not used)
+  // Bit 3: PD_WCTA = 0 (power up WCTA)
+  // Bits 2-0: WCTA[2:0] = 011 (route CH2P to WCTA)
+  // = 0b00000011 = 0x03
+  writeRegister(ADS1298_REG_WCT1, 0x0A);
+  
+  // WCT2 (Address 0x19):
+  // Bit 7: PD_WCTC = 0 (power up WCTC)
+  // Bit 6: PD_WCTB = 0 (power up WCTB)
+  // Bits 5-3: WCTC[2:0] = 101 (route CH3P to WCTC)
+  // Bits 2-0: WCTB[2:0] = 010 (route CH2N to WCTB)
+  // = 0b00101010 = 0x2A
+  writeRegister(ADS1298_REG_WCT2, 0xE3);
+  
+  // Verify WCT registers
+  uint8_t wct1_readback = readRegister(ADS1298_REG_WCT1);
+  uint8_t wct2_readback = readRegister(ADS1298_REG_WCT2);
+  Serial.print("    WCT1 readback: 0x");
+  Serial.println(wct1_readback, HEX);
+  Serial.print("    WCT2 readback: 0x");
+  Serial.println(wct2_readback, HEX);
   
   delay(10);
   Serial.println("  ✓ All registers configured");
