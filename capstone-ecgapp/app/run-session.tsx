@@ -12,7 +12,7 @@ import {
   Square,
   Zap,
 } from "lucide-react-native";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Alert,
   AppState,
@@ -39,10 +39,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Text } from "@/components/ui/text";
 import { ENABLE_MOCK_MODE } from "@/config/mock-config";
-import {
-  checkSessionSignalQuality,
-  startSessionRecord,
-} from "@/services/backend-ecg";
+import { addToSessionChunk, startSessionRecord } from "@/services/backend-ecg";
 import { useBluetoothService } from "@/services/bluetooth-service";
 import {
   concatUint8Arrays,
@@ -62,7 +59,6 @@ export default function RunSessionScreen() {
   const [isAppActive, setIsAppActive] = useState(true);
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const sessionCheckTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const expectedPacketBytes = ECG_PACKET_BYTES;
 
   const {
@@ -97,6 +93,7 @@ export default function RunSessionScreen() {
   const sessionCheckPacketsRef = useRef<Uint8Array[]>([]);
   const sessionPacketCountRef = useRef(0);
   const invalidPacketCountRef = useRef(0);
+  const sessionChunkIndexRef = useRef(0);
   const sessionStartRef = useRef<Date | null>(null);
   const isStreamingRef = useRef(false);
   const isSessionCheckInFlightRef = useRef(false);
@@ -122,6 +119,42 @@ export default function RunSessionScreen() {
   const heartPulseStyle = useAnimatedStyle(() => ({
     transform: [{ scale: heartScale.value }],
   }));
+
+  const flushSessionPackets = useCallback(async () => {
+    if (isSessionCheckInFlightRef.current) return;
+    const recordId = recordIdRef.current;
+    const sessionId = sessionIdRef.current;
+    if (!recordId || !sessionId) {
+      return;
+    }
+    if (sessionCheckPacketsRef.current.length < 20) {
+      return;
+    }
+
+    isSessionCheckInFlightRef.current = true;
+    try {
+      while (sessionCheckPacketsRef.current.length >= 20) {
+        const chunkPackets = sessionCheckPacketsRef.current.slice(0, 20);
+        sessionCheckPacketsRef.current = sessionCheckPacketsRef.current.slice(20);
+        const bytes = concatUint8Arrays(chunkPackets);
+        const chunkIndex = sessionChunkIndexRef.current;
+        sessionChunkIndexRef.current += 1;
+        const result = await addToSessionChunk({
+          recordId,
+          sessionId,
+          chunkIndex,
+          bytes,
+        });
+        console.log(
+          `[SESSION] chunk stored chunk_index=${result.chunkIndex} packets=${result.packetCount} samples=${result.sampleCountPerChannel}`,
+        );
+      }
+    } catch (error) {
+      console.error("Failed to store session chunk:", error);
+    } finally {
+      isSessionCheckInFlightRef.current = false;
+    }
+  }, []);
 
   // Handle app state changes (background/foreground)
   useEffect(() => {
@@ -169,6 +202,7 @@ export default function RunSessionScreen() {
         sessionId,
         calibrationObjectKey,
         startTime: sessionStartRef.current,
+        recordId: calibrationResult?.recordId ?? null,
       })
         .then((record) => {
           recordIdRef.current = record.recordId ?? null;
@@ -199,6 +233,7 @@ export default function RunSessionScreen() {
       sessionCheckPacketsRef.current = [];
       sessionPacketCountRef.current = 0;
       invalidPacketCountRef.current = 0;
+      sessionChunkIndexRef.current = 0;
       console.log(
         `[SESSION] start stream expectedBytes=${expectedPacketBytes}`,
       );
@@ -240,66 +275,18 @@ export default function RunSessionScreen() {
       } else if (count % 20 === 0) {
         console.log(`[SESSION] packet=${count}`);
       }
+      void flushSessionPackets();
     }).catch((error) => {
       console.error("Failed to start ECG stream:", error);
     });
-  }, [calibrationResult?.calibrationObjectKey, sessionStatus, startEcgNotifications, userId]);
+  }, [calibrationResult?.calibrationObjectKey, sessionStatus, startEcgNotifications, userId, flushSessionPackets]);
 
   useEffect(() => {
-    if (sessionStatus !== "running") {
-      if (sessionCheckTimerRef.current) {
-        clearInterval(sessionCheckTimerRef.current);
-        sessionCheckTimerRef.current = null;
-      }
-      if (sessionStatus === "paused") {
-        isStreamingRef.current = false;
-        stopEcgNotifications();
-        console.log("[SESSION] paused stream");
-      }
-      return;
+    if (sessionStatus !== "running" && sessionStatus === "paused") {
+      isStreamingRef.current = false;
+      stopEcgNotifications();
+      console.log("[SESSION] paused stream");
     }
-
-    const flushSessionCheck = async () => {
-      if (isSessionCheckInFlightRef.current) return;
-      const recordId = recordIdRef.current;
-      const sessionId = sessionIdRef.current;
-      if (!recordId || !sessionId) {
-        return;
-      }
-      const chunkPackets = sessionCheckPacketsRef.current;
-      if (chunkPackets.length === 0) {
-        return;
-      }
-
-      sessionCheckPacketsRef.current = [];
-      const bytes = concatUint8Arrays(chunkPackets);
-      isSessionCheckInFlightRef.current = true;
-      try {
-        const result = await checkSessionSignalQuality({
-          recordId,
-          sessionId,
-          bytes,
-        });
-        console.log(
-          `[SESSION] live check result abnormal=${result.abnormalDetected} signal_ok=${result.signalOk} quality=${result.qualityPercentage.toFixed(2)} hr=${result.heartRateBpm ?? "null"} reasons=${result.reasonCodes.join("|") || "none"} buffered_packets=${result.totalPacketsBuffered}`,
-        );
-      } catch (error) {
-        console.error("Failed to run live session check:", error);
-      } finally {
-        isSessionCheckInFlightRef.current = false;
-      }
-    };
-
-    sessionCheckTimerRef.current = setInterval(() => {
-      void flushSessionCheck();
-    }, 500);
-
-    return () => {
-      if (sessionCheckTimerRef.current) {
-        clearInterval(sessionCheckTimerRef.current);
-        sessionCheckTimerRef.current = null;
-      }
-    };
   }, [sessionStatus, stopEcgNotifications]);
 
   useEffect(() => {
@@ -312,6 +299,7 @@ export default function RunSessionScreen() {
       sessionIdRef.current = null;
       sessionStartRef.current = null;
       sessionCheckPacketsRef.current = [];
+      sessionChunkIndexRef.current = 0;
       stopEcgNotifications();
     }
   }, [sessionStatus, stopEcgNotifications]);
@@ -320,10 +308,6 @@ export default function RunSessionScreen() {
     return () => {
       isStreamingRef.current = false;
       isSessionCheckInFlightRef.current = false;
-      if (sessionCheckTimerRef.current) {
-        clearInterval(sessionCheckTimerRef.current);
-        sessionCheckTimerRef.current = null;
-      }
       stopEcgNotifications();
     };
   }, [stopEcgNotifications]);
@@ -390,10 +374,6 @@ export default function RunSessionScreen() {
 
   const handleEnd = async () => {
     isStreamingRef.current = false;
-    if (sessionCheckTimerRef.current) {
-      clearInterval(sessionCheckTimerRef.current);
-      sessionCheckTimerRef.current = null;
-    }
     stopEcgNotifications();
 
     const recordId = recordIdRef.current;

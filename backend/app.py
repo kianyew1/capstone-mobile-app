@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import io
 import json
@@ -5,13 +7,12 @@ import logging
 import os
 import threading
 import warnings
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-import httpx
 import matplotlib
 import neurokit2 as nk
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -33,8 +34,41 @@ logger = logging.getLogger("ecg-backend")
 DEFAULT_BASE_URL = "http://127.0.0.1:8001"
 BASE_URL = os.getenv("BASE_URL") or DEFAULT_BASE_URL
 
-PACKET_BYTES = 228
+from supabase import (
+    REVIEW_PROCESSING_VERSION,
+    _fetch_latest_recording_id,
+    _fetch_latest_live_preview_row,
+    _fetch_live_preview_row,
+    _fetch_processed_artifact_key,
+    _fetch_processed_record,
+    _fetch_recording_by_id,
+    _fetch_storage_bytes,
+    _fetch_storage_json,
+    _get_supabase_config,
+    _insert_recording_row,
+    _insert_session_chunk_row,
+    _sg_now_iso,
+    _update_recording_row,
+    _upsert_live_preview_row,
+    _upsert_processed_artifact,
+    _upsert_processed_record,
+    _upload_storage_bytes,
+    _upload_storage_json,
+)
+from ui_previews import (
+    LIVE_SESSION_STATE,
+    LIVE_VISUAL_BUFFER_SAMPLES,
+    live_session_status,
+    latest_live_record_id,
+    trim_live_visual_snapshot,
+)
+
+STATUS_BYTES = 3
+TIMESTAMP_BYTES = 3
+BYTES_PER_SAMPLE = 3
 SAMPLES_PER_PACKET = 25
+CHANNELS = 3
+PACKET_BYTES = STATUS_BYTES + (BYTES_PER_SAMPLE * SAMPLES_PER_PACKET * CHANNELS) + TIMESTAMP_BYTES
 CHANNEL_LABELS = ["CH2", "CH3", "CH4"]
 ADS1298_VREF = 2.4
 ADS1298_GAIN = 6.0
@@ -47,397 +81,21 @@ LAST_CALIBRATION_META = {
 }
 
 ANALYSIS_JOBS: Dict[str, Dict[str, Any]] = {}
-LIVE_SESSION_STATE: Dict[str, Dict[str, Any]] = {}
 DEFAULT_SAMPLE_RATE_HZ = 500
-LIVE_VISUAL_BUFFER_SAMPLES = 6000
-LIVE_VISUAL_BUFFER_PACKETS = (LIVE_VISUAL_BUFFER_SAMPLES + SAMPLES_PER_PACKET - 1) // SAMPLES_PER_PACKET
-REVIEW_PROCESSING_VERSION = "review_v7"
 REVIEW_ARTIFACT_CACHE: Dict[tuple[str, str, str], Dict[str, Any]] = {}
 VECTOR3D_IMAGE_CACHE: Dict[tuple[str, str, int, float, float, int], str] = {}
 VECTOR3D_PRELOAD_STATE: Dict[tuple[str, str, float, float, int], Dict[str, Any]] = {}
 VECTOR3D_PRELOAD_LOCK = threading.Lock()
 
 
-def _get_supabase_config() -> Dict[str, str]:
-    url = os.getenv("EXPO_PUBLIC_SUPABASE_URL") or os.getenv("SUPABASE_URL")
-    key = (
-        os.getenv("EXPO_PUBLIC_SUPABASE_ANON_KEY")
-        or os.getenv("SUPABASE_ANON_KEY")
-    )
-    bucket = (
-        os.getenv("EXPO_PUBLIC_SUPABASE_STORAGE_BUCKET")
-        or os.getenv("SUPABASE_STORAGE_BUCKET")
-    )
-    if not url or not key:
-        raise HTTPException(
-            status_code=500,
-            detail="Missing Supabase env vars: EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.",
-        )
-    if not bucket:
-        raise HTTPException(
-            status_code=500,
-            detail="Missing Supabase env var: EXPO_PUBLIC_SUPABASE_STORAGE_BUCKET.",
-        )
-    return {"url": url, "key": key, "bucket": bucket}
-
-
-def _fetch_recording_by_id(record_id: str) -> Dict[str, Any]:
-    config = _get_supabase_config()
-    logger.info("[FETCH] start record_id=%s", record_id)
-    select_fields = ",".join(
-        [
-            "id",
-            "user_id",
-            "bucket",
-            "session_object_key",
-            "calibration_object_key",
-            "encoding",
-            "sample_rate_hz",
-            "channels",
-            "sample_count",
-            "duration_ms",
-            "byte_length",
-            "created_at",
-        ]
-    )
-    url = f"{config['url']}/rest/v1/ecg_recordings"
-    params = {
-        "id": f"eq.{record_id}",
-        "select": select_fields,
-    }
-    headers = {
-        "apikey": config["key"],
-        "Authorization": f"Bearer {config['key']}",
-        "Accept": "application/json",
-    }
-    try:
-        with httpx.Client(timeout=30) as client:
-            response = client.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase REST error: {exc.response.status_code} {exc.response.text}",
-        ) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase REST unreachable: {exc}",
-        ) from exc
-
-    if not data:
-        logger.warning("[FETCH] not_found record_id=%s", record_id)
-        raise HTTPException(status_code=404, detail="Recording not found.")
-    logger.info("[FETCH] success record_id=%s", record_id)
-    return data[0]
-
-
-def _fetch_latest_recording_id() -> Optional[str]:
-    config = _get_supabase_config()
-    url = f"{config['url']}/rest/v1/ecg_recordings"
-    params = {
-        "select": "id,created_at",
-        "order": "created_at.desc",
-        "limit": 1,
-    }
-    headers = {
-        "apikey": config["key"],
-        "Authorization": f"Bearer {config['key']}",
-        "Accept": "application/json",
-    }
-    try:
-        with httpx.Client(timeout=15) as client:
-            response = client.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-    except Exception as exc:  # pragma: no cover - safeguard
-        logger.error("[FETCH] latest_record_failed error=%s", exc)
+def _normalize_iso_to_sg(value: Optional[str]) -> Optional[str]:
+    if not value:
         return None
-    if not data:
-        return None
-    return data[0].get("id")
-
-
-def _fetch_storage_bytes(object_key: str) -> bytes:
-    config = _get_supabase_config()
-    normalized_object_key = (object_key or "").lstrip("/")
-    encoded_object_key = quote(normalized_object_key, safe="/")
-    url = f"{config['url']}/storage/v1/object/{config['bucket']}/{encoded_object_key}"
-    headers = {
-        "apikey": config["key"],
-        "Authorization": f"Bearer {config['key']}",
-    }
-    logger.info(
-        "[FETCH] storage raw_object_key=%r normalized_object_key=%r url=%s",
-        object_key,
-        normalized_object_key,
-        url,
-    )
     try:
-        with httpx.Client(timeout=60) as client:
-            response = client.get(url, headers=headers)
-            response.raise_for_status()
-            return response.content
-    except httpx.HTTPStatusError as exc:
-        logger.error(
-            "[FETCH] storage_http_error raw_object_key=%r normalized_object_key=%r url=%s status=%s body=%s",
-            object_key,
-            normalized_object_key,
-            url,
-            exc.response.status_code,
-            exc.response.text,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase Storage error: {exc.response.status_code} {exc.response.text}",
-        ) from exc
-    except httpx.RequestError as exc:
-        logger.error(
-            "[FETCH] storage_request_error raw_object_key=%r normalized_object_key=%r url=%s error=%s",
-            object_key,
-            normalized_object_key,
-            url,
-            exc,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase Storage unreachable: {exc}",
-        ) from exc
-
-
-def _fetch_storage_json(object_key: str) -> Dict[str, Any]:
-    payload = _fetch_storage_bytes(object_key)
-    try:
-        return json.loads(payload.decode("utf-8"))
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Stored JSON artifact is invalid for object_key={object_key}: {exc}",
-        ) from exc
-
-
-def _review_cache_key(record_id: str, channel: str) -> tuple[str, str, str]:
-    return (record_id, channel.upper(), REVIEW_PROCESSING_VERSION)
-
-
-def _supabase_headers(json_content: bool = True) -> Dict[str, str]:
-    config = _get_supabase_config()
-    headers = {
-        "apikey": config["key"],
-        "Authorization": f"Bearer {config['key']}",
-    }
-    if json_content:
-        headers["Content-Type"] = "application/json"
-        headers["Accept"] = "application/json"
-    return headers
-
-
-def _upload_storage_bytes(object_key: str, payload: bytes) -> None:
-    config = _get_supabase_config()
-    url = f"{config['url']}/storage/v1/object/{config['bucket']}/{object_key}"
-    headers = {
-        "apikey": config["key"],
-        "Authorization": f"Bearer {config['key']}",
-        "Content-Type": "application/octet-stream",
-        "x-upsert": "true",
-    }
-    try:
-        with httpx.Client(timeout=60) as client:
-            response = client.post(url, headers=headers, content=payload)
-            response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase Storage upload error: {exc.response.status_code} {exc.response.text}",
-        ) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase Storage upload unreachable: {exc}",
-        ) from exc
-
-
-def _upload_storage_json(object_key: str, payload: Dict[str, Any]) -> None:
-    config = _get_supabase_config()
-    url = f"{config['url']}/storage/v1/object/{config['bucket']}/{object_key}"
-    headers = {
-        "apikey": config["key"],
-        "Authorization": f"Bearer {config['key']}",
-        "Content-Type": "application/json",
-        "x-upsert": "true",
-    }
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    try:
-        with httpx.Client(timeout=60) as client:
-            response = client.post(url, headers=headers, content=body)
-            response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase Storage upload error: {exc.response.status_code} {exc.response.text}",
-        ) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase Storage upload unreachable: {exc}",
-        ) from exc
-
-
-def _insert_recording_row(payload: Dict[str, Any]) -> Dict[str, Any]:
-    config = _get_supabase_config()
-    url = f"{config['url']}/rest/v1/ecg_recordings"
-    headers = _supabase_headers(json_content=True)
-    headers["Prefer"] = "return=representation"
-    try:
-        with httpx.Client(timeout=30) as client:
-            response = client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase insert error: {exc.response.status_code} {exc.response.text}",
-        ) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase insert unreachable: {exc}",
-        ) from exc
-    if not data:
-        raise HTTPException(status_code=502, detail="Supabase insert returned no rows.")
-    return data[0]
-
-
-def _update_recording_row(record_id: str, payload: Dict[str, Any]) -> None:
-    config = _get_supabase_config()
-    url = f"{config['url']}/rest/v1/ecg_recordings?id=eq.{record_id}"
-    headers = _supabase_headers(json_content=True)
-    headers["Prefer"] = "return=minimal"
-    try:
-        with httpx.Client(timeout=30) as client:
-            response = client.patch(url, headers=headers, json=payload)
-            response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase update error: {exc.response.status_code} {exc.response.text}",
-        ) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase update unreachable: {exc}",
-        ) from exc
-
-
-def _upsert_table_row(table: str, payload: Dict[str, Any], conflict_columns: str) -> List[Dict[str, Any]]:
-    config = _get_supabase_config()
-    url = f"{config['url']}/rest/v1/{table}?on_conflict={conflict_columns}"
-    headers = _supabase_headers(json_content=True)
-    headers["Prefer"] = "return=representation,resolution=merge-duplicates"
-    try:
-        with httpx.Client(timeout=30) as client:
-            response = client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            return response.json() or []
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase upsert error ({table}): {exc.response.status_code} {exc.response.text}",
-        ) from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Supabase upsert unreachable ({table}): {exc}",
-        ) from exc
-
-
-def _fetch_processed_record(record_id: str) -> Optional[Dict[str, Any]]:
-    config = _get_supabase_config()
-    url = f"{config['url']}/rest/v1/ecg_processed_records"
-    params = {
-        "record_id": f"eq.{record_id}",
-        "select": "record_id,status,processing_version,updated_at,error_message",
-        "limit": 1,
-    }
-    headers = _supabase_headers(json_content=False)
-    headers["Accept"] = "application/json"
-    try:
-        with httpx.Client(timeout=15) as client:
-            response = client.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-    except Exception as exc:  # pragma: no cover - safeguard
-        logger.error("[PROCESSING] fetch_record failed record_id=%s error=%s", record_id, exc)
-        return None
-    return data[0] if data else None
-
-
-def _upsert_processed_record(
-    record_id: str,
-    status: str,
-    error_message: Optional[str] = None,
-) -> None:
-    _upsert_table_row(
-        "ecg_processed_records",
-        {
-            "record_id": record_id,
-            "status": status,
-            "processing_version": REVIEW_PROCESSING_VERSION,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "error_message": error_message,
-        },
-        "record_id",
-    )
-
-
-def _fetch_processed_artifact_key(record_id: str, artifact_type: str) -> Optional[str]:
-    config = _get_supabase_config()
-    url = f"{config['url']}/rest/v1/ecg_processed_artifacts"
-    params = {
-        "record_id": f"eq.{record_id}",
-        "artifact_type": f"eq.{artifact_type}",
-        "select": "object_key,updated_at",
-        "limit": 1,
-    }
-    headers = _supabase_headers(json_content=False)
-    headers["Accept"] = "application/json"
-    try:
-        with httpx.Client(timeout=15) as client:
-            response = client.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-    except Exception as exc:  # pragma: no cover - safeguard
-        logger.error(
-            "[PROCESSING] fetch_artifact failed record_id=%s artifact_type=%s error=%s",
-            record_id,
-            artifact_type,
-            exc,
-        )
-        return None
-    object_key = data[0].get("object_key") if data else None
-    logger.info(
-        "[PROCESSING] fetch_artifact record_id=%s artifact_type=%s url=%s params=%s object_key=%r",
-        record_id,
-        artifact_type,
-        url,
-        params,
-        object_key,
-    )
-    return object_key
-
-
-def _upsert_processed_artifact(record_id: str, artifact_type: str, object_key: str) -> None:
-    _upsert_table_row(
-        "ecg_processed_artifacts",
-        {
-            "record_id": record_id,
-            "artifact_type": artifact_type,
-            "object_key": object_key,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        },
-        "record_id,artifact_type",
-    )
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(ZoneInfo("Asia/Singapore")).isoformat()
+    except Exception:
+        return value
 
 
 def _decode_int16_le(payload: bytes) -> List[int]:
@@ -455,6 +113,10 @@ def _read24_signed_be(payload: bytes, offset: int) -> int:
     if value & 0x800000:
         return value - (1 << 24)
     return value
+
+
+def _read24_unsigned_be(payload: bytes, offset: int) -> int:
+    return (payload[offset] << 16) | (payload[offset + 1] << 8) | payload[offset + 2]
 
 
 def _counts_to_mv(count: int) -> float:
@@ -475,7 +137,7 @@ def _decode_ads1298_packets(payload: bytes) -> Dict[str, List[float]]:
     channels: Dict[str, List[float]] = {label: [] for label in CHANNEL_LABELS}
     for p in range(packet_count):
         base = p * PACKET_BYTES
-        offset = base + 3  # skip status
+        offset = base + STATUS_BYTES  # skip status
         for _ in range(SAMPLES_PER_PACKET):
             channels["CH2"].append(_counts_to_mv(_read24_signed_be(payload, offset)))
             offset += 3
@@ -534,11 +196,465 @@ def _packet_stats(payload: bytes) -> Dict[str, int]:
     packet_count = len(payload) // PACKET_BYTES
     sample_count_per_channel = packet_count * SAMPLES_PER_PACKET
     remainder = len(payload) % PACKET_BYTES
-    return {
+    first_ts_ms = None
+    last_ts_ms = None
+    if TIMESTAMP_BYTES and packet_count > 0:
+        first_offset = PACKET_BYTES - TIMESTAMP_BYTES
+        last_offset = ((packet_count - 1) * PACKET_BYTES) + (PACKET_BYTES - TIMESTAMP_BYTES)
+        if last_offset + TIMESTAMP_BYTES <= len(payload):
+            first_ts_ms = _read24_unsigned_be(payload, first_offset)
+            last_ts_ms = _read24_unsigned_be(payload, last_offset)
+    stats: Dict[str, int] = {
         "packet_count": packet_count,
         "sample_count_per_channel": sample_count_per_channel,
         "remainder": remainder,
         "byte_length": len(payload),
+    }
+    if first_ts_ms is not None:
+        stats["first_ts_ms"] = int(first_ts_ms)
+    if last_ts_ms is not None:
+        stats["last_ts_ms"] = int(last_ts_ms)
+    return stats
+
+
+def _handle_calibration_payload(
+    *,
+    data: bytes,
+    run_id: str,
+    user_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    stats = _packet_stats(data)
+    logger.info(
+        "[CALIBRATION] received run_id=%s byte_length=%s packet_count=%s sample_count_per_channel=%s remainder=%s",
+        run_id,
+        stats["byte_length"],
+        stats["packet_count"],
+        stats["sample_count_per_channel"],
+        stats["remainder"],
+    )
+    if stats["packet_count"] == 0:
+        raise HTTPException(status_code=400, detail="No complete ECG packets received.")
+    if stats["remainder"] != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Payload length is not a multiple of packet size {PACKET_BYTES}.",
+        )
+
+    channels = _decode_ads1298_packets(data)
+    ch2 = channels.get("CH2", [])
+    if not ch2:
+        raise HTTPException(status_code=400, detail="Decoded calibration signal is empty.")
+    calibration_result = _process_window(ch2, DEFAULT_SAMPLE_RATE_HZ)
+    quality_percentage = 100 + round(
+        _quality_to_percentage(calibration_result.get("quality")),
+        2,
+    )
+    signal_suitable = (
+        quality_percentage >= 70.0
+        and bool(calibration_result.get("cleaned"))
+        and bool(calibration_result.get("r_peaks"))
+    )
+    previews = _build_cleaned_previews(channels, DEFAULT_SAMPLE_RATE_HZ)
+
+    LAST_CALIBRATION_SAMPLES.clear()
+    LAST_CALIBRATION_SAMPLES.extend(calibration_result.get("cleaned", []))
+    LAST_CALIBRATION_META["byte_length"] = stats["byte_length"]
+    LAST_CALIBRATION_META["sample_count"] = stats["sample_count_per_channel"]
+
+    stored_object_key = ""
+    if signal_suitable:
+        object_key = f"calibration/{run_id}.bin"
+        _upload_storage_bytes(object_key, data)
+        stored_object_key = object_key
+
+    record_id: Optional[str] = None
+    if user_id and stored_object_key:
+        config = _get_supabase_config()
+        record = _insert_recording_row(
+            {
+                "user_id": user_id,
+                "bucket": config["bucket"],
+                "calibration_object_key": stored_object_key,
+                "session_object_key": "pending",
+                "created_at": _sg_now_iso(),
+                "encoding": "ads1298_24be_mv",
+                "sample_rate_hz": 500,
+                "channels": 3,
+                "sample_count": stats["sample_count_per_channel"],
+                "duration_ms": round((stats["sample_count_per_channel"] / 500) * 1000),
+                "byte_length": stats["byte_length"],
+                "status": "calibrated",
+                "notes": json.dumps(
+                    {
+                        "channel_labels": CHANNEL_LABELS,
+                        "packet_bytes": PACKET_BYTES,
+                        "samples_per_packet": SAMPLES_PER_PACKET,
+                        "encoding": "ads1298_24be_mv",
+                    }
+                ),
+            }
+        )
+        record_id = str(record.get("id")) if record else None
+        logger.info(
+            "[CALIBRATION] record_created run_id=%s record_id=%s user_id=%s",
+            run_id,
+            record_id,
+            user_id,
+        )
+
+    logger.info(
+        "[CALIBRATION] response run_id=%s quality_percentage=%.2f signal_suitable=%s stored_object_key=%s cleaned_samples=%s r_peaks=%s preview_lengths=%s",
+        run_id,
+        quality_percentage,
+        signal_suitable,
+        stored_object_key or "none",
+        len(calibration_result.get("cleaned", [])),
+        len(calibration_result.get("r_peaks", [])),
+        {label: len(previews.get(label, [])) for label in CHANNEL_LABELS},
+    )
+
+    return {
+        "quality_percentage": quality_percentage,
+        "signal_suitable": signal_suitable,
+        "calibration_object_key": stored_object_key,
+        "byte_length": stats["byte_length"],
+        "packet_count": stats["packet_count"],
+        "sample_count_per_channel": stats["sample_count_per_channel"],
+        "preview": previews,
+        "record_id": record_id,
+    }
+
+
+def _review_cache_key(record_id: str, channel: str) -> tuple[str, str, str]:
+    return (record_id, channel.upper(), REVIEW_PROCESSING_VERSION)
+
+
+def _validate_packet_payload(payload: bytes, context: str) -> Dict[str, int]:
+    stats = _packet_stats(payload)
+    if stats["byte_length"] == 0:
+        logger.error("[%s] empty_payload", context)
+        raise HTTPException(status_code=400, detail="Empty payload.")
+    if stats["remainder"] != 0:
+        logger.error(
+            "[%s] invalid_payload_length byte_length=%s remainder=%s",
+            context,
+            stats["byte_length"],
+            stats["remainder"],
+        )
+        raise HTTPException(status_code=400, detail="Invalid payload length.")
+    if stats.get("packet_count", 0) > 1 and "first_ts_ms" in stats and "last_ts_ms" in stats:
+        first_ts = stats["first_ts_ms"]
+        last_ts = stats["last_ts_ms"]
+        if first_ts == last_ts:
+            logger.error(
+                "[%s] invalid_timestamp_delta first_ts_ms=%s last_ts_ms=%s",
+                context,
+                first_ts,
+                last_ts,
+            )
+            raise HTTPException(status_code=400, detail="Invalid timestamp delta.")
+    return stats
+
+
+def _store_session_chunk(
+    *,
+    record_id: str,
+    session_id: str,
+    payload: bytes,
+    chunk_index: int,
+    context: str,
+    stats: Optional[Dict[str, int]] = None,
+) -> Dict[str, int]:
+    stats = stats or _validate_packet_payload(payload, context)
+    object_key = f"session/{session_id}/chunks/{chunk_index}.bin"
+    _upload_storage_bytes(object_key, payload)
+    _insert_session_chunk_row(
+        {
+            "record_id": record_id,
+            "chunk_index": chunk_index,
+            "object_key": object_key,
+            "byte_length": stats["byte_length"],
+            "packet_count": stats["packet_count"],
+            "sample_count": stats["sample_count_per_channel"],
+            "first_ts_ms": stats.get("first_ts_ms"),
+            "last_ts_ms": stats.get("last_ts_ms"),
+            "created_at": _sg_now_iso(),
+        }
+    )
+    logger.info(
+        "[%s] chunk_stored record_id=%s session_id=%s chunk_index=%s object_key=%s packets=%s",
+        context,
+        record_id,
+        session_id,
+        chunk_index,
+        object_key,
+        stats["packet_count"],
+    )
+    return stats
+
+
+def _finalize_session_upload(
+    *,
+    record_id: str,
+    session_id: str,
+    user_id: str,
+    start_time: Optional[str],
+    payload: bytes,
+    stats: Dict[str, int],
+    context: str,
+) -> SessionUploadResponse:
+    if stats["packet_count"] == 0:
+        raise HTTPException(status_code=400, detail="No complete ECG packets received.")
+
+    session_object_key = f"session/{session_id}.bin"
+    normalized_start_time = _normalize_iso_to_sg(start_time)
+    _upload_storage_bytes(session_object_key, payload)
+    duration_ms = round((stats["sample_count_per_channel"] / 500) * 1000)
+    effective_sps = None
+    if "first_ts_ms" in stats and "last_ts_ms" in stats:
+        first_ts = stats["first_ts_ms"]
+        last_ts = stats["last_ts_ms"]
+        if last_ts < first_ts:
+            last_ts += (1 << 24)
+        delta_ms = last_ts - first_ts
+        if delta_ms > 0:
+            effective_sps = round(
+                float(stats["sample_count_per_channel"]) / (delta_ms / 1000.0),
+                4,
+            )
+            duration_ms = int(delta_ms)
+    _update_recording_row(
+        record_id,
+        {
+            "user_id": user_id,
+            "session_object_key": session_object_key,
+            "sample_count": stats["sample_count_per_channel"],
+            "duration_ms": duration_ms,
+            "start_time": normalized_start_time,
+            "byte_length": stats["byte_length"],
+            "encoding": "ads1298_24be_mv",
+            "sample_rate_hz": 500,
+            "channels": 3,
+            "first_ts_ms": stats.get("first_ts_ms"),
+            "last_ts_ms": stats.get("last_ts_ms"),
+            "effective_sps": effective_sps,
+            "notes": json.dumps(
+                {
+                    "channel_labels": CHANNEL_LABELS,
+                    "packet_bytes": PACKET_BYTES,
+                    "samples_per_packet": SAMPLES_PER_PACKET,
+                    "encoding": "ads1298_24be_mv",
+                    "packet_count": stats["packet_count"],
+                }
+            ),
+        },
+    )
+    try:
+        _process_review_artifacts_for_record(record_id)
+    except Exception as exc:  # pragma: no cover - safeguard
+        logger.error(
+            "[%s] review_processing_failed record_id=%s error=%s",
+            context,
+            record_id,
+            exc,
+        )
+    response = SessionUploadResponse(
+        record_id=record_id,
+        session_object_key=session_object_key,
+        byte_length=stats["byte_length"],
+        packet_count=stats["packet_count"],
+        sample_count_per_channel=stats["sample_count_per_channel"],
+        duration_ms=duration_ms,
+    )
+    state = LIVE_SESSION_STATE.get(record_id)
+    if state is not None:
+        ended_at = _sg_now_iso()
+        state["is_active"] = False
+        state["ended_at"] = ended_at
+        snapshot = state.get("snapshot")
+        if isinstance(snapshot, dict):
+            snapshot["status"] = "ended"
+            snapshot["ended_at"] = ended_at
+            snapshot["updated_at"] = ended_at
+        visual_snapshot = state.get("visual_snapshot")
+        if isinstance(visual_snapshot, dict):
+            visual_snapshot["status"] = "ended"
+            visual_snapshot["ended_at"] = ended_at
+            visual_snapshot["updated_at"] = ended_at
+    logger.info(
+        "[%s] response record_id=%s session_object_key=%s duration_ms=%s",
+        context,
+        response.record_id,
+        response.session_object_key,
+        response.duration_ms,
+    )
+    return response
+
+
+def _refresh_live_session_state(
+    *,
+    data: bytes,
+    stats: Dict[str, int],
+    record_id: str,
+    session_id: Optional[str],
+    context: str,
+) -> Dict[str, Any]:
+    logger.info(
+        "[%s] live_received record_id=%s session_id=%s byte_length=%s packet_count=%s sample_count_per_channel=%s remainder=%s",
+        context,
+        record_id,
+        session_id,
+        stats["byte_length"],
+        stats["packet_count"],
+        stats["sample_count_per_channel"],
+        stats["remainder"],
+    )
+
+    state = LIVE_SESSION_STATE.setdefault(
+        record_id,
+        {
+            "session_id": session_id,
+            "buffer": bytearray(),
+            "total_packets_received": 0,
+            "total_samples_received": 0,
+            "first_ts_ms": None,
+            "last_ts_ms": None,
+            "effective_sps": None,
+            "last_hr_bpm": None,
+            "preview_ch2": [],
+            "preview_ch3": [],
+            "preview_ch4": [],
+            "snapshot": None,
+            "is_active": True,
+            "ended_at": None,
+        },
+    )
+    state["session_id"] = session_id or state.get("session_id")
+    state["is_active"] = True
+    state["ended_at"] = None
+    state.setdefault("total_samples_received", 0)
+    state["total_packets_received"] += stats["packet_count"]
+    state["total_samples_received"] += stats["sample_count_per_channel"]
+    if "first_ts_ms" in stats and state.get("first_ts_ms") is None:
+        state["first_ts_ms"] = stats.get("first_ts_ms")
+    if "last_ts_ms" in stats:
+        state["last_ts_ms"] = stats.get("last_ts_ms")
+
+    if state.get("first_ts_ms") is not None and state.get("last_ts_ms") is not None:
+        first_ts = int(state["first_ts_ms"])
+        last_ts = int(state["last_ts_ms"])
+        if last_ts < first_ts:
+            last_ts += (1 << 24)
+        delta_ms = last_ts - first_ts
+        if delta_ms > 0:
+            state["effective_sps"] = round(
+                float(state["total_samples_received"]) / (delta_ms / 1000.0),
+                4,
+            )
+
+    channels = _decode_ads1298_packets(data)
+    preview_ch2 = list(state.get("preview_ch2") or [])
+    preview_ch3 = list(state.get("preview_ch3") or [])
+    preview_ch4 = list(state.get("preview_ch4") or [])
+    preview_ch2.extend(channels.get("CH2", []))
+    preview_ch3.extend(channels.get("CH3", []))
+    preview_ch4.extend(channels.get("CH4", []))
+    if len(preview_ch2) > LIVE_VISUAL_BUFFER_SAMPLES:
+        preview_ch2 = preview_ch2[-LIVE_VISUAL_BUFFER_SAMPLES:]
+    if len(preview_ch3) > LIVE_VISUAL_BUFFER_SAMPLES:
+        preview_ch3 = preview_ch3[-LIVE_VISUAL_BUFFER_SAMPLES:]
+    if len(preview_ch4) > LIVE_VISUAL_BUFFER_SAMPLES:
+        preview_ch4 = preview_ch4[-LIVE_VISUAL_BUFFER_SAMPLES:]
+    state["preview_ch2"] = preview_ch2
+    state["preview_ch3"] = preview_ch3
+    state["preview_ch4"] = preview_ch4
+
+    buffer_samples = min(len(preview_ch2), len(preview_ch3), len(preview_ch4))
+    window_seconds = round(buffer_samples / DEFAULT_SAMPLE_RATE_HZ, 2)
+    total_packets_buffered = buffer_samples // SAMPLES_PER_PACKET
+    updated_at = _sg_now_iso()
+    state["snapshot"] = {
+        "record_id": record_id,
+        "session_id": state.get("session_id"),
+        "status": live_session_status(state),
+        "channel": "CH2",
+        "updated_at": updated_at,
+        "ended_at": state.get("ended_at"),
+        "packet_count_received": stats["packet_count"],
+        "total_packets_buffered": total_packets_buffered,
+        "samples_analyzed": buffer_samples,
+        "window_seconds": window_seconds,
+        "quality_percentage": 0.0,
+        "signal_ok": buffer_samples > 0,
+        "abnormal_detected": False,
+        "reason_codes": [],
+        "heart_rate_bpm": None,
+        "signal": {
+            "full": preview_ch2[-buffer_samples:],
+            "r_peaks": [],
+        },
+        "markers": _empty_beat_markers(),
+        "interval_related": None,
+    }
+
+    state["visual_snapshot"] = {
+        "record_id": record_id,
+        "session_id": state.get("session_id"),
+        "status": live_session_status(state),
+        "updated_at": updated_at,
+        "ended_at": state.get("ended_at"),
+        "sample_rate_hz": DEFAULT_SAMPLE_RATE_HZ,
+        "buffer_samples": buffer_samples,
+        "total_samples_received": int(state.get("total_samples_received") or 0),
+        "heart_rate_bpm": None,
+        "channels": {
+            "CH2": preview_ch2[-buffer_samples:],
+            "CH3": preview_ch3[-buffer_samples:],
+            "CH4": preview_ch4[-buffer_samples:],
+        },
+    }
+
+    try:
+        _upsert_live_preview_row(
+            {
+                "record_id": record_id,
+                "ch2_preview": preview_ch2[-buffer_samples:],
+                "ch3_preview": preview_ch3[-buffer_samples:],
+                "ch4_preview": preview_ch4[-buffer_samples:],
+                "sample_count": int(state.get("total_samples_received") or 0),
+                "last_ts_ms": state.get("last_ts_ms"),
+                "updated_at": updated_at,
+            }
+        )
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("[SESSION_ADD] live_preview_upsert_failed record_id=%s error=%s", record_id, exc)
+
+    try:
+        _update_recording_row(
+            record_id,
+            {
+                "packet_count": int(state.get("total_packets_received") or 0),
+                "sample_count": int(state.get("total_samples_received") or 0),
+                "first_ts_ms": state.get("first_ts_ms"),
+                "last_ts_ms": state.get("last_ts_ms"),
+                "effective_sps": state.get("effective_sps"),
+            },
+        )
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("[SESSION_ADD] record_update_failed record_id=%s error=%s", record_id, exc)
+
+    return {
+        "record_id": record_id,
+        "session_id": state.get("session_id"),
+        "packet_count_received": stats["packet_count"],
+        "total_packets_buffered": total_packets_buffered,
+        "samples_analyzed": buffer_samples,
+        "window_seconds": window_seconds,
+        "quality_percentage": 0.0,
+        "signal_ok": buffer_samples > 0,
+        "abnormal_detected": False,
+        "reason_codes": [],
+        "heart_rate_bpm": None,
     }
 
 def _metrics_from_info(
@@ -593,6 +709,7 @@ def _process_window(
         }
     try:
         with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
             try:
                 from pandas.errors import ChainedAssignmentError
             except Exception:  # pragma: no cover - pandas compatibility
@@ -601,6 +718,10 @@ def _process_window(
             warnings.filterwarnings(
                 "ignore",
                 message=".*ChainedAssignmentError.*",
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message=".*Copy-on-Write.*",
             )
             signals, info = nk.ecg_process(window, sampling_rate=sample_rate_hz)
         cleaned_series = signals.get("ECG_Clean")
@@ -1285,47 +1406,6 @@ def _build_review_section(
     }
 
 
-def _latest_live_record_id() -> Optional[str]:
-    latest_record_id: Optional[str] = None
-    latest_updated_at = ""
-    for record_id, state in LIVE_SESSION_STATE.items():
-        snapshot = state.get("snapshot")
-        updated_at = snapshot.get("updated_at", "") if isinstance(snapshot, dict) else ""
-        if snapshot and updated_at >= latest_updated_at:
-            latest_record_id = record_id
-            latest_updated_at = updated_at
-    return latest_record_id
-
-
-def _live_session_status(state: Optional[Dict[str, Any]]) -> str:
-    if not state:
-        return "missing"
-    return "active" if bool(state.get("is_active")) else "ended"
-
-
-def _trim_live_visual_snapshot(
-    snapshot: Dict[str, Any],
-) -> Dict[str, Any]:
-    sample_rate_hz = int(snapshot.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
-    channels = snapshot.get("channels") or {}
-    trimmed_channels = {
-        "CH2": list(channels.get("CH2") or []),
-        "CH3": list(channels.get("CH3") or []),
-        "CH4": list(channels.get("CH4") or []),
-    }
-
-    return {
-        "record_id": snapshot.get("record_id"),
-        "session_id": snapshot.get("session_id"),
-        "status": snapshot.get("status"),
-        "updated_at": snapshot.get("updated_at"),
-        "ended_at": snapshot.get("ended_at"),
-        "sample_rate_hz": sample_rate_hz,
-        "buffer_samples": len(trimmed_channels["CH2"]),
-        "total_samples_received": int(snapshot.get("total_samples_received") or 0),
-        "heart_rate_bpm": snapshot.get("heart_rate_bpm"),
-        "channels": trimmed_channels,
-    }
 
 
 def _set_job(job_id: str, **fields: Any) -> None:
@@ -1348,11 +1428,16 @@ class CalibrationSignalQualityResponse(BaseModel):
     preview: Dict[str, List[float]]
 
 
+class CalibrationCompletionResponse(CalibrationSignalQualityResponse):
+    record_id: Optional[str] = None
+
+
 class SessionStartRequest(BaseModel):
     user_id: str
     session_id: str
     calibration_object_key: str
     start_time: Optional[str] = None
+    record_id: Optional[str] = None
 
 
 class SessionStartResponse(BaseModel):
@@ -1367,6 +1452,15 @@ class SessionUploadResponse(BaseModel):
     packet_count: int
     sample_count_per_channel: int
     duration_ms: int
+
+
+class SessionChunkResponse(BaseModel):
+    record_id: str
+    session_id: str
+    chunk_index: int
+    byte_length: int
+    packet_count: int
+    sample_count_per_channel: int
 
 
 class ReviewMeta(BaseModel):
@@ -1569,262 +1663,18 @@ def health() -> Dict[str, str]:
 
 
 
-@app.post("/calibration_signal_quality_check", response_model=CalibrationSignalQualityResponse)
-async def calibration_signal_quality_check(
-    request: Request,
-) -> CalibrationSignalQualityResponse:
+@app.post("/calibration_completion", response_model=CalibrationCompletionResponse)
+async def calibration_completion(request: Request) -> CalibrationCompletionResponse:
     data = await request.body()
-    stats = _packet_stats(data)
     run_id = request.headers.get("X-Run-Id") or f"calibration_{uuid4().hex}"
-    object_key = f"calibration/{run_id}.bin"
-
-    logger.info(
-        "[CALIBRATION] received run_id=%s byte_length=%s packet_count=%s sample_count_per_channel=%s remainder=%s",
-        run_id,
-        stats["byte_length"],
-        stats["packet_count"],
-        stats["sample_count_per_channel"],
-        stats["remainder"],
-    )
-
-    if stats["packet_count"] == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="No complete ECG packets received.",
-        )
-    if stats["remainder"] != 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Payload length is not a multiple of packet size {PACKET_BYTES}.",
-        )
-
-    channels = _decode_ads1298_packets(data)
-    ch2 = channels.get("CH2", [])
-    if not ch2:
-        raise HTTPException(status_code=400, detail="Decoded calibration signal is empty.")
-    calibration_result = _process_window(ch2, DEFAULT_SAMPLE_RATE_HZ)
-    quality_percentage = 100 + round(
-        _quality_to_percentage(calibration_result.get("quality")),
-        2,
-    )
-    signal_suitable = (
-        quality_percentage >= 70.0
-        and bool(calibration_result.get("cleaned"))
-        and bool(calibration_result.get("r_peaks"))
-    )
-    previews = _build_cleaned_previews(channels, DEFAULT_SAMPLE_RATE_HZ)
-
-    LAST_CALIBRATION_SAMPLES.clear()
-    LAST_CALIBRATION_SAMPLES.extend(calibration_result.get("cleaned", []))
-    LAST_CALIBRATION_META["byte_length"] = stats["byte_length"]
-    LAST_CALIBRATION_META["sample_count"] = stats["sample_count_per_channel"]
-
-    stored_object_key = ""
-    if signal_suitable:
-        _upload_storage_bytes(object_key, data)
-        stored_object_key = object_key
-
-    logger.info(
-        "[CALIBRATION] response run_id=%s quality_percentage=%.2f signal_suitable=%s stored_object_key=%s cleaned_samples=%s r_peaks=%s preview_lengths=%s",
-        run_id,
-        quality_percentage,
-        signal_suitable,
-        stored_object_key or "none",
-        len(calibration_result.get("cleaned", [])),
-        len(calibration_result.get("r_peaks", [])),
-        {label: len(previews.get(label, [])) for label in CHANNEL_LABELS},
-    )
-
-    return CalibrationSignalQualityResponse(
-        quality_percentage=quality_percentage,
-        signal_suitable=signal_suitable,
-        calibration_object_key=stored_object_key,
-        byte_length=stats["byte_length"],
-        packet_count=stats["packet_count"],
-        sample_count_per_channel=stats["sample_count_per_channel"],
-        preview=previews,
-    )
-
-
-@app.post("/session_signal_quality_check", response_model=SessionSignalQualityResponse)
-async def session_signal_quality_check(
-    request: Request,
-) -> SessionSignalQualityResponse:
-    data = await request.body()
-    stats = _packet_stats(data)
-    record_id = request.headers.get("X-Record-Id") or "unknown-record"
-    session_id = request.headers.get("X-Session-Id")
-
-    logger.info(
-        "[SESSION_CHECK] received record_id=%s session_id=%s byte_length=%s packet_count=%s sample_count_per_channel=%s remainder=%s",
-        record_id,
-        session_id,
-        stats["byte_length"],
-        stats["packet_count"],
-        stats["sample_count_per_channel"],
-        stats["remainder"],
-    )
-
-    if stats["packet_count"] == 0:
-        raise HTTPException(status_code=400, detail="No complete ECG packets received.")
-    if stats["remainder"] != 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Payload length is not a multiple of packet size {PACKET_BYTES}.",
-        )
-
-    state = LIVE_SESSION_STATE.setdefault(
-        record_id,
-        {
-            "session_id": session_id,
-            "buffer": bytearray(),
-            "total_packets_received": 0,
-            "total_samples_received": 0,
-            "last_hr_bpm": None,
-            "snapshot": None,
-            "is_active": True,
-            "ended_at": None,
-        },
-    )
-    state["session_id"] = session_id or state.get("session_id")
-    state["is_active"] = True
-    state["ended_at"] = None
-    state["buffer"].extend(data)
-    state["total_packets_received"] += stats["packet_count"]
-    state["total_samples_received"] += stats["sample_count_per_channel"]
-
-    max_buffer_bytes = LIVE_VISUAL_BUFFER_PACKETS * PACKET_BYTES
-    if len(state["buffer"]) > max_buffer_bytes:
-        state["buffer"] = state["buffer"][-max_buffer_bytes:]
-
-    buffered_payload = bytes(state["buffer"])
-    buffered_stats = _packet_stats(buffered_payload)
-    channels = _decode_ads1298_packets(buffered_payload)
-    ch2 = channels.get("CH2", [])
-    result = _process_window(ch2, DEFAULT_SAMPLE_RATE_HZ)
-    quality_percentage = round(_quality_to_percentage(result.get("quality")), 2)
-    heart_rate_bpm = result.get("metrics", {}).get("avg_hr_bpm")
-    reason_codes: List[str] = []
-
-    if quality_percentage < 50.0:
-        reason_codes.append("poor_signal_quality")
-    if heart_rate_bpm is not None and heart_rate_bpm < 45.0:
-        reason_codes.append("bradycardia")
-    if heart_rate_bpm is not None and heart_rate_bpm > 190.0:
-        reason_codes.append("tachycardia")
-    previous_hr = state.get("last_hr_bpm")
-    if (
-        previous_hr is not None
-        and heart_rate_bpm is not None
-        and abs(float(heart_rate_bpm) - float(previous_hr)) >= 40.0
-    ):
-        reason_codes.append("abrupt_hr_shift")
-    if len(result.get("r_peaks", [])) < 2 and len(ch2) >= DEFAULT_SAMPLE_RATE_HZ * 4:
-        reason_codes.append("insufficient_r_peaks")
-    if result.get("cleaned"):
-        recent = result["cleaned"][-DEFAULT_SAMPLE_RATE_HZ :]
-        if recent and (max(recent) - min(recent)) < 0.05:
-            reason_codes.append("possible_flatline")
-
-    state["last_hr_bpm"] = heart_rate_bpm
-    signal_ok = quality_percentage >= 50.0
-    abnormal_detected = len(reason_codes) > 0
-    window_seconds = round(
-        buffered_stats["sample_count_per_channel"] / DEFAULT_SAMPLE_RATE_HZ,
-        2,
-    )
-    interval_related = None
-    if buffered_stats["sample_count_per_channel"] >= int(DEFAULT_SAMPLE_RATE_HZ * 0.5):
-        interval_related = _interval_related_single(
-            result.get("cleaned", []),
-            buffered_stats["sample_count_per_channel"],
-            DEFAULT_SAMPLE_RATE_HZ,
-        )
-    markers = _delineate_signal_peaks(
-        result.get("cleaned", []),
-        result.get("r_peaks", []),
-        DEFAULT_SAMPLE_RATE_HZ,
-    )
-    updated_at = datetime.now(timezone.utc).isoformat()
-
-    state["snapshot"] = {
-        "record_id": record_id,
-        "session_id": state.get("session_id"),
-        "status": _live_session_status(state),
-        "channel": "CH2",
-        "updated_at": updated_at,
-        "ended_at": state.get("ended_at"),
-        "total_packets_buffered": buffered_stats["packet_count"],
-        "samples_analyzed": buffered_stats["sample_count_per_channel"],
-        "window_seconds": window_seconds,
-        "quality_percentage": quality_percentage,
-        "signal_ok": signal_ok,
-        "abnormal_detected": abnormal_detected,
-        "reason_codes": list(reason_codes),
-        "heart_rate_bpm": heart_rate_bpm,
-        "signal": {
-            "full": result.get("cleaned", []),
-            "r_peaks": result.get("r_peaks", []),
-        },
-        "markers": markers,
-        "interval_related": interval_related,
-    }
-    cleaned_ch2 = result.get("cleaned", []) or []
-    cleaned_ch3 = _clean_series(channels.get("CH3", []), DEFAULT_SAMPLE_RATE_HZ)
-    cleaned_ch4 = _clean_series(channels.get("CH4", []), DEFAULT_SAMPLE_RATE_HZ)
-
-    state["visual_snapshot"] = {
-        "record_id": record_id,
-        "session_id": state.get("session_id"),
-        "status": _live_session_status(state),
-        "updated_at": updated_at,
-        "ended_at": state.get("ended_at"),
-        "sample_rate_hz": DEFAULT_SAMPLE_RATE_HZ,
-        "buffer_samples": min(
-            len(cleaned_ch2),
-            len(cleaned_ch3),
-            len(cleaned_ch4),
-            LIVE_VISUAL_BUFFER_SAMPLES,
-        ),
-        "total_samples_received": int(state.get("total_samples_received") or 0),
-        "heart_rate_bpm": heart_rate_bpm,
-        "channels": {
-            "CH2": cleaned_ch2[-LIVE_VISUAL_BUFFER_SAMPLES:],
-            "CH3": cleaned_ch3[-LIVE_VISUAL_BUFFER_SAMPLES:],
-            "CH4": cleaned_ch4[-LIVE_VISUAL_BUFFER_SAMPLES:],
-        },
-    }
-
-    response = SessionSignalQualityResponse(
-        record_id=record_id,
-        session_id=state.get("session_id"),
-        packet_count_received=stats["packet_count"],
-        total_packets_buffered=buffered_stats["packet_count"],
-        samples_analyzed=buffered_stats["sample_count_per_channel"],
-        window_seconds=window_seconds,
-        quality_percentage=quality_percentage,
-        signal_ok=signal_ok,
-        abnormal_detected=abnormal_detected,
-        reason_codes=reason_codes,
-        heart_rate_bpm=heart_rate_bpm,
-    )
-    logger.info(
-        "[SESSION_CHECK] response record_id=%s quality_percentage=%.2f signal_ok=%s abnormal_detected=%s reasons=%s heart_rate_bpm=%s samples_analyzed=%s marker_counts=%s",
-        record_id,
-        response.quality_percentage,
-        response.signal_ok,
-        response.abnormal_detected,
-        ",".join(response.reason_codes) if response.reason_codes else "none",
-        response.heart_rate_bpm,
-        response.samples_analyzed,
-        {key: len(value) for key, value in markers.items()},
-    )
-    return response
+    user_id = request.headers.get("X-User-Id")
+    result = _handle_calibration_payload(data=data, run_id=run_id, user_id=user_id)
+    return CalibrationCompletionResponse(**result)
 
 
 @app.get("/session/live", response_model=LiveSessionSnapshotResponse)
 async def session_live(record_id: Optional[str] = None) -> LiveSessionSnapshotResponse:
-    selected_record_id = record_id or _latest_live_record_id()
+    selected_record_id = record_id or latest_live_record_id()
     if not selected_record_id:
         raise HTTPException(status_code=404, detail="No live session snapshot available.")
 
@@ -1851,19 +1701,71 @@ async def session_live(record_id: Optional[str] = None) -> LiveSessionSnapshotRe
 async def session_live_visual(
     record_id: Optional[str] = None,
 ) -> LiveSessionVisualResponse:
-    selected_record_id = record_id or _latest_live_record_id()
+    persisted_preview = None
+    selected_record_id = record_id or latest_live_record_id()
+    if not selected_record_id:
+        persisted_preview = _fetch_latest_live_preview_row()
+        selected_record_id = persisted_preview.get("record_id") if persisted_preview else None
     if not selected_record_id:
         raise HTTPException(status_code=404, detail="No live session visualization available.")
 
     state = LIVE_SESSION_STATE.get(selected_record_id)
     snapshot = state.get("visual_snapshot") if state else None
     if not isinstance(snapshot, dict):
-        raise HTTPException(
-            status_code=404,
-            detail=f"No live session visualization available for record_id={selected_record_id}.",
+        persisted_preview = persisted_preview or _fetch_live_preview_row(selected_record_id)
+        if persisted_preview:
+            payload = trim_live_visual_snapshot(
+                {
+                    "record_id": selected_record_id,
+                    "session_id": state.get("session_id") if state else None,
+                    "status": live_session_status(state) if state else "active",
+                    "updated_at": persisted_preview.get("updated_at"),
+                    "ended_at": state.get("ended_at") if state else None,
+                    "sample_rate_hz": DEFAULT_SAMPLE_RATE_HZ,
+                    "buffer_samples": len(list(persisted_preview.get("ch2_preview") or [])),
+                    "total_samples_received": int(persisted_preview.get("sample_count") or 0),
+                    "heart_rate_bpm": state.get("last_hr_bpm") if state else None,
+                    "channels": {
+                        "CH2": list(persisted_preview.get("ch2_preview") or []),
+                        "CH3": list(persisted_preview.get("ch3_preview") or []),
+                        "CH4": list(persisted_preview.get("ch4_preview") or []),
+                    },
+                },
+                DEFAULT_SAMPLE_RATE_HZ,
+            )
+            logger.info(
+                "[SESSION_LIVE_VISUAL] served_persisted record_id=%s updated_at=%s buffer_samples=%s",
+                selected_record_id,
+                payload.get("updated_at"),
+                payload.get("buffer_samples"),
+            )
+            return LiveSessionVisualResponse(**payload)
+        if not state:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No live session visualization available for record_id={selected_record_id}.",
+            )
+        placeholder = {
+            "record_id": selected_record_id,
+            "session_id": state.get("session_id"),
+            "status": live_session_status(state),
+            "updated_at": _sg_now_iso(),
+            "ended_at": state.get("ended_at"),
+            "sample_rate_hz": DEFAULT_SAMPLE_RATE_HZ,
+            "buffer_samples": 0,
+            "total_samples_received": int(state.get("total_samples_received") or 0),
+            "heart_rate_bpm": state.get("last_hr_bpm"),
+            "channels": {"CH2": [], "CH3": [], "CH4": []},
+        }
+        payload = trim_live_visual_snapshot(placeholder, DEFAULT_SAMPLE_RATE_HZ)
+        logger.info(
+            "[SESSION_LIVE_VISUAL] served_empty record_id=%s updated_at=%s status=%s",
+            selected_record_id,
+            payload.get("updated_at"),
+            payload.get("status"),
         )
-
-    payload = _trim_live_visual_snapshot(snapshot)
+        return LiveSessionVisualResponse(**payload)
+    payload = trim_live_visual_snapshot(snapshot, DEFAULT_SAMPLE_RATE_HZ)
     logger.info(
         "[SESSION_LIVE_VISUAL] served record_id=%s updated_at=%s buffer_samples=%s total_samples_received=%s status=%s",
         selected_record_id,
@@ -1879,49 +1781,99 @@ async def session_live_visual(
 async def session_start(payload: SessionStartRequest) -> SessionStartResponse:
     config = _get_supabase_config()
     session_object_key = f"session/{payload.session_id}.bin"
+    normalized_start_time = _normalize_iso_to_sg(payload.start_time)
     logger.info(
         "[SESSION_START] received user_id=%s session_id=%s calibration_object_key=%s start_time=%s",
         payload.user_id,
         payload.session_id,
         payload.calibration_object_key,
-        payload.start_time,
+        normalized_start_time,
     )
-    record = _insert_recording_row(
-        {
-            "user_id": payload.user_id,
-            "bucket": config["bucket"],
-            "session_object_key": session_object_key,
-            "calibration_object_key": payload.calibration_object_key,
-            "encoding": "ads1298_24be_mv",
-            "sample_rate_hz": 500,
-            "channels": 3,
-            "sample_count": 0,
-            "duration_ms": 0,
-            "start_time": payload.start_time,
-            "byte_length": 0,
-            "notes": json.dumps(
-                {
-                    "channel_labels": CHANNEL_LABELS,
-                    "packet_bytes": PACKET_BYTES,
-                    "samples_per_packet": SAMPLES_PER_PACKET,
-                    "encoding": "ads1298_24be_mv",
-                }
-            ),
-        }
-    )
+    record_id = payload.record_id
+    if record_id:
+        record = _fetch_recording_by_id(record_id)
+        _update_recording_row(
+            record_id,
+            {
+                "user_id": payload.user_id,
+                "bucket": config["bucket"],
+                "session_object_key": session_object_key,
+                "calibration_object_key": payload.calibration_object_key,
+                "encoding": "ads1298_24be_mv",
+                "sample_rate_hz": 500,
+                "channels": 3,
+                "start_time": normalized_start_time,
+                "notes": json.dumps(
+                    {
+                        "channel_labels": CHANNEL_LABELS,
+                        "packet_bytes": PACKET_BYTES,
+                        "samples_per_packet": SAMPLES_PER_PACKET,
+                        "encoding": "ads1298_24be_mv",
+                    }
+                ),
+            },
+        )
+        response_record_id = str(record.get("id"))
+    else:
+        record = _insert_recording_row(
+            {
+                "user_id": payload.user_id,
+                "bucket": config["bucket"],
+                "session_object_key": session_object_key,
+                "calibration_object_key": payload.calibration_object_key,
+                "encoding": "ads1298_24be_mv",
+                "sample_rate_hz": 500,
+                "channels": 3,
+                "sample_count": 0,
+                "duration_ms": 0,
+                "created_at": _sg_now_iso(),
+                "start_time": normalized_start_time,
+                "byte_length": 0,
+                "notes": json.dumps(
+                    {
+                        "channel_labels": CHANNEL_LABELS,
+                        "packet_bytes": PACKET_BYTES,
+                        "samples_per_packet": SAMPLES_PER_PACKET,
+                        "encoding": "ads1298_24be_mv",
+                    }
+                ),
+            }
+        )
+        response_record_id = str(record["id"])
     response = SessionStartResponse(
-        record_id=str(record["id"]),
+        record_id=response_record_id,
         session_object_key=session_object_key,
     )
     LIVE_SESSION_STATE[str(record["id"])] = {
         "session_id": payload.session_id,
-        "buffer": bytearray(),
         "total_packets_received": 0,
+        "total_samples_received": 0,
+        "first_ts_ms": None,
+        "last_ts_ms": None,
+        "effective_sps": None,
         "last_hr_bpm": None,
+        "preview_ch2": [],
+        "preview_ch3": [],
+        "preview_ch4": [],
         "snapshot": None,
+        "visual_snapshot": None,
         "is_active": True,
         "ended_at": None,
     }
+    try:
+        _upsert_live_preview_row(
+            {
+                "record_id": response.record_id,
+                "ch2_preview": [],
+                "ch3_preview": [],
+                "ch4_preview": [],
+                "sample_count": 0,
+                "last_ts_ms": None,
+                "updated_at": _sg_now_iso(),
+            }
+        )
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("[SESSION_START] live_preview_init_failed record_id=%s error=%s", response.record_id, exc)
     logger.info(
         "[SESSION_START] response record_id=%s session_object_key=%s",
         response.record_id,
@@ -1930,97 +1882,107 @@ async def session_start(payload: SessionStartRequest) -> SessionStartResponse:
     return response
 
 
-@app.post("/session/{record_id}/upload", response_model=SessionUploadResponse)
-async def session_upload(record_id: str, request: Request) -> SessionUploadResponse:
+@app.post("/add_to_session", response_model=SessionChunkResponse)
+async def add_to_session(request: Request) -> SessionChunkResponse:
     payload = await request.body()
+    record_id = request.headers.get("X-Record-Id")
     session_id = request.headers.get("X-Session-Id")
-    user_id = request.headers.get("X-User-Id")
-    start_time = request.headers.get("X-Start-Time")
-    if not session_id or not user_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing X-Session-Id or X-User-Id header.",
+    chunk_header = request.headers.get("X-Chunk-Index")
+    if not record_id or not session_id:
+        logger.error("[SESSION_ADD] missing_record_or_session record_id=%s session_id=%s", record_id, session_id)
+        raise HTTPException(status_code=400, detail="Missing X-Record-Id or X-Session-Id header.")
+    if chunk_header is None:
+        logger.error("[SESSION_ADD] missing_chunk_index record_id=%s session_id=%s", record_id, session_id)
+        raise HTTPException(status_code=400, detail="Missing X-Chunk-Index header.")
+    try:
+        chunk_index = int(chunk_header)
+    except ValueError:
+        logger.error(
+            "[SESSION_ADD] invalid_chunk_index record_id=%s session_id=%s value=%r",
+            record_id,
+            session_id,
+            chunk_header,
         )
+        raise HTTPException(status_code=400, detail="Invalid chunk index.")
 
-    stats = _packet_stats(payload)
-    logger.info(
-        "[SESSION_UPLOAD] received record_id=%s session_id=%s user_id=%s byte_length=%s packet_count=%s sample_count_per_channel=%s remainder=%s",
-        record_id,
-        session_id,
-        user_id,
-        stats["byte_length"],
-        stats["packet_count"],
-        stats["sample_count_per_channel"],
-        stats["remainder"],
-    )
+    stats = _validate_packet_payload(payload, "SESSION_ADD")
     if stats["packet_count"] == 0:
         raise HTTPException(status_code=400, detail="No complete ECG packets received.")
-    if stats["remainder"] != 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Payload length is not a multiple of packet size {PACKET_BYTES}.",
-        )
-
-    session_object_key = f"session/{session_id}.bin"
-    _upload_storage_bytes(session_object_key, payload)
-    duration_ms = round((stats["sample_count_per_channel"] / 500) * 1000)
-    _update_recording_row(
-        record_id,
-        {
-            "user_id": user_id,
-            "session_object_key": session_object_key,
-            "sample_count": stats["sample_count_per_channel"],
-            "duration_ms": duration_ms,
-            "start_time": start_time,
-            "byte_length": stats["byte_length"],
-            "encoding": "ads1298_24be_mv",
-            "sample_rate_hz": 500,
-            "channels": 3,
-            "notes": json.dumps(
-                {
-                    "channel_labels": CHANNEL_LABELS,
-                    "packet_bytes": PACKET_BYTES,
-                    "samples_per_packet": SAMPLES_PER_PACKET,
-                    "encoding": "ads1298_24be_mv",
-                    "packet_count": stats["packet_count"],
-                }
-            ),
-        },
-    )
     try:
-        _process_review_artifacts_for_record(record_id)
-    except Exception as exc:  # pragma: no cover - safeguard
-        logger.error("[SESSION_UPLOAD] review_processing_failed record_id=%s error=%s", record_id, exc)
-    response = SessionUploadResponse(
+        _store_session_chunk(
+            record_id=record_id,
+            session_id=session_id,
+            payload=payload,
+            chunk_index=chunk_index,
+            context="SESSION_ADD",
+            stats=stats,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - unexpected failure
+        logger.exception(
+            "[SESSION_ADD] store_failed record_id=%s session_id=%s chunk_index=%s error=%s",
+            record_id,
+            session_id,
+            chunk_index,
+            exc,
+        )
+        raise HTTPException(status_code=502, detail=f"Failed to store session chunk: {exc}") from exc
+
+    try:
+        _refresh_live_session_state(
+            data=payload,
+            stats=stats,
+            record_id=record_id,
+            session_id=session_id,
+            context="SESSION_ADD",
+        )
+    except Exception as exc:  # pragma: no cover - keep storage alive
+        logger.exception(
+            "[SESSION_ADD] live_preview_failed record_id=%s session_id=%s chunk_index=%s error=%s",
+            record_id,
+            session_id,
+            chunk_index,
+            exc,
+        )
+    return SessionChunkResponse(
         record_id=record_id,
-        session_object_key=session_object_key,
+        session_id=session_id,
+        chunk_index=chunk_index,
         byte_length=stats["byte_length"],
         packet_count=stats["packet_count"],
         sample_count_per_channel=stats["sample_count_per_channel"],
-        duration_ms=duration_ms,
     )
-    state = LIVE_SESSION_STATE.get(record_id)
-    if state is not None:
-        ended_at = datetime.now(timezone.utc).isoformat()
-        state["is_active"] = False
-        state["ended_at"] = ended_at
-        snapshot = state.get("snapshot")
-        if isinstance(snapshot, dict):
-            snapshot["status"] = "ended"
-            snapshot["ended_at"] = ended_at
-            snapshot["updated_at"] = ended_at
-        visual_snapshot = state.get("visual_snapshot")
-        if isinstance(visual_snapshot, dict):
-            visual_snapshot["status"] = "ended"
-            visual_snapshot["ended_at"] = ended_at
-            visual_snapshot["updated_at"] = ended_at
-    logger.info(
-        "[SESSION_UPLOAD] response record_id=%s session_object_key=%s duration_ms=%s",
-        response.record_id,
-        response.session_object_key,
-        response.duration_ms,
+
+
+@app.post("/end_session", response_model=SessionUploadResponse)
+async def end_session(request: Request) -> SessionUploadResponse:
+    payload = await request.body()
+    record_id = request.headers.get("X-Record-Id")
+    session_id = request.headers.get("X-Session-Id")
+    user_id = request.headers.get("X-User-Id")
+    start_time = request.headers.get("X-Start-Time")
+    if not record_id or not session_id or not user_id:
+        logger.error(
+            "[SESSION_END] missing_headers record_id=%s session_id=%s user_id=%s",
+            record_id,
+            session_id,
+            user_id,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Missing X-Record-Id, X-Session-Id, or X-User-Id header.",
+        )
+    stats = _validate_packet_payload(payload, "SESSION_END")
+    return _finalize_session_upload(
+        record_id=record_id,
+        session_id=session_id,
+        user_id=user_id,
+        start_time=start_time,
+        payload=payload,
+        stats=stats,
+        context="SESSION_END",
     )
-    return response
 
 def _session_analysis_job(job_id: str, record_id: str) -> None:
     logger.info("[JOB] start job_id=%s record_id=%s", job_id, record_id)

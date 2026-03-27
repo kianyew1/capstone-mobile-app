@@ -5,18 +5,13 @@ export type SessionStartResult = {
   sessionObjectKey: string;
 };
 
-export type SessionSignalCheckResult = {
+export type SessionChunkResult = {
   recordId: string;
-  sessionId: string | null;
-  packetCountReceived: number;
-  totalPacketsBuffered: number;
-  samplesAnalyzed: number;
-  windowSeconds: number;
-  qualityPercentage: number;
-  signalOk: boolean;
-  abnormalDetected: boolean;
-  reasonCodes: string[];
-  heartRateBpm: number | null;
+  sessionId: string;
+  chunkIndex: number;
+  byteLength: number;
+  packetCount: number;
+  sampleCountPerChannel: number;
 };
 
 export async function startSessionRecord(params: {
@@ -24,6 +19,7 @@ export async function startSessionRecord(params: {
   sessionId: string;
   calibrationObjectKey: string;
   startTime?: Date | null;
+  recordId?: string | null;
 }): Promise<SessionStartResult> {
   const url = `${BACKEND_BASE_URL}/session/start`;
   console.log(
@@ -39,6 +35,7 @@ export async function startSessionRecord(params: {
       session_id: params.sessionId,
       calibration_object_key: params.calibrationObjectKey,
       start_time: params.startTime ? params.startTime.toISOString() : null,
+      record_id: params.recordId ?? null,
     }),
   });
 
@@ -65,14 +62,15 @@ export async function finalizeSessionRecord(params: {
   startTime?: Date | null;
 }): Promise<void> {
   const body = Uint8Array.from(params.bytes).buffer as ArrayBuffer;
-  const url = `${BACKEND_BASE_URL}/session/${params.recordId}/upload`;
+  const url = `${BACKEND_BASE_URL}/end_session`;
   console.log(
-    `[BACKEND] POST ${url} bytes=${params.bytes.length} session_id=${params.sessionId}`,
+    `[BACKEND] POST ${url} bytes=${params.bytes.length} session_id=${params.sessionId} record_id=${params.recordId}`,
   );
   const response = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/octet-stream",
+      "X-Record-Id": params.recordId,
       "X-User-Id": params.userId,
       "X-Session-Id": params.sessionId,
       "X-Start-Time": params.startTime ? params.startTime.toISOString() : "",
@@ -91,15 +89,16 @@ export async function finalizeSessionRecord(params: {
   );
 }
 
-export async function checkSessionSignalQuality(params: {
+export async function addToSessionChunk(params: {
   recordId: string;
   sessionId: string;
+  chunkIndex: number;
   bytes: Uint8Array;
-}): Promise<SessionSignalCheckResult> {
+}): Promise<SessionChunkResult> {
   const body = Uint8Array.from(params.bytes).buffer as ArrayBuffer;
-  const url = `${BACKEND_BASE_URL}/session_signal_quality_check`;
+  const url = `${BACKEND_BASE_URL}/add_to_session`;
   console.log(
-    `[BACKEND] POST ${url} record_id=${params.recordId} session_id=${params.sessionId} bytes=${params.bytes.length}`,
+    `[BACKEND] POST ${url} record_id=${params.recordId} session_id=${params.sessionId} chunk_index=${params.chunkIndex} bytes=${params.bytes.length}`,
   );
   const response = await fetch(url, {
     method: "POST",
@@ -107,35 +106,23 @@ export async function checkSessionSignalQuality(params: {
       "Content-Type": "application/octet-stream",
       "X-Record-Id": params.recordId,
       "X-Session-Id": params.sessionId,
+      "X-Chunk-Index": String(params.chunkIndex),
     },
     body,
   });
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(
-      `Session signal quality check failed: ${response.status} ${text}`,
-    );
+    throw new Error(`Add session chunk failed: ${response.status} ${text}`);
   }
 
   const data = await response.json();
-  console.log(
-    `[BACKEND] session_signal_quality_check response abnormal=${Boolean(data.abnormal_detected)} signal_ok=${Boolean(data.signal_ok)} quality=${Number(data.quality_percentage ?? 0)} hr=${data.heart_rate_bpm ?? "null"} reasons=${Array.isArray(data.reason_codes) ? data.reason_codes.join("|") : "none"}`,
-  );
   return {
     recordId: String(data.record_id ?? params.recordId),
-    sessionId: data.session_id ? String(data.session_id) : null,
-    packetCountReceived: Number(data.packet_count_received ?? 0),
-    totalPacketsBuffered: Number(data.total_packets_buffered ?? 0),
-    samplesAnalyzed: Number(data.samples_analyzed ?? 0),
-    windowSeconds: Number(data.window_seconds ?? 0),
-    qualityPercentage: Number(data.quality_percentage ?? 0),
-    signalOk: Boolean(data.signal_ok),
-    abnormalDetected: Boolean(data.abnormal_detected),
-    reasonCodes: Array.isArray(data.reason_codes) ? data.reason_codes : [],
-    heartRateBpm:
-      data.heart_rate_bpm === null || data.heart_rate_bpm === undefined
-        ? null
-        : Number(data.heart_rate_bpm),
+    sessionId: String(data.session_id ?? params.sessionId),
+    chunkIndex: Number(data.chunk_index ?? params.chunkIndex),
+    byteLength: Number(data.byte_length ?? 0),
+    packetCount: Number(data.packet_count ?? 0),
+    sampleCountPerChannel: Number(data.sample_count_per_channel ?? 0),
   };
 }

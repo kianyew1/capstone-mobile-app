@@ -247,7 +247,7 @@ On the phone:
 3. Let it complete.
 
 Expected backend behavior:
-- `POST /calibration_signal_quality_check`
+- `POST /calibration_completion`
 - backend evaluates the raw payload
 - if suitable, calibration object is stored
 
@@ -272,7 +272,7 @@ Expected backend behavior:
 - `POST /session/start`
 - app receives a `record_id`
 - app begins periodic live session uploads to:
-  - `POST /session_signal_quality_check`
+  - `POST /add_to_session`
 
 Expected local review-web behavior:
 - open the live session page:
@@ -305,7 +305,7 @@ What to confirm:
 - heart rate updates
 - graphs move continuously
 - no repeated fetch failures in browser console
-- no 500s in Render logs for `/session_signal_quality_check`
+- no 500s in Render logs for `/add_to_session`
 
 ---
 
@@ -317,7 +317,7 @@ On the phone:
 
 Expected backend behavior:
 - full session upload to:
-  - `POST /session/{record_id}/upload`
+  - `POST /end_session`
 - backend stores session raw data
 - backend processing / processed review artifacts become available
 
@@ -390,7 +390,7 @@ Check:
 Check:
 - Render logs for:
   - `/session/start`
-  - `/session_signal_quality_check`
+  - `/add_to_session`
 - browser console on `ecg-review-web`
 - phone app logs for backend POST failures
 

@@ -9,6 +9,12 @@ export function concatUint8Arrays(chunks: Uint8Array[]): Uint8Array {
   return result;
 }
 
+export const ECG_STATUS_BYTES = 3;
+export const ECG_TIMESTAMP_BYTES = 3;
+export const ECG_BYTES_PER_SAMPLE = 3;
+export const ECG_CHANNELS = 3;
 export const ECG_SAMPLES_PER_PACKET = 25;
 export const ECG_PACKET_BYTES =
-  (1 + ECG_SAMPLES_PER_PACKET * 3) * 3;
+  ECG_STATUS_BYTES +
+  ECG_TIMESTAMP_BYTES +
+  ECG_BYTES_PER_SAMPLE * ECG_SAMPLES_PER_PACKET * ECG_CHANNELS;

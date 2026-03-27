@@ -18,6 +18,8 @@ import {
 import { useBluetoothStore } from "@/stores/bluetooth-store";
 import {
   ECG_PACKET_BYTES,
+  ECG_STATUS_BYTES,
+  ECG_TIMESTAMP_BYTES,
   ECG_SAMPLES_PER_PACKET,
 } from "@/services/ecg-utils";
 
@@ -42,9 +44,8 @@ let hasLoggedFirstPayload = false;
 
 const MOCK_SAMPLE_RATE_HZ = 500;
 const MOCK_SAMPLES_PER_PACKET = ECG_SAMPLES_PER_PACKET;
-const MOCK_PACKET_INTERVAL_MS = Math.round(
-  (1000 * MOCK_SAMPLES_PER_PACKET) / MOCK_SAMPLE_RATE_HZ,
-);
+// Mock timing intentionally averages ~51ms per packet.
+const MOCK_PACKET_INTERVAL_MS = 51;
 const MOCK_ECG_AMPLITUDE_MV = 0.85;
 const MOCK_ECG_NOISE_AMPLITUDE_MV = 0.03;
 const MOCK_PACKET_STATUS = 0xc00000;
@@ -52,6 +53,8 @@ const ADS1298_VREF = 2.4;
 const ADS1298_GAIN = 6;
 const ADS1298_MAX_CODE = (2 ** 23) - 1;
 let mockPhase = 0;
+let mockTimestampMs = 0;
+const MOCK_TIMESTAMP_STEP_MS = 51;
 
 const syntheticEcg = (t: number) => {
   const p = 0.12 * Math.exp(-Math.pow((t - 0.18) / 0.035, 2));
@@ -88,6 +91,17 @@ const write24SignedBE = (
   buffer[offset + 2] = unsigned & 0xff;
 };
 
+const write24UnsignedBE = (
+  buffer: Uint8Array,
+  offset: number,
+  value: number,
+) => {
+  const bounded = value & 0xffffff;
+  buffer[offset] = (bounded >> 16) & 0xff;
+  buffer[offset + 1] = (bounded >> 8) & 0xff;
+  buffer[offset + 2] = bounded & 0xff;
+};
+
 const nextMockTriplet = () => {
   const baseFreqHz = MOCK_HEART_RATE_CONFIG.baseHeartRate / 60;
   const phaseStep =
@@ -119,7 +133,7 @@ const nextMockTriplet = () => {
 const buildMockPacket = () => {
   const packet = new Uint8Array(ECG_PACKET_BYTES);
   write24SignedBE(packet, 0, MOCK_PACKET_STATUS);
-  const ch2OffsetBase = 3;
+  const ch2OffsetBase = ECG_STATUS_BYTES;
   const ch3OffsetBase = ch2OffsetBase + MOCK_SAMPLES_PER_PACKET * 3;
   const ch4OffsetBase = ch3OffsetBase + MOCK_SAMPLES_PER_PACKET * 3;
 
@@ -129,6 +143,8 @@ const buildMockPacket = () => {
     write24SignedBE(packet, ch3OffsetBase + i * 3, sample.ch3);
     write24SignedBE(packet, ch4OffsetBase + i * 3, sample.ch4);
   }
+  mockTimestampMs = (mockTimestampMs + MOCK_TIMESTAMP_STEP_MS) & 0xffffff;
+  write24UnsignedBE(packet, ECG_PACKET_BYTES - ECG_TIMESTAMP_BYTES, mockTimestampMs);
   return packet;
 };
 

@@ -70,7 +70,7 @@ export default function CalibrationScreen() {
   const [isGraphLoading, setIsGraphLoading] = useState(false);
   const [graphWidth, setGraphWidth] = useState(320);
 
-  const { setCalibrationResult, completeOnboarding, isOnboardingComplete } =
+  const { user, setCalibrationResult, completeOnboarding, isOnboardingComplete } =
     useAppStore();
   const { startEcgNotifications, stopEcgNotifications } = useBluetoothService();
   const packetCountRef = useRef(0);
@@ -158,7 +158,7 @@ export default function CalibrationScreen() {
         const bytes = concatUint8Arrays(
           packetsRef.current.map((packet) => packet.data),
         );
-        const quality = await getCalibrationSignalQuality(bytes, runId);
+        const quality = await getCalibrationSignalQuality(bytes, runId, user?.email ?? null);
         const message = quality.signalSuitable
           ? `Signal quality ${quality.qualityPercentage}%. Calibration successful.`
           : `Signal quality ${quality.qualityPercentage}%. Calibration failed. Please adjust device placement.`;
@@ -178,6 +178,7 @@ export default function CalibrationScreen() {
           timestamp: new Date(),
           signalQuality: quality.qualityPercentage,
           calibrationObjectKey: quality.calibrationObjectKey,
+          recordId: quality.recordId ?? undefined,
         });
       } catch (error) {
         console.error("Failed to save calibration packets:", error);
