@@ -51,7 +51,7 @@ export function usePermissions() {
           );
 
           newPermissions.bluetooth =
-            bluetoothScan && bluetoothConnect ? "granted" : "denied";
+            bluetoothScan && bluetoothConnect ? "granted" : "undetermined";
         } else {
           // On older Android, Bluetooth uses location permission
           newPermissions.bluetooth = newPermissions.location;

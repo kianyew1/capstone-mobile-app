@@ -1,0 +1,1027 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wearable ECG — Early Detection of Ischemia | SUTD Capstone</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #F0F4F8;
+    --surface: #FFFFFF;
+    --surface-2: #E8EFF7;
+    --navy: #0D1B3E;
+    --blue: #1A6EBD;
+    --blue-light: #3B8FD4;
+    --accent: #E84855;
+    --slate: #4A5C74;
+    --muted: #8499B5;
+    --text: #1C2B3A;
+    --border: #C8D8EC;
+    --mono: 'JetBrains Mono', monospace;
+    --serif: 'DM Serif Display', serif;
+    --sans: 'DM Sans', sans-serif;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    overflow-x: hidden;
+  }
+
+  /* ── NAV ── */
+  nav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 1.1rem 4rem;
+    background: rgba(240,244,248,0.88);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-logo {
+    display: flex; align-items: center; gap: 0.6rem;
+    font-family: var(--mono); font-size: 0.85rem; font-weight: 500;
+    color: var(--navy); letter-spacing: 0.04em;
+  }
+  .nav-logo .pulse-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent);
+    animation: pulse-dot 2s ease-in-out infinite;
+  }
+  @keyframes pulse-dot {
+    0%,100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.4); }
+  }
+  .nav-links { display: flex; gap: 2rem; list-style: none; }
+  .nav-links a {
+    font-size: 0.85rem; font-weight: 500; color: var(--slate);
+    text-decoration: none; letter-spacing: 0.03em;
+    transition: color 0.2s;
+  }
+  .nav-links a:hover { color: var(--blue); }
+  .nav-cta {
+    font-size: 0.8rem; font-weight: 600; padding: 0.5rem 1.2rem;
+    background: var(--navy); color: white; border-radius: 6px;
+    text-decoration: none; letter-spacing: 0.03em;
+    transition: background 0.2s;
+  }
+  .nav-cta:hover { background: var(--blue); }
+
+  /* ── HERO ── */
+  .hero {
+    min-height: 100vh;
+    display: grid; place-items: center;
+    padding: 10rem 4rem 6rem;
+    position: relative; overflow: hidden;
+  }
+  .hero-bg {
+    position: absolute; inset: 0; pointer-events: none;
+    background:
+      radial-gradient(ellipse 60% 50% at 80% 50%, rgba(26,110,189,0.08) 0%, transparent 70%),
+      radial-gradient(ellipse 40% 40% at 10% 80%, rgba(13,27,62,0.06) 0%, transparent 60%);
+  }
+
+  /* ECG line animation */
+  .ecg-bg {
+    position: absolute; bottom: 0; left: 0; right: 0; height: 180px;
+    overflow: hidden; opacity: 0.12;
+  }
+  .ecg-line {
+    stroke: var(--blue); stroke-width: 2; fill: none;
+    stroke-dasharray: 2000;
+    stroke-dashoffset: 2000;
+    animation: ecg-draw 4s ease-out 0.5s forwards, ecg-loop 6s linear 4.5s infinite;
+  }
+  @keyframes ecg-draw {
+    to { stroke-dashoffset: 0; }
+  }
+  @keyframes ecg-loop {
+    0% { stroke-dashoffset: 0; }
+    100% { stroke-dashoffset: -2000; }
+  }
+
+  .hero-inner { max-width: 860px; text-align: center; position: relative; z-index: 1; }
+  .hero-badge {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    font-family: var(--mono); font-size: 0.72rem; font-weight: 500;
+    color: var(--blue); background: rgba(26,110,189,0.1);
+    border: 1px solid rgba(26,110,189,0.25);
+    padding: 0.35rem 0.9rem; border-radius: 999px;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    margin-bottom: 2rem;
+    animation: fade-up 0.6s ease both;
+  }
+  .hero-badge svg { width: 12px; height: 12px; }
+
+  h1 {
+    font-family: var(--serif); font-size: clamp(2.8rem, 6vw, 5rem);
+    line-height: 1.1; color: var(--navy); letter-spacing: -0.02em;
+    animation: fade-up 0.7s ease 0.1s both;
+  }
+  h1 em { font-style: italic; color: var(--blue); }
+
+  .hero-sub {
+    margin-top: 1.5rem; font-size: 1.15rem; line-height: 1.7;
+    color: var(--slate); max-width: 640px; margin-inline: auto;
+    animation: fade-up 0.7s ease 0.2s both;
+  }
+
+  .hero-actions {
+    display: flex; gap: 1rem; justify-content: center; margin-top: 2.5rem;
+    animation: fade-up 0.7s ease 0.3s both;
+  }
+  .btn-primary {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    padding: 0.85rem 2rem; background: var(--blue); color: white;
+    border-radius: 8px; font-size: 0.9rem; font-weight: 600;
+    text-decoration: none; letter-spacing: 0.02em;
+    transition: transform 0.2s, box-shadow 0.2s;
+    box-shadow: 0 4px 20px rgba(26,110,189,0.3);
+  }
+  .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 28px rgba(26,110,189,0.4); }
+  .btn-secondary {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    padding: 0.85rem 2rem; background: transparent; color: var(--navy);
+    border: 1.5px solid var(--border); border-radius: 8px;
+    font-size: 0.9rem; font-weight: 600; text-decoration: none;
+    transition: border-color 0.2s, color 0.2s;
+  }
+  .btn-secondary:hover { border-color: var(--blue); color: var(--blue); }
+
+  /* video placeholder */
+  .video-placeholder {
+    margin-top: 4rem; border-radius: 16px;
+    background: var(--surface); border: 1px solid var(--border);
+    height: 380px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 1rem;
+    position: relative; overflow: hidden;
+    animation: fade-up 0.7s ease 0.4s both;
+    box-shadow: 0 12px 48px rgba(13,27,62,0.08);
+  }
+  .video-placeholder::before {
+    content: ''; position: absolute; inset: 0;
+    background: linear-gradient(135deg, rgba(26,110,189,0.04) 0%, rgba(13,27,62,0.06) 100%);
+  }
+  .play-btn {
+    width: 72px; height: 72px; border-radius: 50%;
+    background: var(--blue); display: grid; place-items: center;
+    box-shadow: 0 0 0 12px rgba(26,110,189,0.12), 0 0 0 24px rgba(26,110,189,0.06);
+    cursor: pointer; transition: transform 0.2s;
+  }
+  .play-btn:hover { transform: scale(1.08); }
+  .play-btn svg { margin-left: 4px; }
+  .video-placeholder p { font-size: 0.85rem; color: var(--muted); font-family: var(--mono); }
+
+  @keyframes fade-up {
+    from { opacity: 0; transform: translateY(24px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ── STATS STRIP ── */
+  .stats-strip {
+    background: var(--navy); color: white;
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    divide-x: 1px solid rgba(255,255,255,0.1);
+  }
+  .stat-item {
+    padding: 2.5rem 2rem; text-align: center;
+    border-right: 1px solid rgba(255,255,255,0.08);
+  }
+  .stat-item:last-child { border-right: none; }
+  .stat-num {
+    font-family: var(--serif); font-size: 3rem; line-height: 1;
+    color: white;
+  }
+  .stat-num span { color: var(--accent); }
+  .stat-label { margin-top: 0.5rem; font-size: 0.82rem; color: rgba(255,255,255,0.55); line-height: 1.5; }
+
+  /* ── SECTIONS SHARED ── */
+  section { padding: 7rem 4rem; }
+  .section-tag {
+    font-family: var(--mono); font-size: 0.72rem; font-weight: 500;
+    text-transform: uppercase; letter-spacing: 0.1em; color: var(--blue);
+    margin-bottom: 0.8rem;
+  }
+  h2 {
+    font-family: var(--serif); font-size: clamp(2rem, 4vw, 2.8rem);
+    color: var(--navy); line-height: 1.15; letter-spacing: -0.02em;
+  }
+  h2 em { font-style: italic; }
+  .section-lead {
+    font-size: 1.05rem; color: var(--slate); line-height: 1.75;
+    max-width: 600px; margin-top: 1rem;
+  }
+
+  /* ── PROBLEM ── */
+  .problem { background: var(--surface); }
+  .problem-inner { max-width: 1100px; margin: 0 auto; }
+  .problem-grid {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 4rem; margin-top: 4rem; align-items: start;
+  }
+  .problem-cards { display: flex; flex-direction: column; gap: 1.5rem; }
+  .pcard {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.5rem;
+    display: flex; gap: 1rem; align-items: flex-start;
+    transition: border-color 0.2s, transform 0.2s;
+  }
+  .pcard:hover { border-color: var(--blue-light); transform: translateX(4px); }
+  .pcard-icon {
+    width: 44px; height: 44px; border-radius: 10px;
+    display: grid; place-items: center; flex-shrink: 0;
+  }
+  .pcard-icon.red { background: rgba(232,72,85,0.1); }
+  .pcard-icon.blue { background: rgba(26,110,189,0.1); }
+  .pcard-icon.orange { background: rgba(255,160,50,0.1); }
+  .pcard h3 { font-size: 0.95rem; font-weight: 600; color: var(--navy); }
+  .pcard p { font-size: 0.85rem; color: var(--slate); line-height: 1.6; margin-top: 0.25rem; }
+
+  .problem-visual {
+    background: var(--navy); border-radius: 16px; padding: 2.5rem;
+    color: white; position: relative; overflow: hidden;
+  }
+  .problem-visual::before {
+    content: ''; position: absolute;
+    top: -60px; right: -60px; width: 200px; height: 200px;
+    border-radius: 50%; background: rgba(26,110,189,0.15);
+  }
+  .problem-visual h3 {
+    font-family: var(--serif); font-size: 1.4rem; color: white; margin-bottom: 1.5rem;
+  }
+  .timeline { display: flex; flex-direction: column; gap: 1rem; position: relative; z-index: 1; }
+  .tl-item { display: flex; gap: 1rem; align-items: flex-start; }
+  .tl-dot {
+    width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; margin-top: 5px;
+  }
+  .tl-dot.active { background: var(--accent); box-shadow: 0 0 0 4px rgba(232,72,85,0.2); }
+  .tl-dot.mid { background: #F5A623; }
+  .tl-dot.future { background: var(--blue-light); }
+  .tl-text strong { display: block; font-size: 0.85rem; font-weight: 600; color: white; }
+  .tl-text span { font-size: 0.8rem; color: rgba(255,255,255,0.55); }
+
+  .alert-box {
+    margin-top: 1.5rem; background: rgba(232,72,85,0.15);
+    border: 1px solid rgba(232,72,85,0.3); border-radius: 8px;
+    padding: 1rem; font-size: 0.83rem; color: rgba(255,255,255,0.8);
+    line-height: 1.6; position: relative; z-index: 1;
+  }
+  .alert-box strong { color: var(--accent); }
+
+  /* ── SOLUTION ── */
+  .solution { background: var(--bg); }
+  .solution-inner { max-width: 1100px; margin: 0 auto; }
+  .solution-grid {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 3rem; margin-top: 4rem; align-items: center;
+  }
+  .device-card {
+    background: var(--navy); border-radius: 20px; padding: 3rem;
+    display: flex; flex-direction: column; align-items: center; gap: 1.5rem;
+    position: relative; overflow: hidden;
+  }
+  .device-card::after {
+    content: ''; position: absolute;
+    bottom: -40px; left: 50%; transform: translateX(-50%);
+    width: 160px; height: 160px; border-radius: 50%;
+    background: radial-gradient(circle, rgba(26,110,189,0.3), transparent 70%);
+  }
+  .device-body {
+    width: 140px; height: 90px; background: #1A3060;
+    border-radius: 18px; border: 2px solid rgba(59,143,212,0.4);
+    display: grid; place-items: center; position: relative;
+    box-shadow: 0 0 30px rgba(26,110,189,0.3);
+  }
+  .ecg-mini { width: 100px; }
+  .ecg-mini path {
+    stroke: #5BC8FF; stroke-width: 1.5; fill: none;
+    animation: ecg-pulse 2s ease-in-out infinite;
+  }
+  @keyframes ecg-pulse {
+    0%,100% { opacity: 0.6; }
+    50% { opacity: 1; }
+  }
+  .chip-label {
+    font-family: var(--mono); font-size: 0.7rem;
+    color: rgba(255,255,255,0.4); letter-spacing: 0.06em;
+  }
+  .ble-indicator {
+    display: flex; align-items: center; gap: 0.5rem;
+    font-family: var(--mono); font-size: 0.72rem; color: #5BC8FF;
+  }
+  .ble-dot { width: 6px; height: 6px; border-radius: 50%; background: #5BC8FF; animation: pulse-dot 1.5s ease-in-out infinite; }
+
+  .solution-points { display: flex; flex-direction: column; gap: 1.8rem; }
+  .sol-point { display: flex; gap: 1rem; }
+  .sol-num {
+    font-family: var(--mono); font-size: 0.7rem; color: var(--blue);
+    background: rgba(26,110,189,0.1); border: 1px solid rgba(26,110,189,0.2);
+    border-radius: 6px; padding: 0.2rem 0.5rem;
+    height: fit-content; margin-top: 2px; white-space: nowrap;
+  }
+  .sol-point h3 { font-size: 0.95rem; font-weight: 600; color: var(--navy); }
+  .sol-point p { font-size: 0.85rem; color: var(--slate); line-height: 1.65; margin-top: 0.2rem; }
+
+  /* ── TECH DEEP DIVE ── */
+  .tech { background: var(--surface); }
+  .tech-inner { max-width: 1100px; margin: 0 auto; }
+  .tech-grid {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 2rem; margin-top: 4rem;
+  }
+  .tech-col {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 16px; padding: 2.5rem; position: relative; overflow: hidden;
+  }
+  .tech-col::before {
+    content: ''; position: absolute;
+    top: 0; left: 0; right: 0; height: 3px;
+  }
+  .tech-col.hardware::before { background: linear-gradient(90deg, var(--blue), var(--blue-light)); }
+  .tech-col.software::before { background: linear-gradient(90deg, #7B5CF6, #A78BFA); }
+  .tech-col-label {
+    font-family: var(--mono); font-size: 0.7rem; text-transform: uppercase;
+    letter-spacing: 0.1em; margin-bottom: 1.2rem;
+    display: flex; align-items: center; gap: 0.5rem;
+  }
+  .tech-col.hardware .tech-col-label { color: var(--blue); }
+  .tech-col.software .tech-col-label { color: #7B5CF6; }
+  .tech-col h3 { font-family: var(--serif); font-size: 1.5rem; color: var(--navy); margin-bottom: 1.5rem; }
+  .spec-list { display: flex; flex-direction: column; gap: 1.2rem; }
+  .spec-item {
+    padding: 1rem; background: var(--surface); border-radius: 10px;
+    border: 1px solid var(--border);
+  }
+  .spec-chip {
+    font-family: var(--mono); font-size: 0.68rem; font-weight: 500;
+    padding: 0.2rem 0.5rem; border-radius: 4px; margin-bottom: 0.4rem;
+    display: inline-block;
+  }
+  .tech-col.hardware .spec-chip { background: rgba(26,110,189,0.1); color: var(--blue); }
+  .tech-col.software .spec-chip { background: rgba(123,92,246,0.1); color: #7B5CF6; }
+  .spec-item p { font-size: 0.83rem; color: var(--slate); line-height: 1.6; }
+
+  /* ── PRODUCT SHOWCASE ── */
+  .showcase { background: var(--bg); }
+  .showcase-inner { max-width: 1100px; margin: 0 auto; }
+  .showcase-grid {
+    display: grid; grid-template-columns: 1fr 1.4fr;
+    gap: 3rem; margin-top: 4rem; align-items: start;
+  }
+  .app-phones {
+    display: flex; gap: 1rem; justify-content: center;
+  }
+  .phone-frame {
+    width: 140px; height: 280px; background: var(--navy);
+    border-radius: 28px; border: 3px solid #2A4070;
+    padding: 12px; position: relative; overflow: hidden;
+    box-shadow: 0 20px 48px rgba(13,27,62,0.2);
+  }
+  .phone-frame.secondary { margin-top: 2rem; }
+  .phone-screen {
+    width: 100%; height: 100%; background: #F0F6FF;
+    border-radius: 18px; overflow: hidden; display: flex;
+    flex-direction: column; gap: 4px; padding: 8px;
+  }
+  .phone-bar { height: 6px; border-radius: 3px; background: var(--blue-light); opacity: 0.6; }
+  .phone-bar.accent { background: var(--accent); width: 60%; }
+  .phone-bar.short { width: 40%; }
+  .phone-chart {
+    flex: 1; background: white; border-radius: 8px;
+    display: grid; place-items: center; position: relative; overflow: hidden;
+  }
+  .mini-ecg { width: 100%; }
+  .mini-ecg path { stroke: var(--blue); stroke-width: 1.5; fill: none; }
+  .phone-tags { display: flex; gap: 3px; flex-wrap: wrap; }
+  .ptag { font-size: 6px; background: rgba(26,110,189,0.1); color: var(--blue); border-radius: 3px; padding: 2px 4px; }
+
+  .phone-placeholder-label {
+    position: absolute; bottom: -8px; left: 0; right: 0; text-align: center;
+    font-family: var(--mono); font-size: 0.68rem; color: var(--muted);
+    background: var(--bg); padding: 0.4rem;
+  }
+
+  .showcase-features { display: flex; flex-direction: column; gap: 1.5rem; }
+  .feat-item {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.3rem 1.5rem;
+    display: flex; gap: 1rem; align-items: flex-start;
+    transition: transform 0.2s, border-color 0.2s;
+  }
+  .feat-item:hover { transform: translateX(6px); border-color: var(--blue-light); }
+  .feat-icon {
+    width: 40px; height: 40px; border-radius: 10px;
+    background: rgba(26,110,189,0.1); display: grid; place-items: center; flex-shrink: 0;
+  }
+  .feat-item h4 { font-size: 0.9rem; font-weight: 600; color: var(--navy); }
+  .feat-item p { font-size: 0.82rem; color: var(--slate); line-height: 1.6; margin-top: 0.2rem; }
+
+  .video-demo-block {
+    margin-top: 2rem; background: var(--navy); border-radius: 16px;
+    padding: 3rem; display: flex; flex-direction: column;
+    align-items: center; gap: 1rem; text-align: center;
+  }
+  .video-demo-block p { font-family: var(--mono); font-size: 0.75rem; color: rgba(255,255,255,0.4); }
+  .video-demo-block span { font-family: var(--serif); font-size: 1.3rem; color: white; }
+
+  /* ── PIPELINE ── */
+  .pipeline-section {
+    background: var(--navy); padding: 7rem 4rem;
+  }
+  .pipeline-inner { max-width: 1100px; margin: 0 auto; }
+  .pipeline-section .section-tag { color: #5BC8FF; }
+  .pipeline-section h2 { color: white; }
+  .pipeline-section .section-lead { color: rgba(255,255,255,0.55); }
+  .pipeline-flow {
+    display: flex; align-items: center; gap: 0; margin-top: 4rem;
+    overflow-x: auto; padding-bottom: 1rem;
+  }
+  .pipe-step {
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 12px; padding: 1.5rem; min-width: 160px; flex: 1;
+    text-align: center;
+  }
+  .pipe-step .pipe-icon {
+    width: 44px; height: 44px; border-radius: 10px;
+    background: rgba(26,110,189,0.25); margin: 0 auto 0.8rem;
+    display: grid; place-items: center;
+  }
+  .pipe-step h4 { font-size: 0.82rem; font-weight: 600; color: white; margin-bottom: 0.3rem; }
+  .pipe-step p { font-size: 0.72rem; color: rgba(255,255,255,0.45); line-height: 1.5; }
+  .pipe-arrow {
+    color: rgba(255,255,255,0.2); font-size: 1.2rem; flex-shrink: 0; padding: 0 0.5rem;
+  }
+
+  /* ── PARTNERS ── */
+  .partners { background: var(--surface); }
+  .partners-inner { max-width: 1100px; margin: 0 auto; }
+  .partners-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    gap: 2rem; margin-top: 4rem;
+  }
+  .partner-card {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 16px; padding: 2rem; text-align: center;
+  }
+  .partner-logo {
+    width: 56px; height: 56px; border-radius: 14px;
+    background: var(--navy); margin: 0 auto 1rem;
+    display: grid; place-items: center;
+  }
+  .partner-card h3 { font-size: 0.95rem; font-weight: 600; color: var(--navy); }
+  .partner-card p { font-size: 0.82rem; color: var(--slate); line-height: 1.6; margin-top: 0.4rem; }
+
+  /* ── TEAM ── */
+  .team { background: var(--bg); }
+  .team-inner { max-width: 1100px; margin: 0 auto; }
+  .team-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    gap: 1.5rem; margin-top: 4rem;
+  }
+  .member-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 14px; padding: 1.8rem 1.5rem; text-align: center;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  .member-card:hover { transform: translateY(-4px); box-shadow: 0 12px 32px rgba(13,27,62,0.1); }
+  .member-avatar {
+    width: 60px; height: 60px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--blue), var(--navy));
+    margin: 0 auto 1rem;
+    display: grid; place-items: center;
+    font-family: var(--serif); font-size: 1.2rem; color: white;
+  }
+  .member-card h4 { font-size: 0.9rem; font-weight: 600; color: var(--navy); }
+  .member-card span { font-size: 0.78rem; color: var(--muted); font-family: var(--mono); }
+
+  .mentors-row {
+    display: flex; justify-content: center; gap: 2rem;
+    margin-top: 2rem;
+  }
+  .mentor-pill {
+    display: flex; align-items: center; gap: 0.8rem;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 999px; padding: 0.6rem 1.2rem;
+  }
+  .mentor-icon {
+    width: 32px; height: 32px; border-radius: 50%;
+    background: rgba(26,110,189,0.1); display: grid; place-items: center;
+    flex-shrink: 0;
+  }
+  .mentor-pill span { font-size: 0.83rem; font-weight: 500; color: var(--navy); }
+  .mentor-pill small { font-size: 0.72rem; color: var(--muted); display: block; }
+
+  /* ── FOOTER ── */
+  footer {
+    background: var(--navy); color: rgba(255,255,255,0.5);
+    padding: 3rem 4rem;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  footer .f-logo {
+    font-family: var(--mono); font-size: 0.8rem; color: white; letter-spacing: 0.05em;
+  }
+  footer p { font-size: 0.78rem; }
+  footer .f-sutd { font-family: var(--mono); font-size: 0.72rem; color: rgba(255,255,255,0.3); }
+
+  /* ── UTILS ── */
+  .max-w { max-width: 1100px; margin: 0 auto; }
+  @media (max-width: 768px) {
+    nav { padding: 1rem 1.5rem; }
+    .nav-links { display: none; }
+    section { padding: 5rem 1.5rem; }
+    .hero { padding: 8rem 1.5rem 4rem; }
+    .problem-grid, .solution-grid, .tech-grid, .showcase-grid, .team-grid, .partners-grid { grid-template-columns: 1fr; }
+    .stats-strip { grid-template-columns: 1fr; }
+    .pipeline-flow { flex-direction: column; }
+    .pipe-arrow { transform: rotate(90deg); }
+    footer { flex-direction: column; gap: 1rem; text-align: center; }
+  }
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+  <div class="nav-logo">
+    <div class="pulse-dot"></div>
+    WECG &nbsp;·&nbsp; SUTD 2025
+  </div>
+  <ul class="nav-links">
+    <li><a href="#problem">Problem</a></li>
+    <li><a href="#solution">Solution</a></li>
+    <li><a href="#tech">Technology</a></li>
+    <li><a href="#showcase">Showcase</a></li>
+    <li><a href="#team">Team</a></li>
+  </ul>
+  <a href="#showcase" class="nav-cta">Watch Demo →</a>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-bg"></div>
+  <div class="ecg-bg">
+    <svg viewBox="0 0 1400 180" width="100%" height="100%" preserveAspectRatio="none">
+      <path class="ecg-line" d="M0,120 L80,120 L100,120 L110,40 L120,160 L130,20 L145,140 L160,120 L240,120 L260,120 L270,40 L280,160 L290,20 L305,140 L320,120 L400,120 L420,120 L430,40 L440,160 L450,20 L465,140 L480,120 L560,120 L580,120 L590,40 L600,160 L610,20 L625,140 L640,120 L720,120 L740,120 L750,40 L760,160 L770,20 L785,140 L800,120 L880,120 L900,120 L910,40 L920,160 L930,20 L945,140 L960,120 L1040,120 L1060,120 L1070,40 L1080,160 L1090,20 L1105,140 L1120,120 L1200,120 L1220,120 L1230,40 L1240,160 L1250,20 L1265,140 L1280,120 L1400,120"/>
+    </svg>
+  </div>
+  <div class="hero-inner">
+    <div class="hero-badge">
+      <svg viewBox="0 0 12 12" fill="currentColor"><circle cx="6" cy="6" r="4"/></svg>
+      SUTD Capstone Project · Biomedical Engineering
+    </div>
+    <h1>Empowering <em>Safer Hearts</em><br>through Wearable Intelligence.</h1>
+    <p class="hero-sub">A sports-oriented, wearable ECG system designed to detect silent ischemia in individuals transitioning from sedentary lifestyles to active cardiovascular exercise.</p>
+    <div class="hero-actions">
+      <a href="#solution" class="btn-primary">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="white"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zM6.5 5.5l4 2.5-4 2.5V5.5z"/></svg>
+        Explore the Project
+      </a>
+      <a href="#tech" class="btn-secondary">Technical Deep Dive →</a>
+    </div>
+    <div class="video-placeholder">
+      <div class="play-btn">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+      </div>
+      <p>[ Placeholder · Product Showcase Video ]</p>
+    </div>
+  </div>
+</section>
+
+<!-- STATS -->
+<div class="stats-strip">
+  <div class="stat-item">
+    <div class="stat-num"><span>30</span>%+</div>
+    <div class="stat-label">of Singapore deaths in 2024<br>attributed to cardiovascular disease</div>
+  </div>
+  <div class="stat-item">
+    <div class="stat-num">3<span>×</span></div>
+    <div class="stat-label">projected rise in heart attack<br>incidence by 2050</div>
+  </div>
+  <div class="stat-item">
+    <div class="stat-num">24<span>-bit</span></div>
+    <div class="stat-label">high-resolution ECG data<br>via ADS1298 analog front-end</div>
+  </div>
+</div>
+
+<!-- PROBLEM -->
+<section class="problem" id="problem">
+  <div class="problem-inner">
+    <div class="section-tag">// The Problem</div>
+    <h2>A <em>Silent Threat</em> in Plain Sight</h2>
+    <p class="section-lead">Singapore faces a worsening cardiac crisis — and the most at-risk individuals are often the least equipped to detect it.</p>
+    <div class="problem-grid">
+      <div class="problem-cards">
+        <div class="pcard">
+          <div class="pcard-icon red">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#E84855" stroke-width="2"><path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z"/></svg>
+          </div>
+          <div>
+            <h3>Cardiovascular Disease Crisis</h3>
+            <p>Cardiovascular disease accounted for over 30% of all deaths in Singapore in 2024 — a persistent, leading cause of mortality that demands better early detection tools.</p>
+          </div>
+        </div>
+        <div class="pcard">
+          <div class="pcard-icon orange">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#F5A623" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          </div>
+          <div>
+            <h3>Projected Triple by 2050</h3>
+            <p>Research projects that heart attack incidence could triple by 2050, driven by aging populations, rising obesity rates, and increasingly sedentary work culture.</p>
+          </div>
+        </div>
+        <div class="pcard">
+          <div class="pcard-icon blue">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1A6EBD" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          </div>
+          <div>
+            <h3>The Detection Gap</h3>
+            <p>Sedentary individuals resuming exercise often carry hidden risks of silent ischemia — reduced blood flow to the heart that standard fitness trackers and smartwatches simply cannot detect.</p>
+          </div>
+        </div>
+      </div>
+      <div class="problem-visual">
+        <h3>The Timeline of Risk</h3>
+        <div class="timeline">
+          <div class="tl-item">
+            <div class="tl-dot active"></div>
+            <div class="tl-text">
+              <strong>Today: 2024</strong>
+              <span>30%+ CVD mortality rate in Singapore. Ischemia often goes undetected in active-onset individuals.</span>
+            </div>
+          </div>
+          <div class="tl-item">
+            <div class="tl-dot mid"></div>
+            <div class="tl-text">
+              <strong>2030–2040: Rising Burden</strong>
+              <span>Aging population + "sudden active" demographic surge increases cardiac event risk.</span>
+            </div>
+          </div>
+          <div class="tl-item">
+            <div class="tl-dot future"></div>
+            <div class="tl-text">
+              <strong>2050: Projected Crisis</strong>
+              <span>3× increase in heart attack incidence without improved early-detection infrastructure.</span>
+            </div>
+          </div>
+        </div>
+        <div class="alert-box">
+          <strong>Silent Ischemia:</strong> Reduced cardiac blood flow that produces no symptoms — undetectable without clinical-grade ECG signal analysis. Smartwatches measure heart rate; our system measures heart health.
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- SOLUTION -->
+<section class="solution" id="solution">
+  <div class="solution-inner">
+    <div class="section-tag">// Our Solution</div>
+    <h2>The Wearable <em>ECG System</em></h2>
+    <p class="section-lead">A clinical-grade wearable that compares your resting baseline against your active stress-state — in real time, during exercise.</p>
+    <div class="solution-grid">
+      <div class="device-card">
+        <div class="chip-label">ADS1298 · nRF52840 · BLE 5.0</div>
+        <div class="device-body">
+          <svg class="ecg-mini" viewBox="0 0 100 40" preserveAspectRatio="none">
+            <path d="M0,20 L15,20 L20,20 L23,5 L26,35 L29,2 L33,30 L37,20 L55,20 L60,20 L63,5 L66,35 L69,2 L73,30 L77,20 L100,20"/>
+          </svg>
+        </div>
+        <div class="ble-indicator">
+          <div class="ble-dot"></div>
+          Transmitting via BLE
+        </div>
+        <div class="chip-label" style="text-align:center; line-height:1.6">Active RLD Circuit<br>24-bit Resolution · Ultra-low Power</div>
+      </div>
+      <div class="solution-points">
+        <div class="sol-point">
+          <span class="sol-num">01</span>
+          <div>
+            <h3>Reduced-Lead Strategy</h3>
+            <p>Unlike multi-lead hospital ECGs, our system uses a targeted reduced-lead approach optimised for wearability without sacrificing diagnostic sensitivity for ischemia detection.</p>
+          </div>
+        </div>
+        <div class="sol-point">
+          <span class="sol-num">02</span>
+          <div>
+            <h3>Baseline vs. Stress Comparison</h3>
+            <p>Captures a resting ECG baseline before exercise, then continuously compares active signals against it to identify ischemic biomarkers that emerge under cardiac stress — your body's own reference point.</p>
+          </div>
+        </div>
+        <div class="sol-point">
+          <span class="sol-num">03</span>
+          <div>
+            <h3>Sports-Oriented Design</h3>
+            <p>Engineered for the transition from sedentary to active — the highest-risk window for cardiac events. Designed to be worn during workouts, not just at rest.</p>
+          </div>
+        </div>
+        <div class="sol-point">
+          <span class="sol-num">04</span>
+          <div>
+            <h3>Cloud-Backed Intelligence</h3>
+            <p>Heavy signal processing offloaded to a cloud backend via RESTful API, keeping the mobile interface lightweight and responsive for real-time feedback.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- PIPELINE -->
+<section class="pipeline-section">
+  <div class="pipeline-inner">
+    <div class="section-tag">// Signal Pipeline</div>
+    <h2>From Skin to <em>Insight</em></h2>
+    <p class="section-lead">Every heartbeat passes through multiple validation layers before informing a clinical decision.</p>
+    <div class="pipeline-flow">
+      <div class="pipe-step">
+        <div class="pipe-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5BC8FF" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        </div>
+        <h4>Signal Capture</h4>
+        <p>ADS1298 acquires 24-bit ECG from skin electrodes with RLD noise cancellation</p>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-step">
+        <div class="pipe-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5BC8FF" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8m-4-4v4"/></svg>
+        </div>
+        <h4>BLE Transmission</h4>
+        <p>nRF52840 MCU transmits data wirelessly to mobile app with ultra-low power draw</p>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-step">
+        <div class="pipe-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5BC8FF" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+        </div>
+        <h4>SQI Filtering</h4>
+        <p>Sliding-window kSQI + mSQI metrics autonomously accept good windows, reject noise</p>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-step">
+        <div class="pipe-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5BC8FF" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+        </div>
+        <h4>NeuroKit2 Analysis</h4>
+        <p>Python pipeline cleans signal and detects R-peaks for HRV and morphological analysis</p>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-step">
+        <div class="pipe-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5BC8FF" stroke-width="2"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>
+        </div>
+        <h4>Ischemia Detection</h4>
+        <p>Baseline vs. stress comparison identifies abnormal biomarkers and flags risk</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- TECH DEEP DIVE -->
+<section class="tech" id="tech">
+  <div class="tech-inner">
+    <div class="section-tag">// Technical Architecture</div>
+    <h2>Engineering <em>Precision</em>,<br>Layer by Layer</h2>
+    <p class="section-lead">A carefully co-designed hardware and software stack built for clinical-grade signal fidelity in a wearable form factor.</p>
+    <div class="tech-grid">
+      <div class="tech-col hardware">
+        <div class="tech-col-label">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="#1A6EBD"><rect x="1" y="1" width="10" height="10" rx="2"/></svg>
+          Column A · Hardware Engineering
+        </div>
+        <h3>The Physical Layer</h3>
+        <div class="spec-list">
+          <div class="spec-item">
+            <span class="spec-chip">ADS1298 AFE</span>
+            <p>High-resolution 24-bit analog front-end for ECG acquisition. Industry-standard chip designed specifically for biopotential measurement with exceptional signal-to-noise ratio.</p>
+          </div>
+          <div class="spec-item">
+            <span class="spec-chip">nRF52840 MCU</span>
+            <p>Ultra-low power microcontroller with native Bluetooth Low Energy 5.0 support. Enables sustained wearable operation without compromising wireless data transmission fidelity.</p>
+          </div>
+          <div class="spec-item">
+            <span class="spec-chip">Active RLD Circuit</span>
+            <p>Active Right Leg Drive circuit provides advanced noise cancellation and common-mode rejection — eliminating environmental electrical interference that would corrupt ECG signals during movement.</p>
+          </div>
+        </div>
+      </div>
+      <div class="tech-col software">
+        <div class="tech-col-label">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="#7B5CF6"><path d="M2 2h8v8H2z" rx="1"/></svg>
+          Column B · Software & Data Pipeline
+        </div>
+        <h3>The Intelligence Layer</h3>
+        <div class="spec-list">
+          <div class="spec-item">
+            <span class="spec-chip">NeuroKit2 · Python</span>
+            <p>A Python-based processing pipeline leveraging NeuroKit2 for automated signal cleaning, R-peak detection, and heart rate variability extraction — transforming raw voltages into clinical metrics.</p>
+          </div>
+          <div class="spec-item">
+            <span class="spec-chip">SQI Algorithm</span>
+            <p>Signal Quality Indexing via a custom sliding-window algorithm. Kurtosis (kSQI) and Morphological (mSQI) metrics work in tandem to autonomously accept high-quality data windows and reject noise contamination.</p>
+          </div>
+          <div class="spec-item">
+            <span class="spec-chip">RESTful Cloud API</span>
+            <p>Heavy computational processing is offloaded to a cloud backend via a RESTful API architecture, keeping the mobile user interface lightweight and enabling real-time streaming feedback.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- PRODUCT SHOWCASE -->
+<section class="showcase" id="showcase">
+  <div class="showcase-inner">
+    <div class="section-tag">// Product Showcase</div>
+    <h2>Designed for the <em>Athlete</em><br>in All of Us</h2>
+    <p class="section-lead">A companion app that makes clinical-grade cardiac monitoring intuitive, actionable, and accessible to everyday exercisers.</p>
+    <div class="showcase-grid">
+      <div style="position:relative;">
+        <div class="app-phones">
+          <div class="phone-frame">
+            <div class="phone-screen">
+              <div class="phone-bar"></div>
+              <div class="phone-bar accent short"></div>
+              <div class="phone-chart">
+                <svg class="mini-ecg" viewBox="0 0 116 50" preserveAspectRatio="none">
+                  <path d="M0,25 L18,25 L22,25 L25,8 L28,42 L31,3 L35,38 L38,25 L60,25 L64,25 L67,8 L70,42 L73,3 L77,38 L80,25 L116,25"/>
+                </svg>
+              </div>
+              <div class="phone-tags">
+                <span class="ptag">HR: 84bpm</span>
+                <span class="ptag">SQI ✓</span>
+                <span class="ptag">No Flags</span>
+              </div>
+              <div class="phone-bar" style="width:80%; background:#22C55E; height:4px; border-radius:2px;"></div>
+            </div>
+          </div>
+          <div class="phone-frame secondary">
+            <div class="phone-screen">
+              <div class="phone-bar" style="width:60%;"></div>
+              <div class="phone-chart" style="background:#FFF8F8;">
+                <svg class="mini-ecg" viewBox="0 0 116 50" preserveAspectRatio="none">
+                  <path d="M0,25 L16,25 L20,25 L23,10 L26,40 L29,5 L33,36 L36,25 L55,22 L62,28 L65,10 L68,42 L71,3 L75,36 L79,26 L116,26" stroke="#E84855"/>
+                </svg>
+              </div>
+              <div class="phone-bar" style="background:#FCA5A5; width:70%;"></div>
+              <div class="phone-tags">
+                <span class="ptag" style="background:rgba(232,72,85,0.1);color:#E84855;">Review Session</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p style="text-align:center; font-family:var(--mono); font-size:0.72rem; color:var(--muted); margin-top:1rem;">[ Placeholder · Actual App Screenshots ]</p>
+      </div>
+      <div>
+        <div class="showcase-features">
+          <div class="feat-item">
+            <div class="feat-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#1A6EBD" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+            </div>
+            <div>
+              <h4>Real-Time Heart Rate Trends</h4>
+              <p>Live ECG waveform streaming with annotated R-peaks, heart rate zone tracking, and beat-to-beat HRV analysis during your workout.</p>
+            </div>
+          </div>
+          <div class="feat-item">
+            <div class="feat-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#1A6EBD" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
+            </div>
+            <div>
+              <h4>Electrode Placement Guides</h4>
+              <p>Visual, step-by-step guides ensure correct electrode positioning every session — because signal quality starts before you press record.</p>
+            </div>
+          </div>
+          <div class="feat-item">
+            <div class="feat-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#1A6EBD" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+            </div>
+            <div>
+              <h4>Post-Run Session Reviews</h4>
+              <p>Detailed session reports comparing your resting baseline against active readings — flagging windows where ischemic biomarkers were detected for further review.</p>
+            </div>
+          </div>
+        </div>
+        <div class="video-demo-block">
+          <div class="play-btn" style="width:56px;height:56px;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+          </div>
+          <span>Live Product Demo</span>
+          <p>[ Placeholder · Product Demonstration Video ]</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- PARTNERS -->
+<section class="partners" id="partners">
+  <div class="partners-inner">
+    <div class="section-tag">// Partners & Acknowledgements</div>
+    <h2>Built with <em>Exceptional</em> Support</h2>
+    <p class="section-lead">This project would not exist without the guidance of our academic institution, industry partner, and mentors.</p>
+    <div class="partners-grid">
+      <div class="partner-card">
+        <div class="partner-logo">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+        </div>
+        <h3>SUTD</h3>
+        <p>Singapore University of Technology and Design — academic home of this capstone project, fostering interdisciplinary innovation at the frontier of engineering and design.</p>
+      </div>
+      <div class="partner-card">
+        <div class="partner-logo" style="background: linear-gradient(135deg, #1A6EBD, #0D1B3E);">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        </div>
+        <h3>Biosense</h3>
+        <p>Industry partner providing domain expertise in biomedical signal acquisition. Special thanks to <strong>Alan Goh</strong> and <strong>John Chee</strong> for their invaluable guidance and technical mentorship.</p>
+      </div>
+      <div class="partner-card">
+        <div class="partner-logo" style="background: linear-gradient(135deg, #4A5C74, #1C2B3A);">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
+        </div>
+        <h3>Project Mentors</h3>
+        <p>Prof. <strong>Yihan Du</strong> and Prof. <strong>Dileepa Fernando</strong> — for their expert supervision, technical rigour, and steadfast support throughout the research and development process.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- TEAM -->
+<section class="team" id="team">
+  <div class="team-inner">
+    <div class="section-tag">// The Team</div>
+    <h2>Six Engineers.<br><em>One Mission.</em></h2>
+    <p class="section-lead">A cross-disciplinary team from SUTD, combining hardware engineering, software development, and biomedical signal processing expertise.</p>
+    <div class="team-grid">
+      <div class="member-card">
+        <div class="member-avatar">TR</div>
+        <h4>Tan Hong Ray</h4>
+        <span>Team Member</span>
+      </div>
+      <div class="member-card">
+        <div class="member-avatar">TK</div>
+        <h4>Tan Kian Yew</h4>
+        <span>Team Member</span>
+      </div>
+      <div class="member-card">
+        <div class="member-avatar">TZ</div>
+        <h4>Tan Zorye</h4>
+        <span>Team Member</span>
+      </div>
+      <div class="member-card">
+        <div class="member-avatar">CY</div>
+        <h4>Chen Yi Rong</h4>
+        <span>Team Member</span>
+      </div>
+      <div class="member-card">
+        <div class="member-avatar">JS</div>
+        <h4>Jean Soh Chee Teck</h4>
+        <span>Team Member</span>
+      </div>
+      <div class="member-card">
+        <div class="member-avatar">DL</div>
+        <h4>Daniel Lim</h4>
+        <span>Team Member</span>
+      </div>
+    </div>
+    <div class="mentors-row">
+      <div class="mentor-pill">
+        <div class="mentor-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1A6EBD" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
+        </div>
+        <div>
+          <span>Prof. Yihan Du</span>
+          <small>Faculty Mentor · SUTD</small>
+        </div>
+      </div>
+      <div class="mentor-pill">
+        <div class="mentor-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1A6EBD" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
+        </div>
+        <div>
+          <span>Prof. Dileepa Fernando</span>
+          <small>Faculty Mentor · SUTD</small>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <div>
+    <div class="f-logo">WEARABLE ECG · SUTD 2025</div>
+    <p style="margin-top:0.4rem;">Early Detection of Ischemia — Capstone Project</p>
+  </div>
+  <p>In partnership with <strong style="color:rgba(255,255,255,0.7)">Biosense</strong></p>
+  <div class="f-sutd">Singapore University of Technology and Design</div>
+</footer>
+
+</body>
+</html>
