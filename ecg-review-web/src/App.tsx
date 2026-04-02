@@ -142,8 +142,7 @@ const CHANNELS = ["CH2", "CH3", "CH4"] as const;
 const REVIEW_MODES = ["CH2", "CH3", "CH4", "2D Vectorcardiography", "3D Vectorgraphy"] as const;
 const DEFAULT_ECG_Y_MAX_MV = 0.6;
 const DEFAULT_ECG_Y_MIN_MV = -0.3;
-const LIVE_VISUAL_BUFFER_SAMPLES = 6000;
-const LIVE_FETCH_INTERVAL_MS = 500;
+const LIVE_VISUAL_BUFFER_SAMPLES = 1000;
 const BEAT_MARKER_COLORS: Record<keyof BeatMarkers, string> = {
   P: "#1f7aec",
   Q: "#9a3412",
@@ -248,6 +247,26 @@ function getCombinedFiniteRange(...seriesList: number[][]): { min: number; max: 
     combined.push(...series);
   });
   return getFiniteRange(combined);
+}
+
+function getSymmetricFiniteRange(...seriesList: number[][]): { min: number; max: number } | null {
+  const combined = getCombinedFiniteRange(...seriesList);
+  if (!combined) {
+    return null;
+  }
+  const maxAbs = Math.max(Math.abs(combined.min), Math.abs(combined.max), 0.05);
+  const padded = maxAbs * 1.1;
+  return {
+    min: -padded,
+    max: padded,
+  };
+}
+
+function getVectorBeatRange(data: VectorBeatResponse | null): { min: number; max: number } | null {
+  if (!data) {
+    return null;
+  }
+  return getSymmetricFiniteRange(data.lead_x, data.lead_y, data.lead_z);
 }
 
 function getBeatSamples(fullSignal: number[], beat: ReviewBeat | null): number[] {
@@ -583,7 +602,7 @@ function LiveVector3DCanvas({
     ctx.fillStyle = "#f7fbfd";
     ctx.fillRect(0, 0, width, height);
 
-    const range = getCombinedFiniteRange(xSamples, ySamples, zSamples) ?? { min: -1, max: 1 };
+    const range = getSymmetricFiniteRange(xSamples, ySamples, zSamples) ?? { min: -1, max: 1 };
     const yMin = range.min;
     const yMax = range.max;
 
@@ -1486,6 +1505,9 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
   const showVectorMode = reviewMode === "2D Vectorcardiography";
   const showVector3DMode = reviewMode === "3D Vectorgraphy";
   const showWideVectorMode = showVectorMode || showVector3DMode;
+  const shouldLoadVectorBeats = showVectorMode || showVector3DMode;
+  const calibrationVectorRange = getVectorBeatRange(calibrationVector) ?? { min: yMinMv, max: yMaxMv };
+  const sessionVectorRange = getVectorBeatRange(sessionVector) ?? { min: yMinMv, max: yMaxMv };
 
   useEffect(() => {
     let active = true;
@@ -1526,7 +1548,7 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
   }, [selectedChannel]);
 
   useEffect(() => {
-    if (!data || !showVectorMode) {
+    if (!data || !shouldLoadVectorBeats) {
       setCalibrationVector(null);
       return;
     }
@@ -1560,10 +1582,10 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     return () => {
       active = false;
     };
-  }, [data, calibrationBeat, showVectorMode]);
+  }, [data, calibrationBeat, shouldLoadVectorBeats]);
 
   useEffect(() => {
-    if (!data || !showVectorMode) {
+    if (!data || !shouldLoadVectorBeats) {
       setSessionVector(null);
       return;
     }
@@ -1597,7 +1619,7 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     return () => {
       active = false;
     };
-  }, [data, sessionBeat, showVectorMode]);
+  }, [data, sessionBeat, shouldLoadVectorBeats]);
 
   useEffect(() => {
     if (!data || !showVector3DMode) {
@@ -1608,7 +1630,7 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     let active = true;
     async function loadCalibrationVector3d() {
       setLoadingCalibrationVector3d(true);
-      const url = `/api/review/${recordId}/vector3d_beat?section=calibration&beat_index=${calibrationBeat}&progress_percent=${calibrationVectorMovement}&y_min_mv=${yMinMv}&y_max_mv=${yMaxMv}`;
+      const url = `/api/review/${recordId}/vector3d_beat?section=calibration&beat_index=${calibrationBeat}&progress_percent=${calibrationVectorMovement}&y_min_mv=${calibrationVectorRange.min}&y_max_mv=${calibrationVectorRange.max}`;
       console.log(`[VECTOR3D] GET ${url}`);
       try {
         const response = await fetch(url);
@@ -1634,7 +1656,7 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     return () => {
       active = false;
     };
-  }, [data, calibrationBeat, calibrationVectorMovement, showVector3DMode, yMinMv, yMaxMv]);
+  }, [data, calibrationBeat, calibrationVectorMovement, showVector3DMode, calibrationVectorRange.min, calibrationVectorRange.max]);
 
   useEffect(() => {
     if (!data || !showVector3DMode) {
@@ -1645,7 +1667,7 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     let active = true;
     async function loadSessionVector3d() {
       setLoadingSessionVector3d(true);
-      const url = `/api/review/${recordId}/vector3d_beat?section=session&beat_index=${sessionBeat}&progress_percent=${sessionVectorMovement}&y_min_mv=${yMinMv}&y_max_mv=${yMaxMv}`;
+      const url = `/api/review/${recordId}/vector3d_beat?section=session&beat_index=${sessionBeat}&progress_percent=${sessionVectorMovement}&y_min_mv=${sessionVectorRange.min}&y_max_mv=${sessionVectorRange.max}`;
       console.log(`[VECTOR3D] GET ${url}`);
       try {
         const response = await fetch(url);
@@ -1671,7 +1693,7 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     return () => {
       active = false;
     };
-  }, [data, sessionBeat, sessionVectorMovement, showVector3DMode, yMinMv, yMaxMv]);
+  }, [data, sessionBeat, sessionVectorMovement, showVector3DMode, sessionVectorRange.min, sessionVectorRange.max]);
 
   useEffect(() => {
     if (!data || !showVector3DMode) {
@@ -1679,8 +1701,8 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     }
     const recordId = data.record_id;
     const requests = [
-      `/api/review/${recordId}/vector3d_preload?section=calibration&start_beat_index=${calibrationBeat}&progress_percent=${calibrationVectorMovement}&y_min_mv=${yMinMv}&y_max_mv=${yMaxMv}`,
-      `/api/review/${recordId}/vector3d_preload?section=session&start_beat_index=${sessionBeat}&progress_percent=${sessionVectorMovement}&y_min_mv=${yMinMv}&y_max_mv=${yMaxMv}`,
+      `/api/review/${recordId}/vector3d_preload?section=calibration&start_beat_index=${calibrationBeat}&progress_percent=${calibrationVectorMovement}&y_min_mv=${calibrationVectorRange.min}&y_max_mv=${calibrationVectorRange.max}`,
+      `/api/review/${recordId}/vector3d_preload?section=session&start_beat_index=${sessionBeat}&progress_percent=${sessionVectorMovement}&y_min_mv=${sessionVectorRange.min}&y_max_mv=${sessionVectorRange.max}`,
     ];
     requests.forEach((url) => {
       console.log(`[VECTOR3D] PRELOAD ${url}`);
@@ -1695,8 +1717,10 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     calibrationVectorMovement,
     sessionBeat,
     sessionVectorMovement,
-    yMinMv,
-    yMaxMv,
+    calibrationVectorRange.min,
+    calibrationVectorRange.max,
+    sessionVectorRange.min,
+    sessionVectorRange.max,
   ]);
 
   return (
@@ -1719,19 +1743,26 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
               ))}
             </select>
           </label>
-          <div className="scale-card">
-            <span>Y scale (mV)</span>
-            <div className="scale-inputs">
-              <label className="scale-field">
-                <span>Min</span>
-                <input type="number" step="0.1" value={yMinMv} onChange={(event) => setYMinMv(Number(event.target.value) || 0)} />
-              </label>
-              <label className="scale-field">
-                <span>Max</span>
-                <input type="number" step="0.1" value={yMaxMv} onChange={(event) => setYMaxMv(Number(event.target.value) || 0)} />
-              </label>
+          {!showWideVectorMode ? (
+            <div className="scale-card">
+              <span>Y scale (mV)</span>
+              <div className="scale-inputs">
+                <label className="scale-field">
+                  <span>Min</span>
+                  <input type="number" step="0.1" value={yMinMv} onChange={(event) => setYMinMv(Number(event.target.value) || 0)} />
+                </label>
+                <label className="scale-field">
+                  <span>Max</span>
+                  <input type="number" step="0.1" value={yMaxMv} onChange={(event) => setYMaxMv(Number(event.target.value) || 0)} />
+                </label>
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="scale-card">
+              <span>Vector scale</span>
+              <div className="meta-line">Auto-fit to current beat range.</div>
+            </div>
+          )}
         </div>
       </header>
 
@@ -1754,8 +1785,8 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
                 data={calibrationVector}
                 loading={loadingCalibrationVector}
                 movementPercent={calibrationVectorMovement}
-                yMin={yMinMv}
-                yMax={yMaxMv}
+                yMin={calibrationVectorRange.min}
+                yMax={calibrationVectorRange.max}
                 onBeatIndexChange={setCalibrationBeat}
                 onMovementPercentChange={setCalibrationVectorMovement}
               />
@@ -1766,8 +1797,8 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
                 data={sessionVector}
                 loading={loadingSessionVector}
                 movementPercent={sessionVectorMovement}
-                yMin={yMinMv}
-                yMax={yMaxMv}
+                yMin={sessionVectorRange.min}
+                yMax={sessionVectorRange.max}
                 onBeatIndexChange={setSessionBeat}
                 onMovementPercentChange={setSessionVectorMovement}
                 />
@@ -1828,30 +1859,21 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
   const [recordIdInput, setRecordIdInput] = useState(initialRecordId);
   const [recordId, setRecordId] = useState(initialRecordId);
   const [data, setData] = useState<LiveVisualResponse | null>(null);
-  const [previousData, setPreviousData] = useState<LiveVisualResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [pollingStopped, setPollingStopped] = useState(false);
-  const [transitionStartedAtMs, setTransitionStartedAtMs] = useState(0);
-  const [animationNowMs, setAnimationNowMs] = useState(0);
-  const latestDataRef = useRef<LiveVisualResponse | null>(null);
-
-  useEffect(() => {
-    let frameId = 0;
-    const animate = (now: number) => {
-      setAnimationNowMs(now);
-      frameId = window.requestAnimationFrame(animate);
-    };
-    frameId = window.requestAnimationFrame(animate);
-    return () => window.cancelAnimationFrame(frameId);
-  }, []);
 
   useEffect(() => {
     let active = true;
-    let intervalId: number | undefined;
     let stopped = false;
+    let inFlight = false;
+    let eventSource: EventSource | null = null;
 
     async function load() {
+      if (!active || stopped || inFlight) {
+        return;
+      }
+      inFlight = true;
       const query = new URLSearchParams();
       if (recordId) {
         query.set("record_id", recordId);
@@ -1869,17 +1891,34 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
           `[LIVE] visual response recordId=${payload.record_id} status=${payload.status} buffer=${payload.buffer_samples} total=${payload.total_samples_received} hr=${payload.heart_rate_bpm ?? "null"}`,
         );
         if (!active) return;
-        setPreviousData(latestDataRef.current);
-        latestDataRef.current = payload;
-        setData(payload);
-        setTransitionStartedAtMs(performance.now());
+        setData((current) => {
+          if (!current) {
+            return payload;
+          }
+          if (payload.record_id !== current.record_id) {
+            return payload;
+          }
+          if (payload.total_samples_received < current.total_samples_received) {
+            return current;
+          }
+          const currentUpdatedAt = Date.parse(current.updated_at || "");
+          const payloadUpdatedAt = Date.parse(payload.updated_at || "");
+          if (
+            Number.isFinite(currentUpdatedAt) &&
+            Number.isFinite(payloadUpdatedAt) &&
+            payloadUpdatedAt < currentUpdatedAt
+          ) {
+            return current;
+          }
+          return payload;
+        });
         setError(null);
         if (payload.status === "ended") {
           stopped = true;
           setPollingStopped(true);
-          if (intervalId !== undefined) {
-            window.clearInterval(intervalId);
-            intervalId = undefined;
+          if (timeoutId !== undefined) {
+            window.clearTimeout(timeoutId);
+            timeoutId = undefined;
           }
         } else {
           setPollingStopped(false);
@@ -1888,23 +1927,51 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
         if (!active) return;
         setError(err instanceof Error ? err.message : "Unknown live session error");
       } finally {
-      if (active) {
+        inFlight = false;
+        if (active) {
           setLoading(false);
         }
       }
     }
 
     void load();
-    intervalId = window.setInterval(() => {
-      if (!stopped) {
-        void load();
+    const eventQuery = new URLSearchParams();
+    if (recordId) {
+      eventQuery.set("record_id", recordId);
+    }
+    eventSource = new EventSource(`/api/session/live/events?${eventQuery.toString()}`);
+    eventSource.addEventListener("preview", (event) => {
+      if (!active || stopped) {
+        return;
       }
-    }, LIVE_FETCH_INTERVAL_MS);
+      try {
+        const payload = JSON.parse((event as MessageEvent).data) as {
+          record_id?: string;
+          status?: string;
+        };
+        if (recordId && payload.record_id && payload.record_id !== recordId) {
+          return;
+        }
+        if (payload.status === "ended") {
+          stopped = true;
+          setPollingStopped(true);
+        }
+      } catch {
+        // Ignore malformed event payloads; the follow-up fetch is authoritative.
+      }
+      void load();
+    });
+    eventSource.onerror = () => {
+      if (!active || stopped) {
+        return;
+      }
+      void load();
+    };
 
     return () => {
       active = false;
-      if (intervalId !== undefined) {
-        window.clearInterval(intervalId);
+      if (eventSource) {
+        eventSource.close();
       }
     };
   }, [recordId]);
@@ -1914,9 +1981,7 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
     const nextUrl = next ? `/session?recordId=${encodeURIComponent(next)}` : "/session";
     window.history.replaceState({}, "", nextUrl);
     setRecordId(next);
-    setPreviousData(null);
     setData(null);
-    latestDataRef.current = null;
     setLoading(true);
     setPollingStopped(false);
   };
@@ -1944,47 +2009,11 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
       CH3: data.channels.CH3.slice(-currentCount),
       CH4: data.channels.CH4.slice(-currentCount),
     };
-    if (!previousData || previousData.record_id !== data.record_id || data.status === "ended") {
-      return {
-        channels: currentChannels,
-        displayedSamples: currentCount,
-      };
-    }
-    const previousCount = Math.min(
-      previousData.channels.CH2.length,
-      previousData.channels.CH3.length,
-      previousData.channels.CH4.length,
-      previousData.buffer_samples || LIVE_VISUAL_BUFFER_SAMPLES,
-    );
-    if (previousCount !== currentCount || previousCount <= 0) {
-      return {
-        channels: currentChannels,
-        displayedSamples: currentCount,
-      };
-    }
-    const newSamples = Math.min(
-      Math.max(data.total_samples_received - previousData.total_samples_received, 0),
-      LIVE_VISUAL_BUFFER_SAMPLES,
-    );
-    const transitionDurationMs = Math.max(
-      1,
-      (newSamples / Math.max(data.sample_rate_hz || 500, 1)) * 1000,
-    );
-    const transitionProgress = Math.min(
-      Math.max((animationNowMs - transitionStartedAtMs) / transitionDurationMs, 0),
-      1,
-    );
-    const shiftSamples = Math.round(newSamples * transitionProgress);
-
     return {
-      channels: {
-        CH2: blendRollingBuffer(previousData.channels.CH2.slice(-currentCount), currentChannels.CH2, shiftSamples),
-        CH3: blendRollingBuffer(previousData.channels.CH3.slice(-currentCount), currentChannels.CH3, shiftSamples),
-        CH4: blendRollingBuffer(previousData.channels.CH4.slice(-currentCount), currentChannels.CH4, shiftSamples),
-      },
+      channels: currentChannels,
       displayedSamples: currentCount,
     };
-  }, [animationNowMs, data, previousData, transitionStartedAtMs]);
+  }, [data]);
 
   return (
     <main className="app-shell live-dashboard-shell">
@@ -2042,13 +2071,6 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
                   title="CH4"
                   samples={playback.channels.CH4}
                   sampleRateHz={data.sample_rate_hz}
-                />
-              </div>
-              <div className="live-vector-panel">
-                <LiveVector3DCanvas
-                  xSamples={playback.channels.CH2}
-                  ySamples={playback.channels.CH4}
-                  zSamples={playback.channels.CH3}
                 />
               </div>
             </div>

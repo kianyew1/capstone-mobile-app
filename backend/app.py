@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -8,6 +9,7 @@ import os
 import threading
 import warnings
 from datetime import datetime
+from queue import Empty, Full, Queue
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -17,6 +19,7 @@ import matplotlib
 import neurokit2 as nk
 import numpy as np
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from pydantic import BaseModel, Field
 
@@ -88,6 +91,8 @@ REVIEW_ARTIFACT_CACHE: Dict[tuple[str, str, str], Dict[str, Any]] = {}
 VECTOR3D_IMAGE_CACHE: Dict[tuple[str, str, int, float, float, int], str] = {}
 VECTOR3D_PRELOAD_STATE: Dict[tuple[str, str, float, float, int], Dict[str, Any]] = {}
 VECTOR3D_PRELOAD_LOCK = threading.Lock()
+LIVE_EVENT_SUBSCRIBERS: list[Queue[str]] = []
+LIVE_EVENT_SUBSCRIBERS_LOCK = threading.Lock()
 
 
 def _normalize_iso_to_sg(value: Optional[str]) -> Optional[str]:
@@ -98,6 +103,37 @@ def _normalize_iso_to_sg(value: Optional[str]) -> Optional[str]:
         return parsed.astimezone(ZoneInfo("Asia/Singapore")).isoformat()
     except Exception:
         return value
+
+
+def _subscribe_live_events() -> Queue[str]:
+    subscriber: Queue[str] = Queue(maxsize=1)
+    with LIVE_EVENT_SUBSCRIBERS_LOCK:
+        LIVE_EVENT_SUBSCRIBERS.append(subscriber)
+    return subscriber
+
+
+def _unsubscribe_live_events(subscriber: Queue[str]) -> None:
+    with LIVE_EVENT_SUBSCRIBERS_LOCK:
+        if subscriber in LIVE_EVENT_SUBSCRIBERS:
+            LIVE_EVENT_SUBSCRIBERS.remove(subscriber)
+
+
+def _publish_live_event(event: Dict[str, Any]) -> None:
+    payload = json.dumps(event)
+    with LIVE_EVENT_SUBSCRIBERS_LOCK:
+        subscribers = list(LIVE_EVENT_SUBSCRIBERS)
+    for subscriber in subscribers:
+        try:
+            subscriber.put_nowait(payload)
+        except Full:
+            try:
+                subscriber.get_nowait()
+            except Exception:
+                pass
+            try:
+                subscriber.put_nowait(payload)
+            except Full:
+                pass
 
 
 def _decode_int16_le(payload: bytes) -> List[int]:
@@ -584,6 +620,16 @@ def _finalize_session_upload(
             visual_snapshot["status"] = "ended"
             visual_snapshot["ended_at"] = ended_at
             visual_snapshot["updated_at"] = ended_at
+            _publish_live_event(
+                {
+                    "record_id": record_id,
+                    "session_id": state.get("session_id"),
+                    "status": "ended",
+                    "updated_at": ended_at,
+                    "total_samples_received": int(state.get("total_samples_received") or 0),
+                    "buffer_samples": int(visual_snapshot.get("buffer_samples") or 0),
+                }
+            )
     logger.info(
         "[%s] response record_id=%s session_object_key=%s duration_ms=%s",
         context,
@@ -707,34 +753,16 @@ def _refresh_live_session_state(
             "CH4": preview_ch4[-buffer_samples:],
         },
     }
-
-    try:
-        _upsert_live_preview_row(
-            {
-                "record_id": record_id,
-                "ch2_preview": preview_ch2[-buffer_samples:],
-                "ch3_preview": preview_ch3[-buffer_samples:],
-                "ch4_preview": preview_ch4[-buffer_samples:],
-                "sample_count": int(state.get("total_samples_received") or 0),
-                "elapsed_time_ms": int(state.get("elapsed_time_ms") or 0),
-                "updated_at": updated_at,
-            }
-        )
-    except Exception as exc:  # pragma: no cover - best effort
-        logger.warning("[SESSION_ADD] live_preview_upsert_failed record_id=%s error=%s", record_id, exc)
-
-    try:
-        _update_recording_row(
-            record_id,
-            {
-                "packet_count": int(state.get("total_packets_received") or 0),
-                "sample_count": int(state.get("total_samples_received") or 0),
-                "elapsed_time_ms": int(state.get("elapsed_time_ms") or 0),
-                "effective_sps": state.get("effective_sps"),
-            },
-        )
-    except Exception as exc:  # pragma: no cover - best effort
-        logger.warning("[SESSION_ADD] record_update_failed record_id=%s error=%s", record_id, exc)
+    _publish_live_event(
+        {
+            "record_id": record_id,
+            "session_id": state.get("session_id"),
+            "status": state["visual_snapshot"]["status"],
+            "updated_at": updated_at,
+            "total_samples_received": int(state.get("total_samples_received") or 0),
+            "buffer_samples": buffer_samples,
+        }
+    )
 
     return {
         "record_id": record_id,
@@ -749,6 +777,79 @@ def _refresh_live_session_state(
         "reason_codes": [],
         "heart_rate_bpm": None,
     }
+
+
+def _persist_live_preview_state(record_id: str, context: str = "SESSION_ADD") -> None:
+    state = LIVE_SESSION_STATE.get(record_id)
+    if not state:
+        return
+    preview_ch2 = list(state.get("preview_ch2") or [])
+    preview_ch3 = list(state.get("preview_ch3") or [])
+    preview_ch4 = list(state.get("preview_ch4") or [])
+    buffer_samples = min(len(preview_ch2), len(preview_ch3), len(preview_ch4))
+    visual_snapshot = state.get("visual_snapshot")
+    updated_at = (
+        visual_snapshot.get("updated_at")
+        if isinstance(visual_snapshot, dict)
+        else None
+    ) or _sg_now_iso()
+
+    try:
+        _upsert_live_preview_row(
+            {
+                "record_id": record_id,
+                "ch2_preview": preview_ch2[-buffer_samples:],
+                "ch3_preview": preview_ch3[-buffer_samples:],
+                "ch4_preview": preview_ch4[-buffer_samples:],
+                "sample_count": int(state.get("total_samples_received") or 0),
+                "elapsed_time_ms": int(state.get("elapsed_time_ms") or 0),
+                "updated_at": updated_at,
+            }
+        )
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("[%s] live_preview_upsert_failed record_id=%s error=%s", context, record_id, exc)
+
+    try:
+        _update_recording_row(
+            record_id,
+            {
+                "packet_count": int(state.get("total_packets_received") or 0),
+                "sample_count": int(state.get("total_samples_received") or 0),
+                "elapsed_time_ms": int(state.get("elapsed_time_ms") or 0),
+                "effective_sps": state.get("effective_sps"),
+            },
+        )
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("[%s] record_update_failed record_id=%s error=%s", context, record_id, exc)
+
+
+def _persist_session_chunk_and_live_state(
+    *,
+    record_id: str,
+    session_id: str,
+    payload: bytes,
+    chunk_index: int,
+    stats: Dict[str, int],
+) -> None:
+    try:
+        _store_session_chunk(
+            record_id=record_id,
+            session_id=session_id,
+            payload=payload,
+            chunk_index=chunk_index,
+            context="SESSION_ADD",
+            stats=stats,
+        )
+    except Exception as exc:  # pragma: no cover - background best effort
+        logger.exception(
+            "[SESSION_ADD] deferred_store_failed record_id=%s session_id=%s chunk_index=%s error=%s",
+            record_id,
+            session_id,
+            chunk_index,
+            exc,
+        )
+        return
+    _persist_live_preview_state(record_id, context="SESSION_ADD")
 
 def _metrics_from_info(
     cleaned: List[float],
@@ -1920,6 +2021,39 @@ async def session_live_visual(
     return LiveSessionVisualResponse(**payload)
 
 
+@app.get("/session/live/events")
+async def session_live_events(request: Request, record_id: Optional[str] = None) -> StreamingResponse:
+    subscriber = _subscribe_live_events()
+
+    async def stream():
+        try:
+            yield b": connected\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    payload = await asyncio.to_thread(subscriber.get, True, 15.0)
+                except Empty:
+                    yield b": keep-alive\n\n"
+                    continue
+                event = json.loads(payload)
+                if record_id and str(event.get("record_id")) != record_id:
+                    continue
+                yield f"event: preview\ndata: {payload}\n\n".encode("utf-8")
+        finally:
+            _unsubscribe_live_events(subscriber)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/session/start", response_model=SessionStartResponse)
 async def session_start(payload: SessionStartRequest) -> SessionStartResponse:
     config = _get_supabase_config()
@@ -2025,7 +2159,7 @@ async def session_start(payload: SessionStartRequest) -> SessionStartResponse:
 
 
 @app.post("/add_to_session", response_model=SessionChunkResponse)
-async def add_to_session(request: Request) -> SessionChunkResponse:
+async def add_to_session(request: Request, background_tasks: BackgroundTasks) -> SessionChunkResponse:
     payload = await request.body()
     record_id = request.headers.get("X-Record-Id")
     session_id = request.headers.get("X-Session-Id")
@@ -2051,27 +2185,6 @@ async def add_to_session(request: Request) -> SessionChunkResponse:
     if stats["packet_count"] == 0:
         raise HTTPException(status_code=400, detail="No complete ECG packets received.")
     try:
-        _store_session_chunk(
-            record_id=record_id,
-            session_id=session_id,
-            payload=payload,
-            chunk_index=chunk_index,
-            context="SESSION_ADD",
-            stats=stats,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover - unexpected failure
-        logger.exception(
-            "[SESSION_ADD] store_failed record_id=%s session_id=%s chunk_index=%s error=%s",
-            record_id,
-            session_id,
-            chunk_index,
-            exc,
-        )
-        raise HTTPException(status_code=502, detail=f"Failed to store session chunk: {exc}") from exc
-
-    try:
         _refresh_live_session_state(
             data=payload,
             stats=stats,
@@ -2087,6 +2200,14 @@ async def add_to_session(request: Request) -> SessionChunkResponse:
             chunk_index,
             exc,
         )
+    background_tasks.add_task(
+        _persist_session_chunk_and_live_state,
+        record_id=record_id,
+        session_id=session_id,
+        payload=payload,
+        chunk_index=chunk_index,
+        stats=stats,
+    )
     return SessionChunkResponse(
         record_id=record_id,
         session_id=session_id,

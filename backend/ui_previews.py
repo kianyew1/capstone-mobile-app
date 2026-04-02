@@ -4,7 +4,8 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger("ecg-backend")
 
 LIVE_SESSION_STATE: Dict[str, Dict[str, Any]] = {}
-LIVE_VISUAL_BUFFER_SAMPLES = 4000
+LIVE_VISUAL_BUFFER_SAMPLES = 2000
+LIVE_VISUAL_RENDER_SAMPLES = 1000
 
 
 def live_visual_buffer_packets(samples_per_packet: int) -> int:
@@ -29,16 +30,32 @@ def live_session_status(state: Optional[Dict[str, Any]]) -> str:
     return "active" if bool(state.get("is_active")) else "ended"
 
 
+def _downsample_series(values: list[float], target_count: int) -> list[float]:
+    if target_count <= 0 or len(values) <= target_count:
+        return list(values)
+    if target_count == 1:
+        return [values[-1]]
+    last_index = len(values) - 1
+    return [
+        values[(index * last_index) // (target_count - 1)]
+        for index in range(target_count)
+    ]
+
+
 def trim_live_visual_snapshot(
     snapshot: Dict[str, Any],
     default_sample_rate_hz: int,
 ) -> Dict[str, Any]:
     sample_rate_hz = int(snapshot.get("sample_rate_hz") or default_sample_rate_hz)
     channels = snapshot.get("channels") or {}
-    trimmed_channels = {
+    raw_channels = {
         "CH2": list(channels.get("CH2") or []),
         "CH3": list(channels.get("CH3") or []),
         "CH4": list(channels.get("CH4") or []),
+    }
+    trimmed_channels = {
+        label: _downsample_series(values, LIVE_VISUAL_RENDER_SAMPLES)
+        for label, values in raw_channels.items()
     }
 
     return {
