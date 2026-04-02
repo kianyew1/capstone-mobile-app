@@ -39,7 +39,6 @@ import {
   clearSessionCapture,
   loadSessionCapture,
 } from "@/services/session-packet-storage";
-import { startSessionAnalysis } from "@/services/session-analysis";
 import {
   getSessionAnalysis,
   type SessionInsight,
@@ -115,8 +114,6 @@ export default function RunSummaryScreen() {
       });
       await clearSessionCapture(sessionId);
       setSyncProgress(70);
-
-      await startSessionAnalysis(recordId);
       setSyncProgress(100);
 
       setSyncStatus("analyzing");

@@ -61,7 +61,6 @@ def _fetch_recording_by_id(record_id: str) -> Dict[str, Any]:
         [
             "id",
             "user_id",
-            "bucket",
             "session_object_key",
             "calibration_object_key",
             "encoding",
@@ -346,52 +345,13 @@ def _upsert_table_row(table: str, payload: Dict[str, Any], conflict_columns: str
         ) from exc
 
 
-def _fetch_processed_record(record_id: str) -> Optional[Dict[str, Any]]:
-    config = _get_supabase_config()
-    url = f"{config['url']}/rest/v1/ecg_processed_records"
-    params = {
-        "record_id": f"eq.{record_id}",
-        "select": "record_id,status,processing_version,updated_at,error_message",
-        "limit": 1,
-    }
-    headers = _supabase_headers(json_content=False)
-    headers["Accept"] = "application/json"
-    try:
-        with httpx.Client(timeout=15) as client:
-            response = client.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-    except Exception as exc:  # pragma: no cover - safeguard
-        logger.error("[PROCESSING] fetch_record failed record_id=%s error=%s", record_id, exc)
-        return None
-    return data[0] if data else None
-
-
-def _upsert_processed_record(
-    record_id: str,
-    status: str,
-    error_message: Optional[str] = None,
-) -> None:
-    _upsert_table_row(
-        "ecg_processed_records",
-        {
-            "record_id": record_id,
-            "status": status,
-            "processing_version": REVIEW_PROCESSING_VERSION,
-            "updated_at": _sg_now_iso(),
-            "error_message": error_message,
-        },
-        "record_id",
-    )
-
-
-def _fetch_processed_artifact_key(record_id: str, artifact_type: str) -> Optional[str]:
+def _fetch_processed_artifact(record_id: str, artifact_type: str) -> Optional[Dict[str, Any]]:
     config = _get_supabase_config()
     url = f"{config['url']}/rest/v1/ecg_processed_artifacts"
     params = {
         "record_id": f"eq.{record_id}",
         "artifact_type": f"eq.{artifact_type}",
-        "select": "object_key,updated_at",
+        "select": "object_key,updated_at,processing_version,byte_length,sample_count",
         "limit": 1,
     }
     headers = _supabase_headers(json_content=False)
@@ -409,25 +369,35 @@ def _fetch_processed_artifact_key(record_id: str, artifact_type: str) -> Optiona
             exc,
         )
         return None
-    object_key = data[0].get("object_key") if data else None
+    artifact = data[0] if data else None
     logger.info(
         "[PROCESSING] fetch_artifact record_id=%s artifact_type=%s url=%s params=%s object_key=%r",
         record_id,
         artifact_type,
         url,
         params,
-        object_key,
+        artifact.get("object_key") if artifact else None,
     )
-    return object_key
+    return artifact
 
 
-def _upsert_processed_artifact(record_id: str, artifact_type: str, object_key: str) -> None:
+def _upsert_processed_artifact(
+    record_id: str,
+    artifact_type: str,
+    object_key: str,
+    *,
+    byte_length: Optional[int] = None,
+    sample_count: Optional[int] = None,
+) -> None:
     _upsert_table_row(
         "ecg_processed_artifacts",
         {
             "record_id": record_id,
             "artifact_type": artifact_type,
             "object_key": object_key,
+            "processing_version": REVIEW_PROCESSING_VERSION,
+            "byte_length": byte_length,
+            "sample_count": sample_count,
             "updated_at": _sg_now_iso(),
         },
         "record_id,artifact_type",
@@ -455,7 +425,7 @@ def _fetch_live_preview_row(record_id: str) -> Optional[Dict[str, Any]]:
     url = f"{config['url']}/rest/v1/ecg_live_preview"
     params = {
         "record_id": f"eq.{record_id}",
-        "select": "record_id,ch2_preview,ch3_preview,ch4_preview,sample_count,last_ts_ms,updated_at",
+        "select": "record_id,ch2_preview,ch3_preview,ch4_preview,sample_count,elapsed_time_ms,updated_at",
         "limit": 1,
     }
     headers = _supabase_headers(json_content=False)
@@ -475,7 +445,7 @@ def _fetch_latest_live_preview_row() -> Optional[Dict[str, Any]]:
     config = _get_supabase_config()
     url = f"{config['url']}/rest/v1/ecg_live_preview"
     params = {
-        "select": "record_id,ch2_preview,ch3_preview,ch4_preview,sample_count,last_ts_ms,updated_at",
+        "select": "record_id,ch2_preview,ch3_preview,ch4_preview,sample_count,elapsed_time_ms,updated_at",
         "order": "updated_at.desc",
         "limit": 1,
     }

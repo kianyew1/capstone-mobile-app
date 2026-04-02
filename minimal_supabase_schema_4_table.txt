@@ -1,0 +1,222 @@
+-- Minimal 4-table Supabase schema for the current backend/frontend
+-- Repo: C:\src\capstone-ecgapp
+-- Assumes storage bucket id/name: capstone_ecg
+-- If your bucket name differs, change every occurrence of 'capstone_ecg'.
+
+begin;
+
+create extension if not exists pgcrypto;
+
+-- Optional cleanup from the older 5-table version.
+-- Uncomment if you want to remove the no-longer-used processing status table.
+-- drop table if exists public.ecg_processed_records cascade;
+
+-- Storage bucket
+insert into storage.buckets (id, name, public)
+values ('capstone_ecg', 'capstone_ecg', false)
+on conflict (id) do nothing;
+
+-- 1) Recordings
+create table if not exists public.ecg_recordings (
+  id uuid primary key default gen_random_uuid(),
+  user_id text not null,
+  calibration_object_key text not null,
+  session_object_key text not null default 'pending',
+  encoding text not null,
+  sample_rate_hz integer not null,
+  channels integer not null,
+  sample_count integer not null default 0,
+  duration_ms integer not null default 0,
+  elapsed_time_ms integer,
+  effective_sps numeric(10,4),
+  byte_length integer not null default 0,
+  start_time timestamptz,
+  created_at timestamptz not null default timezone('Asia/Singapore', now())
+);
+
+alter table public.ecg_recordings drop column if exists bucket;
+alter table public.ecg_recordings drop column if exists packet_count;
+alter table public.ecg_recordings drop column if exists status;
+alter table public.ecg_recordings drop column if exists notes;
+
+create index if not exists ecg_recordings_created_at_idx
+  on public.ecg_recordings (created_at desc);
+
+create index if not exists ecg_recordings_user_created_idx
+  on public.ecg_recordings (user_id, created_at desc);
+
+-- 2) Session chunks
+create table if not exists public.ecg_session_chunks (
+  id uuid primary key default gen_random_uuid(),
+  record_id uuid not null references public.ecg_recordings(id) on delete cascade,
+  chunk_index integer not null,
+  object_key text not null,
+  byte_length integer not null,
+  packet_count integer not null,
+  sample_count integer not null,
+  elapsed_time_ms integer,
+  created_at timestamptz not null default timezone('Asia/Singapore', now()),
+  unique (record_id, chunk_index)
+);
+
+create index if not exists ecg_session_chunks_record_chunk_idx
+  on public.ecg_session_chunks (record_id, chunk_index);
+
+-- 3) Live preview
+create table if not exists public.ecg_live_preview (
+  record_id uuid primary key references public.ecg_recordings(id) on delete cascade,
+  ch2_preview real[] not null default '{}'::real[],
+  ch3_preview real[] not null default '{}'::real[],
+  ch4_preview real[] not null default '{}'::real[],
+  sample_count integer not null default 0,
+  elapsed_time_ms integer,
+  updated_at timestamptz not null default timezone('Asia/Singapore', now())
+);
+
+create index if not exists ecg_live_preview_updated_at_idx
+  on public.ecg_live_preview (updated_at desc);
+
+-- 4) Processed artifact metadata
+create table if not exists public.ecg_processed_artifacts (
+  id uuid primary key default gen_random_uuid(),
+  record_id uuid not null references public.ecg_recordings(id) on delete cascade,
+  artifact_type text not null,
+  object_key text not null,
+  processing_version text not null,
+  byte_length integer,
+  sample_count integer,
+  created_at timestamptz not null default timezone('Asia/Singapore', now()),
+  updated_at timestamptz not null default timezone('Asia/Singapore', now()),
+  unique (record_id, artifact_type)
+);
+
+create index if not exists ecg_processed_artifacts_record_idx
+  on public.ecg_processed_artifacts (record_id);
+
+create index if not exists ecg_processed_artifacts_updated_idx
+  on public.ecg_processed_artifacts (updated_at desc);
+
+-- RLS
+alter table public.ecg_recordings enable row level security;
+alter table public.ecg_session_chunks enable row level security;
+alter table public.ecg_live_preview enable row level security;
+alter table public.ecg_processed_artifacts enable row level security;
+
+-- Drop old policies if they exist so this script is re-runnable.
+drop policy if exists "anon_select_ecg_recordings" on public.ecg_recordings;
+drop policy if exists "anon_insert_ecg_recordings" on public.ecg_recordings;
+drop policy if exists "anon_update_ecg_recordings" on public.ecg_recordings;
+
+drop policy if exists "anon_select_ecg_session_chunks" on public.ecg_session_chunks;
+drop policy if exists "anon_insert_ecg_session_chunks" on public.ecg_session_chunks;
+drop policy if exists "anon_update_ecg_session_chunks" on public.ecg_session_chunks;
+
+drop policy if exists "anon_select_ecg_live_preview" on public.ecg_live_preview;
+drop policy if exists "anon_insert_ecg_live_preview" on public.ecg_live_preview;
+drop policy if exists "anon_update_ecg_live_preview" on public.ecg_live_preview;
+
+drop policy if exists "anon_select_ecg_processed_artifacts" on public.ecg_processed_artifacts;
+drop policy if exists "anon_insert_ecg_processed_artifacts" on public.ecg_processed_artifacts;
+drop policy if exists "anon_update_ecg_processed_artifacts" on public.ecg_processed_artifacts;
+
+create policy "anon_select_ecg_recordings"
+  on public.ecg_recordings
+  for select
+  to anon
+  using (true);
+
+create policy "anon_insert_ecg_recordings"
+  on public.ecg_recordings
+  for insert
+  to anon
+  with check (true);
+
+create policy "anon_update_ecg_recordings"
+  on public.ecg_recordings
+  for update
+  to anon
+  using (true)
+  with check (true);
+
+create policy "anon_select_ecg_session_chunks"
+  on public.ecg_session_chunks
+  for select
+  to anon
+  using (true);
+
+create policy "anon_insert_ecg_session_chunks"
+  on public.ecg_session_chunks
+  for insert
+  to anon
+  with check (true);
+
+create policy "anon_update_ecg_session_chunks"
+  on public.ecg_session_chunks
+  for update
+  to anon
+  using (true)
+  with check (true);
+
+create policy "anon_select_ecg_live_preview"
+  on public.ecg_live_preview
+  for select
+  to anon
+  using (true);
+
+create policy "anon_insert_ecg_live_preview"
+  on public.ecg_live_preview
+  for insert
+  to anon
+  with check (true);
+
+create policy "anon_update_ecg_live_preview"
+  on public.ecg_live_preview
+  for update
+  to anon
+  using (true)
+  with check (true);
+
+create policy "anon_select_ecg_processed_artifacts"
+  on public.ecg_processed_artifacts
+  for select
+  to anon
+  using (true);
+
+create policy "anon_insert_ecg_processed_artifacts"
+  on public.ecg_processed_artifacts
+  for insert
+  to anon
+  with check (true);
+
+create policy "anon_update_ecg_processed_artifacts"
+  on public.ecg_processed_artifacts
+  for update
+  to anon
+  using (true)
+  with check (true);
+
+-- Storage RLS for anon access to the ECG bucket
+drop policy if exists "anon_select_capstone_ecg_objects" on storage.objects;
+drop policy if exists "anon_insert_capstone_ecg_objects" on storage.objects;
+drop policy if exists "anon_update_capstone_ecg_objects" on storage.objects;
+
+create policy "anon_select_capstone_ecg_objects"
+  on storage.objects
+  for select
+  to anon
+  using (bucket_id = 'capstone_ecg');
+
+create policy "anon_insert_capstone_ecg_objects"
+  on storage.objects
+  for insert
+  to anon
+  with check (bucket_id = 'capstone_ecg');
+
+create policy "anon_update_capstone_ecg_objects"
+  on storage.objects
+  for update
+  to anon
+  using (bucket_id = 'capstone_ecg')
+  with check (bucket_id = 'capstone_ecg');
+
+commit;

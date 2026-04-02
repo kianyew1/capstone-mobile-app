@@ -96,21 +96,9 @@ npm install
 
 ### 2.3 Build a locally installable APK
 
-For a straightforward APK file on your machine, use the native Android build.
+For the real phone app use case, the default target should be a release build.
 
-#### Option A: Debug APK (simplest for direct install/testing)
-
-```powershell
-cd C:\src\capstone-ecgapp\capstone-ecgapp\android
-.\gradlew assembleDebug
-```
-
-Output APK:
-- `capstone-ecgapp/android/app/build/outputs/apk/debug/app-debug.apk`
-
-This is the simplest path if your goal is just to get the app onto the phone and test the full real workflow.
-
-#### Option B: Release APK
+#### Option A: Release APK (recommended for real use)
 
 ```powershell
 cd C:\src\capstone-ecgapp\capstone-ecgapp\android
@@ -120,7 +108,19 @@ cd C:\src\capstone-ecgapp\capstone-ecgapp\android
 Output APK:
 - `capstone-ecgapp/android/app/build/outputs/apk/release/app-release.apk`
 
-Use this only if your Android signing setup is already in place and working.
+This is the correct default when you want a proper standalone app on the phone for a real run.
+
+#### Option B: Debug APK (developer-only fallback)
+
+```powershell
+cd C:\src\capstone-ecgapp\capstone-ecgapp\android
+.\gradlew assembleDebug
+```
+
+Output APK:
+- `capstone-ecgapp/android/app/build/outputs/apk/debug/app-debug.apk`
+
+Use this only for short local testing when you explicitly want a debug build. It should not be the default recommendation for the real deployment workflow.
 
 ### 2.4 Install the APK on the phone
 
@@ -132,10 +132,10 @@ Then connect the phone by USB and run:
 
 ```powershell
 adb devices
-adb install -r C:\src\capstone-ecgapp\capstone-ecgapp\android\app\build\outputs\apk\debug\app-debug.apk
+adb install -r C:\src\capstone-ecgapp\capstone-ecgapp\android\app\build\outputs\apk\release\app-release.apk
 ```
 
-If you built a release APK, install the release file instead.
+If you intentionally built a debug APK, install the debug file instead.
 
 ### 2.5 Alternative: build and install directly
 
@@ -355,7 +355,7 @@ Use this exact sequence on run day.
    npm run dev
    ```
 4. Open `http://127.0.0.1:5173` on the computer.
-5. If needed, build and install the correct APK onto the phone.
+5. If needed, build and install the release APK onto the phone.
 6. On the phone, open the installed app.
 7. Connect to the real BLE device.
 8. Run calibration and wait for success.
@@ -403,6 +403,17 @@ Check:
 ---
 
 ## 14. Minimal terminal commands
+
+### Build release APK
+```powershell
+cd C:\src\capstone-ecgapp\capstone-ecgapp\android
+.\gradlew assembleRelease
+```
+
+### Install release APK
+```powershell
+adb install -r C:\src\capstone-ecgapp\capstone-ecgapp\android\app\build\outputs\apk\release\app-release.apk
+```
 
 ### Build debug APK
 ```powershell

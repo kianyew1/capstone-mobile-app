@@ -132,10 +132,10 @@ const nextMockTriplet = () => {
 
 const buildMockPacket = () => {
   const packet = new Uint8Array(ECG_PACKET_BYTES);
-  write24SignedBE(packet, 0, MOCK_PACKET_STATUS);
-  const ch2OffsetBase = ECG_STATUS_BYTES;
+  const ch2OffsetBase = 0;
   const ch3OffsetBase = ch2OffsetBase + MOCK_SAMPLES_PER_PACKET * 3;
   const ch4OffsetBase = ch3OffsetBase + MOCK_SAMPLES_PER_PACKET * 3;
+  const statusOffset = ch4OffsetBase + MOCK_SAMPLES_PER_PACKET * 3;
 
   for (let i = 0; i < MOCK_SAMPLES_PER_PACKET; i += 1) {
     const sample = nextMockTriplet();
@@ -143,6 +143,7 @@ const buildMockPacket = () => {
     write24SignedBE(packet, ch3OffsetBase + i * 3, sample.ch3);
     write24SignedBE(packet, ch4OffsetBase + i * 3, sample.ch4);
   }
+  write24SignedBE(packet, statusOffset, MOCK_PACKET_STATUS);
   mockTimestampMs = (mockTimestampMs + MOCK_TIMESTAMP_STEP_MS) & 0xffffff;
   write24UnsignedBE(packet, ECG_PACKET_BYTES - ECG_TIMESTAMP_BYTES, mockTimestampMs);
   return packet;

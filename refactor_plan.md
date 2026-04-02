@@ -153,8 +153,7 @@ Supabase schema proposal (minimal, debuggable)
   - session_chunks_prefix text (e.g., `session/{session_id}/chunks`)
   - packet_count int default 0
   - sample_count int default 0
-  - first_ts_ms int
-  - last_ts_ms int
+  - elapsed_time_ms int
   - effective_sps numeric(10,4)
   - processing_version text
   - status text (e.g., started | ended | processed | error)
@@ -167,8 +166,7 @@ Supabase schema proposal (minimal, debuggable)
   - byte_length int not null
   - packet_count int not null
   - sample_count int not null
-  - first_ts_ms int
-  - last_ts_ms int
+  - elapsed_time_ms int
   - created_at timestamptz default now()
   - unique (record_id, chunk_index)
 
