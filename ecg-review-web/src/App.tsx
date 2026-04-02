@@ -1871,6 +1871,9 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
 
     async function load() {
       if (!active || stopped || inFlight) {
+        console.log(
+          `[LIVE] skip load active=${active} stopped=${stopped} inFlight=${inFlight} recordId=${recordId || "latest"}`,
+        );
         return;
       }
       inFlight = true;
@@ -1879,7 +1882,7 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
         query.set("record_id", recordId);
       }
       const url = `/api/session/live/visual?${query.toString()}`;
-      console.log(`[LIVE] GET ${url}`);
+      console.log(`[LIVE] fetch start url=${url}`);
       try {
         const response = await fetch(url);
         if (!response.ok) {
@@ -1888,17 +1891,26 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
         }
         const payload = (await response.json()) as LiveVisualResponse;
         console.log(
-          `[LIVE] visual response recordId=${payload.record_id} status=${payload.status} buffer=${payload.buffer_samples} total=${payload.total_samples_received} hr=${payload.heart_rate_bpm ?? "null"}`,
+          `[LIVE] fetch success recordId=${payload.record_id} status=${payload.status} buffer=${payload.buffer_samples} total=${payload.total_samples_received} hr=${payload.heart_rate_bpm ?? "null"} updated_at=${payload.updated_at}`,
         );
         if (!active) return;
         setData((current) => {
           if (!current) {
+            console.log(
+              `[LIVE] apply snapshot recordId=${payload.record_id} total=${payload.total_samples_received} reason=initial`,
+            );
             return payload;
           }
           if (payload.record_id !== current.record_id) {
+            console.log(
+              `[LIVE] apply snapshot recordId=${payload.record_id} total=${payload.total_samples_received} reason=record-switch previous=${current.record_id}`,
+            );
             return payload;
           }
           if (payload.total_samples_received < current.total_samples_received) {
+            console.log(
+              `[LIVE] ignore snapshot recordId=${payload.record_id} total=${payload.total_samples_received} previous=${current.total_samples_received} reason=older-total`,
+            );
             return current;
           }
           const currentUpdatedAt = Date.parse(current.updated_at || "");
@@ -1908,8 +1920,14 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
             Number.isFinite(payloadUpdatedAt) &&
             payloadUpdatedAt < currentUpdatedAt
           ) {
+            console.log(
+              `[LIVE] ignore snapshot recordId=${payload.record_id} total=${payload.total_samples_received} reason=older-updated-at current=${current.updated_at} next=${payload.updated_at}`,
+            );
             return current;
           }
+          console.log(
+            `[LIVE] apply snapshot recordId=${payload.record_id} total=${payload.total_samples_received} reason=fresh`,
+          );
           return payload;
         });
         setError(null);
@@ -1925,6 +1943,7 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
         }
       } catch (err) {
         if (!active) return;
+        console.error("[LIVE] fetch error", err);
         setError(err instanceof Error ? err.message : "Unknown live session error");
       } finally {
         inFlight = false;
@@ -1939,7 +1958,12 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
     if (recordId) {
       eventQuery.set("record_id", recordId);
     }
-    eventSource = new EventSource(`/api/session/live/events?${eventQuery.toString()}`);
+    const eventUrl = `/api/session/live/events?${eventQuery.toString()}`;
+    console.log(`[LIVE] sse connect url=${eventUrl}`);
+    eventSource = new EventSource(eventUrl);
+    eventSource.onopen = () => {
+      console.log(`[LIVE] sse open recordId=${recordId || "latest"}`);
+    };
     eventSource.addEventListener("preview", (event) => {
       if (!active || stopped) {
         return;
@@ -1950,14 +1974,20 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
           status?: string;
         };
         if (recordId && payload.record_id && payload.record_id !== recordId) {
+          console.log(
+            `[LIVE] sse ignore recordId=${payload.record_id} current=${recordId}`,
+          );
           return;
         }
+        console.log(
+          `[LIVE] sse preview recordId=${payload.record_id ?? "unknown"} status=${payload.status ?? "unknown"}`,
+        );
         if (payload.status === "ended") {
           stopped = true;
           setPollingStopped(true);
         }
       } catch {
-        // Ignore malformed event payloads; the follow-up fetch is authoritative.
+        console.warn("[LIVE] sse malformed preview event");
       }
       void load();
     });
@@ -1965,12 +1995,14 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
       if (!active || stopped) {
         return;
       }
+      console.warn(`[LIVE] sse error recordId=${recordId || "latest"}`);
       void load();
     };
 
     return () => {
       active = false;
       if (eventSource) {
+        console.log(`[LIVE] sse close recordId=${recordId || "latest"}`);
         eventSource.close();
       }
     };
