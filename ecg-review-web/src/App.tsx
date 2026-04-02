@@ -222,6 +222,34 @@ function formatAxisValue(value: number): string {
   return value.toFixed(2);
 }
 
+function getFiniteRange(values: number[]): { min: number; max: number } | null {
+  const finite = values.filter((value) => Number.isFinite(value));
+  if (!finite.length) {
+    return null;
+  }
+  let min = finite[0];
+  let max = finite[0];
+  for (let index = 1; index < finite.length; index += 1) {
+    const value = finite[index];
+    if (value < min) min = value;
+    if (value > max) max = value;
+  }
+  if (Math.abs(max - min) < 1e-9) {
+    const padding = Math.max(Math.abs(max) * 0.1, 0.05);
+    return { min: min - padding, max: max + padding };
+  }
+  const padding = Math.max((max - min) * 0.08, 0.05);
+  return { min: min - padding, max: max + padding };
+}
+
+function getCombinedFiniteRange(...seriesList: number[][]): { min: number; max: number } | null {
+  const combined: number[] = [];
+  seriesList.forEach((series) => {
+    combined.push(...series);
+  });
+  return getFiniteRange(combined);
+}
+
 function getBeatSamples(fullSignal: number[], beat: ReviewBeat | null): number[] {
   if (!beat) {
     return [];
@@ -433,14 +461,10 @@ function LiveWaveformCanvas({
   title,
   samples,
   sampleRateHz,
-  yMin,
-  yMax,
 }: {
   title: string;
   samples: number[];
   sampleRateHz: number;
-  yMin: number;
-  yMax: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -455,6 +479,9 @@ function LiveWaveformCanvas({
     const margin = { top: 18, right: 14, bottom: 36, left: 44 };
     const plotWidth = width - margin.left - margin.right;
     const plotHeight = height - margin.top - margin.bottom;
+    const range = getFiniteRange(samples) ?? { min: -1, max: 1 };
+    const yMin = range.min;
+    const yMax = range.max;
     const span = yMax - yMin || 1;
     const zeroY = margin.top + plotHeight - ((0 - yMin) / span) * plotHeight;
 
@@ -520,7 +547,7 @@ function LiveWaveformCanvas({
       }
     });
     ctx.stroke();
-  }, [samples, sampleRateHz, yMin, yMax]);
+  }, [samples, sampleRateHz]);
 
   return (
     <section className="live-quadrant-card">
@@ -537,14 +564,10 @@ function LiveVector3DCanvas({
   xSamples,
   ySamples,
   zSamples,
-  yMin,
-  yMax,
 }: {
   xSamples: number[];
   ySamples: number[];
   zSamples: number[];
-  yMin: number;
-  yMax: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -559,6 +582,10 @@ function LiveVector3DCanvas({
     ctx.clearRect(0, 0, width, height);
     ctx.fillStyle = "#f7fbfd";
     ctx.fillRect(0, 0, width, height);
+
+    const range = getCombinedFiniteRange(xSamples, ySamples, zSamples) ?? { min: -1, max: 1 };
+    const yMin = range.min;
+    const yMax = range.max;
 
     const project = (x: number, y: number, z: number) =>
       projectVector3DPoint(x, y, z, width, height, yMin, yMax);
@@ -601,7 +628,7 @@ function LiveVector3DCanvas({
       }
     }
     ctx.stroke();
-  }, [xSamples, ySamples, zSamples, yMin, yMax]);
+  }, [xSamples, ySamples, zSamples]);
 
   return (
     <section className="live-quadrant-card live-vector-card">
@@ -2005,22 +2032,16 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
                   title="CH2"
                   samples={playback.channels.CH2}
                   sampleRateHz={data.sample_rate_hz}
-                  yMin={DEFAULT_ECG_Y_MIN_MV}
-                  yMax={DEFAULT_ECG_Y_MAX_MV}
                 />
                 <LiveWaveformCanvas
                   title="CH3"
                   samples={playback.channels.CH3}
                   sampleRateHz={data.sample_rate_hz}
-                  yMin={DEFAULT_ECG_Y_MIN_MV}
-                  yMax={DEFAULT_ECG_Y_MAX_MV}
                 />
                 <LiveWaveformCanvas
                   title="CH4"
                   samples={playback.channels.CH4}
                   sampleRateHz={data.sample_rate_hz}
-                  yMin={DEFAULT_ECG_Y_MIN_MV}
-                  yMax={DEFAULT_ECG_Y_MAX_MV}
                 />
               </div>
               <div className="live-vector-panel">
@@ -2028,8 +2049,6 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
                   xSamples={playback.channels.CH2}
                   ySamples={playback.channels.CH4}
                   zSamples={playback.channels.CH3}
-                  yMin={DEFAULT_ECG_Y_MIN_MV}
-                  yMax={DEFAULT_ECG_Y_MAX_MV}
                 />
               </div>
             </div>

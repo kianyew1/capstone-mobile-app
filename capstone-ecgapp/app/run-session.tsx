@@ -92,8 +92,10 @@ export default function RunSessionScreen() {
 
   const sessionCheckPacketsRef = useRef<Uint8Array[]>([]);
   const sessionPacketCountRef = useRef(0);
+  const sessionReceivedPacketCountRef = useRef(0);
   const invalidPacketCountRef = useRef(0);
   const sessionChunkIndexRef = useRef(0);
+  const skippedWarmupPacketRef = useRef(false);
   const sessionStartRef = useRef<Date | null>(null);
   const isStreamingRef = useRef(false);
   const isSessionCheckInFlightRef = useRef(false);
@@ -232,8 +234,10 @@ export default function RunSessionScreen() {
       hasInitializedSessionCaptureRef.current = true;
       sessionCheckPacketsRef.current = [];
       sessionPacketCountRef.current = 0;
+      sessionReceivedPacketCountRef.current = 0;
       invalidPacketCountRef.current = 0;
       sessionChunkIndexRef.current = 0;
+      skippedWarmupPacketRef.current = false;
       console.log(
         `[SESSION] start stream expectedBytes=${expectedPacketBytes}`,
       );
@@ -254,6 +258,15 @@ export default function RunSessionScreen() {
         }
         return;
       }
+      sessionReceivedPacketCountRef.current += 1;
+      const receivedCount = sessionReceivedPacketCountRef.current;
+      if (!skippedWarmupPacketRef.current) {
+        skippedWarmupPacketRef.current = true;
+        console.log(
+          `[SESSION] skipped warmup packet bytes=${bytes.length} received=${receivedCount}`,
+        );
+        return;
+      }
       sessionCheckPacketsRef.current.push(bytes);
       sessionPacketCountRef.current += 1;
       const count = sessionPacketCountRef.current;
@@ -270,10 +283,10 @@ export default function RunSessionScreen() {
       }
       if (count === 1) {
         console.log(
-          `[SESSION] first packet bytes=${bytes.length}`,
+          `[SESSION] first kept packet bytes=${bytes.length} received=${receivedCount} kept=${count}`,
         );
-      } else if (count % 20 === 0) {
-        console.log(`[SESSION] packet=${count}`);
+      } else if (receivedCount % 20 === 0) {
+        console.log(`[SESSION] packet_received=${receivedCount} packet_kept=${count}`);
       }
       void flushSessionPackets();
     }).catch((error) => {
@@ -299,7 +312,9 @@ export default function RunSessionScreen() {
       sessionIdRef.current = null;
       sessionStartRef.current = null;
       sessionCheckPacketsRef.current = [];
+      sessionReceivedPacketCountRef.current = 0;
       sessionChunkIndexRef.current = 0;
+      skippedWarmupPacketRef.current = false;
       stopEcgNotifications();
     }
   }, [sessionStatus, stopEcgNotifications]);

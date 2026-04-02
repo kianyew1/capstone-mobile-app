@@ -74,6 +74,8 @@ export default function CalibrationScreen() {
     useAppStore();
   const { startEcgNotifications, stopEcgNotifications } = useBluetoothService();
   const packetCountRef = useRef(0);
+  const receivedPacketCountRef = useRef(0);
+  const skippedWarmupPacketRef = useRef(false);
   const invalidPacketCountRef = useRef(0);
   const packetsRef = useRef<Array<{ data: Uint8Array; receivedAt: number }>>(
     [],
@@ -124,7 +126,9 @@ export default function CalibrationScreen() {
     setElapsedMs(0);
     setLastPacketBytes(null);
     packetCountRef.current = 0;
+    receivedPacketCountRef.current = 0;
     invalidPacketCountRef.current = 0;
+    skippedWarmupPacketRef.current = false;
     packetsRef.current = [];
     calibrationStartRef.current = Date.now();
     isFinishingRef.current = false;
@@ -221,28 +225,43 @@ export default function CalibrationScreen() {
           return;
         }
 
+        receivedPacketCountRef.current += 1;
+        const receivedCount = receivedPacketCountRef.current;
+        if (!skippedWarmupPacketRef.current) {
+          skippedWarmupPacketRef.current = true;
+          console.log(
+            `[CAL] skipped warmup packet len=${bytes.length} received=${receivedCount}`,
+          );
+          if (calibrationStartRef.current) {
+            setElapsedMs(receivedAt - calibrationStartRef.current);
+          }
+          setProgress(0);
+          setPacketCount(0);
+          return;
+        }
+
         packetsRef.current.push({ data: bytes, receivedAt });
         packetCountRef.current += 1;
-        const count = packetCountRef.current;
-        setPacketCount(count);
+        const storedCount = packetCountRef.current;
+        setPacketCount(storedCount);
         setLastPacketBytes(bytes);
-        if (count === 1) {
+        if (storedCount === 1) {
           console.log(
-            `[CAL] first packet len=${bytes.length} bytes=${Array.from(bytes).join(",")}`,
+            `[CAL] first kept packet len=${bytes.length} received=${receivedCount}`,
           );
-        } else if (count % 20 === 0) {
-          console.log(`[CAL] packet=${count} len=${bytes.length}`);
+        } else if (receivedCount % 20 === 0) {
+          console.log(`[CAL] packet=${receivedCount} len=${bytes.length}`);
         }
         if (calibrationStartRef.current) {
           setElapsedMs(receivedAt - calibrationStartRef.current);
         }
         const pct = Math.min(
           100,
-          Math.round((count / targetPacketCount) * 100),
+          Math.round((storedCount / targetPacketCount) * 100),
         );
         setProgress(pct);
 
-        if (count >= targetPacketCount) {
+        if (storedCount >= targetPacketCount) {
           void finishSuccess();
         }
       },
@@ -275,7 +294,9 @@ export default function CalibrationScreen() {
     setGraphSeries({ ch2: [], ch3: [], ch4: [] });
     setGraphError(null);
     packetCountRef.current = 0;
+    receivedPacketCountRef.current = 0;
     packetsRef.current = [];
+    skippedWarmupPacketRef.current = false;
     calibrationStartRef.current = null;
     isFinishingRef.current = false;
   };

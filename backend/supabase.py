@@ -69,6 +69,8 @@ def _fetch_recording_by_id(record_id: str) -> Dict[str, Any]:
             "channels",
             "sample_count",
             "duration_ms",
+            "elapsed_time_ms",
+            "effective_sps",
             "byte_length",
             "created_at",
         ]
@@ -428,6 +430,7 @@ def _upsert_processed_artifact(record_id: str, artifact_type: str, object_key: s
             "record_id": record_id,
             "artifact_type": artifact_type,
             "object_key": object_key,
+            "processing_version": REVIEW_PROCESSING_VERSION,
             "updated_at": _sg_now_iso(),
         },
         "record_id,artifact_type",
@@ -455,7 +458,7 @@ def _fetch_live_preview_row(record_id: str) -> Optional[Dict[str, Any]]:
     url = f"{config['url']}/rest/v1/ecg_live_preview"
     params = {
         "record_id": f"eq.{record_id}",
-        "select": "record_id,ch2_preview,ch3_preview,ch4_preview,sample_count,last_ts_ms,updated_at",
+        "select": "record_id,ch2_preview,ch3_preview,ch4_preview,sample_count,elapsed_time_ms,updated_at",
         "limit": 1,
     }
     headers = _supabase_headers(json_content=False)
@@ -475,7 +478,7 @@ def _fetch_latest_live_preview_row() -> Optional[Dict[str, Any]]:
     config = _get_supabase_config()
     url = f"{config['url']}/rest/v1/ecg_live_preview"
     params = {
-        "select": "record_id,ch2_preview,ch3_preview,ch4_preview,sample_count,last_ts_ms,updated_at",
+        "select": "record_id,ch2_preview,ch3_preview,ch4_preview,sample_count,elapsed_time_ms,updated_at",
         "order": "updated_at.desc",
         "limit": 1,
     }

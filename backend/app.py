@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import matplotlib
 import neurokit2 as nk
+import numpy as np
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from pydantic import BaseModel, Field
@@ -63,12 +64,13 @@ from ui_previews import (
     trim_live_visual_snapshot,
 )
 
-STATUS_BYTES = 3
-TIMESTAMP_BYTES = 3
 BYTES_PER_SAMPLE = 3
 SAMPLES_PER_PACKET = 25
 CHANNELS = 3
-PACKET_BYTES = STATUS_BYTES + (BYTES_PER_SAMPLE * SAMPLES_PER_PACKET * CHANNELS) + TIMESTAMP_BYTES
+SIGNAL_BYTES = BYTES_PER_SAMPLE * SAMPLES_PER_PACKET * CHANNELS
+STATUS_BYTES = 3
+ELAPSED_TIME_BYTES = 3
+PACKET_BYTES = SIGNAL_BYTES + STATUS_BYTES + ELAPSED_TIME_BYTES
 CHANNEL_LABELS = ["CH2", "CH3", "CH4"]
 ADS1298_VREF = 2.4
 ADS1298_GAIN = 6.0
@@ -137,7 +139,7 @@ def _decode_ads1298_packets(payload: bytes) -> Dict[str, List[float]]:
     channels: Dict[str, List[float]] = {label: [] for label in CHANNEL_LABELS}
     for p in range(packet_count):
         base = p * PACKET_BYTES
-        offset = base + STATUS_BYTES  # skip status
+        offset = base + STATUS_BYTES
         for _ in range(SAMPLES_PER_PACKET):
             channels["CH2"].append(_counts_to_mv(_read24_signed_be(payload, offset)))
             offset += 3
@@ -196,25 +198,111 @@ def _packet_stats(payload: bytes) -> Dict[str, int]:
     packet_count = len(payload) // PACKET_BYTES
     sample_count_per_channel = packet_count * SAMPLES_PER_PACKET
     remainder = len(payload) % PACKET_BYTES
-    first_ts_ms = None
-    last_ts_ms = None
-    if TIMESTAMP_BYTES and packet_count > 0:
-        first_offset = PACKET_BYTES - TIMESTAMP_BYTES
-        last_offset = ((packet_count - 1) * PACKET_BYTES) + (PACKET_BYTES - TIMESTAMP_BYTES)
-        if last_offset + TIMESTAMP_BYTES <= len(payload):
-            first_ts_ms = _read24_unsigned_be(payload, first_offset)
-            last_ts_ms = _read24_unsigned_be(payload, last_offset)
+    elapsed_time_ms = 0
+    if ELAPSED_TIME_BYTES and packet_count > 0:
+        for packet_index in range(packet_count):
+            elapsed_offset = (packet_index * PACKET_BYTES) + (PACKET_BYTES - ELAPSED_TIME_BYTES)
+            if elapsed_offset + ELAPSED_TIME_BYTES <= len(payload):
+                elapsed_time_ms += _read24_unsigned_be(payload, elapsed_offset)
     stats: Dict[str, int] = {
         "packet_count": packet_count,
         "sample_count_per_channel": sample_count_per_channel,
         "remainder": remainder,
         "byte_length": len(payload),
+        "elapsed_time_ms": int(elapsed_time_ms),
     }
-    if first_ts_ms is not None:
-        stats["first_ts_ms"] = int(first_ts_ms)
-    if last_ts_ms is not None:
-        stats["last_ts_ms"] = int(last_ts_ms)
     return stats
+
+
+def _packet_elapsed_summary(payload: bytes, preview_count: int = 5) -> Dict[str, Any]:
+    packet_count = len(payload) // PACKET_BYTES
+    if packet_count <= 0:
+        return {
+            "packet_count": 0,
+            "preview_hex": [],
+            "preview_ms": [],
+            "min_ms": None,
+            "max_ms": None,
+            "mean_ms": None,
+            "total_ms": 0,
+        }
+
+    values: List[int] = []
+    preview_hex: List[str] = []
+    for packet_index in range(packet_count):
+        elapsed_offset = (packet_index * PACKET_BYTES) + (PACKET_BYTES - ELAPSED_TIME_BYTES)
+        raw_bytes = payload[elapsed_offset : elapsed_offset + ELAPSED_TIME_BYTES]
+        if len(raw_bytes) != ELAPSED_TIME_BYTES:
+            continue
+        value = _read24_unsigned_be(payload, elapsed_offset)
+        values.append(value)
+        if len(preview_hex) < preview_count:
+            preview_hex.append(raw_bytes.hex())
+
+    if not values:
+        return {
+            "packet_count": packet_count,
+            "preview_hex": preview_hex,
+            "preview_ms": [],
+            "min_ms": None,
+            "max_ms": None,
+            "mean_ms": None,
+            "total_ms": 0,
+        }
+
+    return {
+        "packet_count": packet_count,
+        "preview_hex": preview_hex,
+        "preview_ms": values[:preview_count],
+        "min_ms": min(values),
+        "max_ms": max(values),
+        "mean_ms": round(sum(values) / len(values), 3),
+        "total_ms": sum(values),
+    }
+
+
+def _effective_sps_from_stats(stats: Dict[str, int]) -> Optional[float]:
+    elapsed_time_ms = int(stats.get("elapsed_time_ms") or 0)
+    sample_count = int(stats.get("sample_count_per_channel") or 0)
+    if elapsed_time_ms <= 0 or sample_count <= 0:
+        return None
+    return round(float(sample_count) / (elapsed_time_ms / 1000.0), 4)
+
+
+def _resample_series(
+    samples: List[float],
+    source_sps: Optional[float],
+    target_sps: int,
+) -> List[float]:
+    if not samples:
+        return []
+    if source_sps is None or source_sps <= 0 or target_sps <= 0:
+        return list(samples)
+    if len(samples) < 2:
+        return list(samples)
+    if abs(float(source_sps) - float(target_sps)) < 1e-6:
+        return list(samples)
+
+    duration_seconds = len(samples) / float(source_sps)
+    target_count = max(1, int(round(duration_seconds * float(target_sps))))
+    if target_count == len(samples):
+        return list(samples)
+
+    source_positions = np.linspace(0.0, duration_seconds, num=len(samples), endpoint=False)
+    target_positions = np.linspace(0.0, duration_seconds, num=target_count, endpoint=False)
+    resampled = np.interp(target_positions, source_positions, np.asarray(samples, dtype=float))
+    return resampled.astype(float).tolist()
+
+
+def _resample_channels(
+    channels: Dict[str, List[float]],
+    source_sps: Optional[float],
+    target_sps: int,
+) -> Dict[str, List[float]]:
+    return {
+        label: _resample_series(channels.get(label, []), source_sps, target_sps)
+        for label in CHANNEL_LABELS
+    }
 
 
 def _handle_calibration_payload(
@@ -224,13 +312,18 @@ def _handle_calibration_payload(
     user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     stats = _packet_stats(data)
+    elapsed_summary = _packet_elapsed_summary(data)
     logger.info(
-        "[CALIBRATION] received run_id=%s byte_length=%s packet_count=%s sample_count_per_channel=%s remainder=%s",
+        "[CALIBRATION] received run_id=%s byte_length=%s packet_count=%s sample_count_per_channel=%s remainder=%s elapsed_preview_ms=%s elapsed_preview_hex=%s elapsed_mean_ms=%s elapsed_total_ms=%s",
         run_id,
         stats["byte_length"],
         stats["packet_count"],
         stats["sample_count_per_channel"],
         stats["remainder"],
+        elapsed_summary.get("preview_ms"),
+        elapsed_summary.get("preview_hex"),
+        elapsed_summary.get("mean_ms"),
+        elapsed_summary.get("total_ms"),
     )
     if stats["packet_count"] == 0:
         raise HTTPException(status_code=400, detail="No complete ECG packets received.")
@@ -240,12 +333,18 @@ def _handle_calibration_payload(
             detail=f"Payload length is not a multiple of packet size {PACKET_BYTES}.",
         )
 
-    channels = _decode_ads1298_packets(data)
+    effective_sps = _effective_sps_from_stats(stats)
+    decoded_channels = _decode_ads1298_packets(data)
+    channels = _resample_channels(
+        decoded_channels,
+        effective_sps or float(DEFAULT_SAMPLE_RATE_HZ),
+        DEFAULT_SAMPLE_RATE_HZ,
+    )
     ch2 = channels.get("CH2", [])
     if not ch2:
         raise HTTPException(status_code=400, detail="Decoded calibration signal is empty.")
     calibration_result = _process_window(ch2, DEFAULT_SAMPLE_RATE_HZ)
-    quality_percentage = 100 + round(
+    quality_percentage = round(
         _quality_to_percentage(calibration_result.get("quality")),
         2,
     )
@@ -259,7 +358,7 @@ def _handle_calibration_payload(
     LAST_CALIBRATION_SAMPLES.clear()
     LAST_CALIBRATION_SAMPLES.extend(calibration_result.get("cleaned", []))
     LAST_CALIBRATION_META["byte_length"] = stats["byte_length"]
-    LAST_CALIBRATION_META["sample_count"] = stats["sample_count_per_channel"]
+    LAST_CALIBRATION_META["sample_count"] = len(ch2)
 
     stored_object_key = ""
     if signal_suitable:
@@ -280,8 +379,10 @@ def _handle_calibration_payload(
                 "encoding": "ads1298_24be_mv",
                 "sample_rate_hz": 500,
                 "channels": 3,
-                "sample_count": stats["sample_count_per_channel"],
-                "duration_ms": round((stats["sample_count_per_channel"] / 500) * 1000),
+                "sample_count": len(ch2),
+                "duration_ms": int(stats.get("elapsed_time_ms") or round((stats["sample_count_per_channel"] / 500) * 1000)),
+                "elapsed_time_ms": stats.get("elapsed_time_ms"),
+                "effective_sps": effective_sps,
                 "byte_length": stats["byte_length"],
                 "status": "calibrated",
                 "notes": json.dumps(
@@ -303,11 +404,14 @@ def _handle_calibration_payload(
         )
 
     logger.info(
-        "[CALIBRATION] response run_id=%s quality_percentage=%.2f signal_suitable=%s stored_object_key=%s cleaned_samples=%s r_peaks=%s preview_lengths=%s",
+        "[CALIBRATION] response run_id=%s quality_percentage=%.2f signal_suitable=%s stored_object_key=%s effective_sps=%s raw_samples=%s resampled_samples=%s cleaned_samples=%s r_peaks=%s preview_lengths=%s",
         run_id,
         quality_percentage,
         signal_suitable,
         stored_object_key or "none",
+        effective_sps,
+        stats["sample_count_per_channel"],
+        len(ch2),
         len(calibration_result.get("cleaned", [])),
         len(calibration_result.get("r_peaks", [])),
         {label: len(previews.get(label, [])) for label in CHANNEL_LABELS},
@@ -342,17 +446,25 @@ def _validate_packet_payload(payload: bytes, context: str) -> Dict[str, int]:
             stats["remainder"],
         )
         raise HTTPException(status_code=400, detail="Invalid payload length.")
-    if stats.get("packet_count", 0) > 1 and "first_ts_ms" in stats and "last_ts_ms" in stats:
-        first_ts = stats["first_ts_ms"]
-        last_ts = stats["last_ts_ms"]
-        if first_ts == last_ts:
-            logger.error(
-                "[%s] invalid_timestamp_delta first_ts_ms=%s last_ts_ms=%s",
-                context,
-                first_ts,
-                last_ts,
-            )
-            raise HTTPException(status_code=400, detail="Invalid timestamp delta.")
+    if stats.get("packet_count", 0) > 0 and int(stats.get("elapsed_time_ms") or 0) <= 0:
+        logger.error(
+            "[%s] invalid_elapsed_time elapsed_time_ms=%s",
+            context,
+            stats.get("elapsed_time_ms"),
+        )
+        raise HTTPException(status_code=400, detail="Invalid elapsed time.")
+    elapsed_summary = _packet_elapsed_summary(payload)
+    mean_ms = elapsed_summary.get("mean_ms")
+    if mean_ms is not None and (float(mean_ms) <= 0.0 or float(mean_ms) > 1000.0):
+        logger.error(
+            "[%s] invalid_packet_elapsed preview_ms=%s preview_hex=%s mean_ms=%s total_ms=%s",
+            context,
+            elapsed_summary.get("preview_ms"),
+            elapsed_summary.get("preview_hex"),
+            elapsed_summary.get("mean_ms"),
+            elapsed_summary.get("total_ms"),
+        )
+        raise HTTPException(status_code=400, detail="Invalid packet elapsed timing.")
     return stats
 
 
@@ -376,8 +488,7 @@ def _store_session_chunk(
             "byte_length": stats["byte_length"],
             "packet_count": stats["packet_count"],
             "sample_count": stats["sample_count_per_channel"],
-            "first_ts_ms": stats.get("first_ts_ms"),
-            "last_ts_ms": stats.get("last_ts_ms"),
+            "elapsed_time_ms": stats.get("elapsed_time_ms"),
             "created_at": _sg_now_iso(),
         }
     )
@@ -409,34 +520,26 @@ def _finalize_session_upload(
     session_object_key = f"session/{session_id}.bin"
     normalized_start_time = _normalize_iso_to_sg(start_time)
     _upload_storage_bytes(session_object_key, payload)
-    duration_ms = round((stats["sample_count_per_channel"] / 500) * 1000)
-    effective_sps = None
-    if "first_ts_ms" in stats and "last_ts_ms" in stats:
-        first_ts = stats["first_ts_ms"]
-        last_ts = stats["last_ts_ms"]
-        if last_ts < first_ts:
-            last_ts += (1 << 24)
-        delta_ms = last_ts - first_ts
-        if delta_ms > 0:
-            effective_sps = round(
-                float(stats["sample_count_per_channel"]) / (delta_ms / 1000.0),
-                4,
-            )
-            duration_ms = int(delta_ms)
+    duration_ms = int(stats.get("elapsed_time_ms") or round((stats["sample_count_per_channel"] / 500) * 1000))
+    effective_sps = _effective_sps_from_stats(stats)
+    resampled_sample_count = (
+        max(1, int(round((duration_ms / 1000.0) * DEFAULT_SAMPLE_RATE_HZ)))
+        if duration_ms > 0
+        else stats["sample_count_per_channel"]
+    )
     _update_recording_row(
         record_id,
         {
             "user_id": user_id,
             "session_object_key": session_object_key,
-            "sample_count": stats["sample_count_per_channel"],
+            "sample_count": resampled_sample_count,
             "duration_ms": duration_ms,
             "start_time": normalized_start_time,
             "byte_length": stats["byte_length"],
             "encoding": "ads1298_24be_mv",
             "sample_rate_hz": 500,
             "channels": 3,
-            "first_ts_ms": stats.get("first_ts_ms"),
-            "last_ts_ms": stats.get("last_ts_ms"),
+            "elapsed_time_ms": stats.get("elapsed_time_ms"),
             "effective_sps": effective_sps,
             "notes": json.dumps(
                 {
@@ -517,8 +620,7 @@ def _refresh_live_session_state(
             "buffer": bytearray(),
             "total_packets_received": 0,
             "total_samples_received": 0,
-            "first_ts_ms": None,
-            "last_ts_ms": None,
+            "elapsed_time_ms": 0,
             "effective_sps": None,
             "last_hr_bpm": None,
             "preview_ch2": [],
@@ -533,24 +635,16 @@ def _refresh_live_session_state(
     state["is_active"] = True
     state["ended_at"] = None
     state.setdefault("total_samples_received", 0)
+    state.setdefault("elapsed_time_ms", 0)
     state["total_packets_received"] += stats["packet_count"]
     state["total_samples_received"] += stats["sample_count_per_channel"]
-    if "first_ts_ms" in stats and state.get("first_ts_ms") is None:
-        state["first_ts_ms"] = stats.get("first_ts_ms")
-    if "last_ts_ms" in stats:
-        state["last_ts_ms"] = stats.get("last_ts_ms")
+    state["elapsed_time_ms"] += int(stats.get("elapsed_time_ms") or 0)
 
-    if state.get("first_ts_ms") is not None and state.get("last_ts_ms") is not None:
-        first_ts = int(state["first_ts_ms"])
-        last_ts = int(state["last_ts_ms"])
-        if last_ts < first_ts:
-            last_ts += (1 << 24)
-        delta_ms = last_ts - first_ts
-        if delta_ms > 0:
-            state["effective_sps"] = round(
-                float(state["total_samples_received"]) / (delta_ms / 1000.0),
-                4,
-            )
+    if int(state.get("elapsed_time_ms") or 0) > 0:
+        state["effective_sps"] = round(
+            float(state["total_samples_received"]) / (float(state["elapsed_time_ms"]) / 1000.0),
+            4,
+        )
 
     channels = _decode_ads1298_packets(data)
     preview_ch2 = list(state.get("preview_ch2") or [])
@@ -622,7 +716,7 @@ def _refresh_live_session_state(
                 "ch3_preview": preview_ch3[-buffer_samples:],
                 "ch4_preview": preview_ch4[-buffer_samples:],
                 "sample_count": int(state.get("total_samples_received") or 0),
-                "last_ts_ms": state.get("last_ts_ms"),
+                "elapsed_time_ms": int(state.get("elapsed_time_ms") or 0),
                 "updated_at": updated_at,
             }
         )
@@ -635,8 +729,7 @@ def _refresh_live_session_state(
             {
                 "packet_count": int(state.get("total_packets_received") or 0),
                 "sample_count": int(state.get("total_samples_received") or 0),
-                "first_ts_ms": state.get("first_ts_ms"),
-                "last_ts_ms": state.get("last_ts_ms"),
+                "elapsed_time_ms": int(state.get("elapsed_time_ms") or 0),
                 "effective_sps": state.get("effective_sps"),
             },
         )
@@ -1276,8 +1369,40 @@ def _process_review_artifacts_for_record(record_id: str) -> None:
         sample_rate_hz = int(record.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
         session_bytes = _fetch_storage_bytes(session_key)
         calibration_bytes = _fetch_storage_bytes(calibration_key)
-        decoded_session = _decode_ads1298_packets(session_bytes)
-        decoded_calibration = _decode_ads1298_packets(calibration_bytes)
+        session_elapsed_summary = _packet_elapsed_summary(session_bytes)
+        calibration_elapsed_summary = _packet_elapsed_summary(calibration_bytes)
+        logger.info(
+            "[PROCESSING] elapsed_decode record_id=%s calibration_preview_ms=%s calibration_preview_hex=%s calibration_mean_ms=%s calibration_total_ms=%s session_preview_ms=%s session_preview_hex=%s session_mean_ms=%s session_total_ms=%s",
+            record_id,
+            calibration_elapsed_summary.get("preview_ms"),
+            calibration_elapsed_summary.get("preview_hex"),
+            calibration_elapsed_summary.get("mean_ms"),
+            calibration_elapsed_summary.get("total_ms"),
+            session_elapsed_summary.get("preview_ms"),
+            session_elapsed_summary.get("preview_hex"),
+            session_elapsed_summary.get("mean_ms"),
+            session_elapsed_summary.get("total_ms"),
+        )
+        session_stats = _packet_stats(session_bytes)
+        calibration_stats = _packet_stats(calibration_bytes)
+        session_effective_sps = _effective_sps_from_stats(session_stats) or float(sample_rate_hz)
+        calibration_effective_sps = _effective_sps_from_stats(calibration_stats) or float(sample_rate_hz)
+        decoded_session_raw = _decode_ads1298_packets(session_bytes)
+        decoded_calibration_raw = _decode_ads1298_packets(calibration_bytes)
+        decoded_session = _resample_channels(decoded_session_raw, session_effective_sps, sample_rate_hz)
+        decoded_calibration = _resample_channels(decoded_calibration_raw, calibration_effective_sps, sample_rate_hz)
+
+        logger.info(
+            "[PROCESSING] resample record_id=%s sample_rate_hz=%s calibration_effective_sps=%s calibration_raw_samples=%s calibration_resampled_samples=%s session_effective_sps=%s session_raw_samples=%s session_resampled_samples=%s",
+            record_id,
+            sample_rate_hz,
+            calibration_effective_sps,
+            calibration_stats.get("sample_count_per_channel"),
+            len(decoded_calibration.get("CH2", [])),
+            session_effective_sps,
+            session_stats.get("sample_count_per_channel"),
+            len(decoded_session.get("CH2", [])),
+        )
 
         for channel in CHANNEL_LABELS:
             artifact = _build_review_artifact(
@@ -1711,6 +1836,24 @@ async def session_live_visual(
 
     state = LIVE_SESSION_STATE.get(selected_record_id)
     snapshot = state.get("visual_snapshot") if state else None
+    if (
+        not isinstance(snapshot, dict)
+        or int(snapshot.get("buffer_samples") or 0) <= 0
+    ):
+        latest_persisted_preview = _fetch_latest_live_preview_row()
+        latest_persisted_record_id = latest_persisted_preview.get("record_id") if latest_persisted_preview else None
+        if (
+            latest_persisted_preview
+            and latest_persisted_record_id
+            and (
+                latest_persisted_record_id != selected_record_id
+                or int(latest_persisted_preview.get("sample_count") or 0) > 0
+            )
+        ):
+            persisted_preview = latest_persisted_preview
+            selected_record_id = str(latest_persisted_record_id)
+            state = LIVE_SESSION_STATE.get(selected_record_id)
+            snapshot = state.get("visual_snapshot") if state else None
     if not isinstance(snapshot, dict):
         persisted_preview = persisted_preview or _fetch_live_preview_row(selected_record_id)
         if persisted_preview:
@@ -1848,8 +1991,7 @@ async def session_start(payload: SessionStartRequest) -> SessionStartResponse:
         "session_id": payload.session_id,
         "total_packets_received": 0,
         "total_samples_received": 0,
-        "first_ts_ms": None,
-        "last_ts_ms": None,
+        "elapsed_time_ms": 0,
         "effective_sps": None,
         "last_hr_bpm": None,
         "preview_ch2": [],
@@ -1868,7 +2010,7 @@ async def session_start(payload: SessionStartRequest) -> SessionStartResponse:
                 "ch3_preview": [],
                 "ch4_preview": [],
                 "sample_count": 0,
-                "last_ts_ms": None,
+                "elapsed_time_ms": 0,
                 "updated_at": _sg_now_iso(),
             }
         )
