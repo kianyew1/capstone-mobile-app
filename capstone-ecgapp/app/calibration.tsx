@@ -164,20 +164,20 @@ export default function CalibrationScreen() {
         );
         const quality = await getCalibrationSignalQuality(bytes, runId, user?.email ?? null);
         const message = quality.signalSuitable
-          ? `Signal quality ${quality.qualityPercentage}%. Calibration successful.`
-          : `Signal quality ${quality.qualityPercentage}%. Calibration failed. Please adjust device placement.`;
+          ? `Signal quality ${quality.qualityPercentage}%. Calibration complete.`
+          : `Signal quality ${quality.qualityPercentage}%. Calibration complete, but quality is poor. Review the signal before continuing.`;
 
         setSignalQuality(quality.qualityPercentage);
         setProgress(100);
         setResultMessage(message);
-        setCalibrationStatus(quality.signalSuitable ? "success" : "failed");
+        setCalibrationStatus("success");
         setGraphSeries({
           ch2: quality.preview.CH2,
           ch3: quality.preview.CH3,
           ch4: quality.preview.CH4,
         });
         setCalibrationResult({
-          status: quality.signalSuitable ? "success" : "failed",
+          status: "success",
           message,
           timestamp: new Date(),
           signalQuality: quality.qualityPercentage,
@@ -611,12 +611,18 @@ export default function CalibrationScreen() {
         <View
           className={`w-24 h-24 rounded-full items-center justify-center mb-4 ${
             calibrationStatus === "success"
-              ? "bg-green-500/20"
+              ? signalQuality >= 70
+                ? "bg-green-500/20"
+                : "bg-yellow-500/20"
               : "bg-red-500/20"
           }`}
         >
           {calibrationStatus === "success" ? (
-            <Check size={48} className="text-green-500" />
+            signalQuality >= 70 ? (
+              <Check size={48} className="text-green-500" />
+            ) : (
+              <Zap size={48} className="text-yellow-500" />
+            )
           ) : (
             <X size={48} className="text-red-500" />
           )}
@@ -624,7 +630,9 @@ export default function CalibrationScreen() {
 
         <Text variant="h3" className="text-center mb-0">
           {calibrationStatus === "success"
-            ? "Calibration Successful!"
+            ? signalQuality >= 70
+              ? "Calibration Complete"
+              : "Calibration Complete With Warning"
             : "Calibration Failed"}
         </Text>
         <Text className="text-muted-foreground text-center px-4">

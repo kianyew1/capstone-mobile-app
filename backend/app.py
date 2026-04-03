@@ -396,11 +396,9 @@ def _handle_calibration_payload(
     LAST_CALIBRATION_META["byte_length"] = stats["byte_length"]
     LAST_CALIBRATION_META["sample_count"] = len(ch2)
 
-    stored_object_key = ""
-    if signal_suitable:
-        object_key = f"calibration/{run_id}.bin"
-        _upload_storage_bytes(object_key, data)
-        stored_object_key = object_key
+    object_key = f"calibration/{run_id}.bin"
+    _upload_storage_bytes(object_key, data)
+    stored_object_key = object_key
 
     record_id: Optional[str] = None
     if user_id and stored_object_key:
