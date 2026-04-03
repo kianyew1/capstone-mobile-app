@@ -1368,7 +1368,7 @@ def _build_review_section_from_samples(
     samples: List[float],
     sample_rate_hz: int,
     include_interval_rows: bool = False,
-    window_seconds: int = 20,
+    window_seconds: int = 10,
 ) -> Dict[str, Any]:
     processed = _process_window(samples, sample_rate_hz)
     cleaned = processed.get("cleaned", []) or list(samples)

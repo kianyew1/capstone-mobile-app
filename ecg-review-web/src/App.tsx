@@ -200,6 +200,20 @@ function createPath(
   return { path, min, max };
 }
 
+function downsampleForPlot(points: number[], targetCount: number): number[] {
+  if (targetCount <= 0 || points.length <= targetCount) {
+    return points;
+  }
+  if (targetCount === 1) {
+    return [points[0]];
+  }
+  const lastIndex = points.length - 1;
+  return Array.from({ length: targetCount }, (_, index) => {
+    const sourceIndex = Math.round((index * lastIndex) / (targetCount - 1));
+    return points[sourceIndex];
+  });
+}
+
 function createTicks(min: number, max: number, count: number): number[] {
   if (count <= 1) {
     return [min];
@@ -397,9 +411,13 @@ function FullSignalChart({
   const margin = { top: 12, right: 18, bottom: 52, left: 64 };
   const plotWidth = width - margin.left - margin.right;
   const plotHeight = height - margin.top - margin.bottom;
+  const displayedSamples = useMemo(
+    () => downsampleForPlot(samples, Math.max(200, Math.floor(plotWidth))),
+    [samples, plotWidth],
+  );
   const { path, min, max } = useMemo(
-    () => createPath(samples, plotWidth, plotHeight, yMin, yMax),
-    [samples, plotWidth, plotHeight, yMin, yMax],
+    () => createPath(displayedSamples, plotWidth, plotHeight, yMin, yMax),
+    [displayedSamples, plotWidth, plotHeight, yMin, yMax],
   );
   const xTickCount = 9;
   const yTicks = createTicks(yMin, yMax, 5);
@@ -422,7 +440,7 @@ function FullSignalChart({
           <h3>{title}</h3>
           {subtitle ? <span className="chart-subtitle">{subtitle}</span> : null}
         </div>
-        <span>{samples.length} samples</span>
+        <span>{`${samples.length} samples${displayedSamples.length !== samples.length ? ` | plotted ${displayedSamples.length}` : ""}`}</span>
       </div>
       <svg viewBox={`0 0 ${width} ${height}`} className="signal-chart">
         {Array.from({ length: xTickCount }, (_, index) => {
@@ -1279,8 +1297,17 @@ function ReviewSectionCard({
 }) {
   const beat = section.beats.items.find((item) => item.index === beatIndex) ?? section.beats.items[0] ?? null;
   const beatSamples = useMemo(() => getBeatSamples(section.signal.full, beat), [section.signal.full, beat]);
-  const highlightStart = beat ? Math.max(0, beat.start_sample - 1) : null;
-  const highlightEnd = beat ? beat.end_sample : null;
+  const displayWindowStart = beat ? beat.window_start_sample : 1;
+  const displayWindowEnd =
+    beat ? beat.window_end_sample : Math.min(section.signal.full.length, sampleRateHz * 10);
+  const windowSamples = section.signal.full.slice(
+    Math.max(0, displayWindowStart - 1),
+    displayWindowEnd,
+  );
+  const highlightStart =
+    beat && beat.start_sample >= displayWindowStart ? beat.start_sample - displayWindowStart : null;
+  const highlightEnd =
+    beat && beat.end_sample >= displayWindowStart ? beat.end_sample - displayWindowStart : null;
 
   return (
     <section className="review-section">
@@ -1296,13 +1323,14 @@ function ReviewSectionCard({
       <div className="section-grid">
         <div className="signal-column">
           <FullSignalChart
-            title={`${title} Full Signal`}
-            samples={section.signal.full}
+            title={`${title} 10s Window`}
+            samples={windowSamples}
             sampleRateHz={sampleRateHz}
             yMin={yMin}
             yMax={yMax}
             highlightStart={highlightStart}
             highlightEnd={highlightEnd}
+            subtitle={`Samples ${displayWindowStart}-${displayWindowEnd} | Window ${beat?.window_index ?? 1} of ${section.window_count}`}
           />
         </div>
         <div className="beat-column">
@@ -1383,7 +1411,7 @@ function SessionReviewCard({
   const beat = beats.find((item) => item.index === beatIndex) ?? beats[0] ?? null;
   const beatSamples = useMemo(() => getBeatSamples(section.signal.full, beat), [section.signal.full, beat]);
   const displayWindowStart = beat ? beat.window_start_sample : 1;
-  const displayWindowEnd = beat ? beat.window_end_sample : Math.min(section.signal.full.length, sampleRateHz * 20);
+  const displayWindowEnd = beat ? beat.window_end_sample : Math.min(section.signal.full.length, sampleRateHz * 10);
   const windowSamples = section.signal.full.slice(
     Math.max(0, displayWindowStart - 1),
     displayWindowEnd,
@@ -1410,7 +1438,7 @@ function SessionReviewCard({
       <div className="section-grid">
         <div className="signal-column">
           <FullSignalChart
-            title="Session 20s Window"
+            title="Session 10s Window"
             samples={windowSamples}
             sampleRateHz={sampleRateHz}
             yMin={yMin}
