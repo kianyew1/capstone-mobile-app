@@ -79,6 +79,25 @@ type ReviewResponse = {
   session: ReviewSection;
 };
 
+type ReviewProcessingJob = {
+  job_id: string;
+  status: string;
+  record_id: string;
+  details?: {
+    resample?: boolean;
+  };
+  error?: string | null;
+};
+
+type ReviewArtifactsNotReadyDetail = {
+  code: string;
+  record_id: string;
+  channel: string;
+  processed_status?: string | null;
+  artifact_key?: string | null;
+  processing_version?: string | null;
+};
+
 type VectorBeatResponse = {
   record_id: string;
   section: "calibration" | "session";
@@ -323,54 +342,6 @@ function createVectorLoopGeometry(
   };
 }
 
-function projectVector3DPoint(
-  x: number,
-  y: number,
-  z: number,
-  width: number,
-  height: number,
-  axisMin: number,
-  axisMax: number,
-): { x: number; y: number; depth: number } {
-  const span = axisMax - axisMin || 1;
-  const center = (axisMin + axisMax) / 2;
-  const normalizedX = (x - center) / span;
-  const normalizedY = (y - center) / span;
-  const normalizedZ = (z - center) / span;
-  const yaw = -Math.PI / 4;
-  const pitch = Math.PI / 7;
-
-  const x1 = normalizedX * Math.cos(yaw) + normalizedZ * Math.sin(yaw);
-  const z1 = -normalizedX * Math.sin(yaw) + normalizedZ * Math.cos(yaw);
-  const y1 = normalizedY * Math.cos(pitch) - z1 * Math.sin(pitch);
-  const z2 = normalizedY * Math.sin(pitch) + z1 * Math.cos(pitch);
-  const perspective = 1 / (1 + z2 * 0.6);
-  const scale = Math.min(width, height) * 1.65;
-
-  return {
-    x: width / 2 + x1 * scale * perspective,
-    y: height / 2 - y1 * scale * perspective,
-    depth: z2,
-  };
-}
-
-function blendRollingBuffer(previous: number[], current: number[], shiftSamples: number): number[] {
-  if (!current.length) {
-    return [];
-  }
-  if (!previous.length || previous.length !== current.length) {
-    return current;
-  }
-  const boundedShift = Math.min(Math.max(Math.round(shiftSamples), 0), current.length);
-  if (boundedShift <= 0) {
-    return previous;
-  }
-  if (boundedShift >= current.length) {
-    return current;
-  }
-  return previous.slice(boundedShift).concat(current.slice(current.length - boundedShift));
-}
-
 function TopNav({ currentPath }: { currentPath: string }) {
   return (
     <nav className="route-nav">
@@ -593,87 +564,6 @@ function LiveWaveformCanvas({
         <span>{samples.length} samples</span>
       </div>
       <canvas ref={canvasRef} width={720} height={180} className="live-canvas live-waveform-canvas" />
-    </section>
-  );
-}
-
-function LiveVector3DCanvas({
-  xSamples,
-  ySamples,
-  zSamples,
-}: {
-  xSamples: number[];
-  ySamples: number[];
-  zSamples: number[];
-}) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const width = canvas.width;
-    const height = canvas.height;
-    ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = "#f7fbfd";
-    ctx.fillRect(0, 0, width, height);
-
-    const range = getSymmetricFiniteRange(xSamples, ySamples, zSamples) ?? { min: -1, max: 1 };
-    const yMin = range.min;
-    const yMax = range.max;
-
-    const project = (x: number, y: number, z: number) =>
-      projectVector3DPoint(x, y, z, width, height, yMin, yMax);
-    const axes = [
-      { from: [yMin, 0, 0] as const, to: [yMax, 0, 0] as const, color: "#dc2626" },
-      { from: [0, yMin, 0] as const, to: [0, yMax, 0] as const, color: "#2563eb" },
-      { from: [0, 0, yMin] as const, to: [0, 0, yMax] as const, color: "#16a34a" },
-    ];
-
-    axes.forEach((axis) => {
-      const from = project(axis.from[0], axis.from[1], axis.from[2]);
-      const to = project(axis.to[0], axis.to[1], axis.to[2]);
-      ctx.strokeStyle = axis.color;
-      ctx.globalAlpha = 0.68;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(from.x, from.y);
-      ctx.lineTo(to.x, to.y);
-      ctx.stroke();
-      ctx.globalAlpha = 1;
-    });
-
-    const count = Math.min(xSamples.length, ySamples.length, zSamples.length);
-    if (!count) {
-      ctx.fillStyle = "#6d8395";
-      ctx.font = "13px Segoe UI";
-      ctx.fillText("Waiting for live vector data...", 22, height / 2);
-      return;
-    }
-
-    ctx.strokeStyle = "#0d697a";
-    ctx.lineWidth = 1.6;
-    ctx.beginPath();
-    for (let index = 0; index < count; index += 1) {
-      const point = project(xSamples[index], ySamples[index], zSamples[index]);
-      if (index === 0) {
-        ctx.moveTo(point.x, point.y);
-      } else {
-        ctx.lineTo(point.x, point.y);
-      }
-    }
-    ctx.stroke();
-  }, [xSamples, ySamples, zSamples]);
-
-  return (
-    <section className="live-quadrant-card live-vector-card">
-      <div className="card-header">
-        <h3>3D Vectorcardiography</h3>
-        <span>{Math.min(xSamples.length, ySamples.length, zSamples.length)} samples</span>
-      </div>
-      <canvas ref={canvasRef} width={720} height={720} className="live-canvas live-vector-canvas" />
     </section>
   );
 }
@@ -1513,8 +1403,13 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
   const [yMaxMv, setYMaxMv] = useState(DEFAULT_ECG_Y_MAX_MV);
   const [yMinMv, setYMinMv] = useState(DEFAULT_ECG_Y_MIN_MV);
   const [data, setData] = useState<ReviewResponse | null>(null);
+  const [reviewRecordId, setReviewRecordId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [artifactsNotReady, setArtifactsNotReady] = useState<ReviewArtifactsNotReadyDetail | null>(null);
+  const [processResample, setProcessResample] = useState(true);
+  const [processingJob, setProcessingJob] = useState<ReviewProcessingJob | null>(null);
+  const [processActionPending, setProcessActionPending] = useState(false);
   const [calibrationBeat, setCalibrationBeat] = useState(1);
   const [sessionBeat, setSessionBeat] = useState(1);
   const [calibrationVector, setCalibrationVector] = useState<VectorBeatResponse | null>(null);
@@ -1536,18 +1431,46 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
   const shouldLoadVectorBeats = showVectorMode || showVector3DMode;
   const calibrationVectorRange = getVectorBeatRange(calibrationVector) ?? { min: yMinMv, max: yMaxMv };
   const sessionVectorRange = getVectorBeatRange(sessionVector) ?? { min: yMinMv, max: yMaxMv };
+  const [reviewRefreshToken, setReviewRefreshToken] = useState(0);
 
   useEffect(() => {
     let active = true;
     async function load() {
       setLoading(true);
       setError(null);
+      setArtifactsNotReady(null);
       const url = `/api/review/latest?channel=${selectedChannel}`;
       console.log(`[REVIEW] GET ${url}`);
       try {
         const response = await fetch(url);
         if (!response.ok) {
-          const text = await response.text();
+          let detail: unknown = null;
+          let text = "";
+          try {
+            const payload = await response.json();
+            detail = payload?.detail ?? null;
+            text = JSON.stringify(payload);
+          } catch {
+            text = await response.text();
+          }
+          if (
+            response.status === 409 &&
+            detail &&
+            typeof detail === "object" &&
+            "code" in detail &&
+            ((detail as { code?: string }).code === "review_artifacts_not_ready" ||
+              (detail as { code?: string }).code === "review_artifact_fetch_unavailable")
+          ) {
+            const notReady = detail as ReviewArtifactsNotReadyDetail;
+            console.log(
+              `[REVIEW] artifacts not ready recordId=${notReady.record_id} channel=${notReady.channel} status=${notReady.processed_status ?? "none"}`,
+            );
+            if (!active) return;
+            setArtifactsNotReady(notReady);
+            setReviewRecordId(notReady.record_id);
+            setData(null);
+            return;
+          }
           throw new Error(`Review fetch failed: ${response.status} ${text}`);
         }
         const payload = (await response.json()) as ReviewResponse;
@@ -1556,6 +1479,8 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
         );
         if (!active) return;
         setData(payload);
+        setReviewRecordId(payload.record_id);
+        setArtifactsNotReady(null);
         setCalibrationBeat(1);
         setSessionBeat(1);
         setCalibrationVectorMovement(100);
@@ -1573,7 +1498,92 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     return () => {
       active = false;
     };
-  }, [selectedChannel]);
+  }, [selectedChannel, reviewRefreshToken]);
+
+  useEffect(() => {
+    if (!processingJob || !["queued", "running"].includes(processingJob.status)) {
+      return;
+    }
+    let active = true;
+    let timeoutId: number | undefined;
+    const jobId = processingJob.job_id;
+
+    async function poll() {
+      const url = `/api/review/process/${jobId}`;
+      console.log(`[REVIEW_PROCESS] GET ${url}`);
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Process status failed: ${response.status} ${text}`);
+        }
+        const payload = (await response.json()) as ReviewProcessingJob;
+        if (!active) return;
+        console.log(
+          `[REVIEW_PROCESS] status jobId=${payload.job_id} recordId=${payload.record_id} status=${payload.status} resample=${String(payload.details?.resample)}`,
+        );
+        setProcessingJob(payload);
+        if (payload.status === "ready") {
+          setProcessActionPending(false);
+          setArtifactsNotReady(null);
+          setReviewRefreshToken((value) => value + 1);
+          return;
+        }
+        if (payload.status === "error") {
+          setProcessActionPending(false);
+          setError(payload.error || "Processing failed.");
+          return;
+        }
+        timeoutId = window.setTimeout(poll, 1000);
+      } catch (err) {
+        if (!active) return;
+        console.error("[REVIEW_PROCESS] poll error", err);
+        setProcessActionPending(false);
+        setError(err instanceof Error ? err.message : "Unknown processing status error");
+      }
+    }
+
+    timeoutId = window.setTimeout(poll, 1000);
+    return () => {
+      active = false;
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [processingJob]);
+
+  async function handleProcessReview() {
+    if (!reviewRecordId) {
+      setError("No review record available to process.");
+      return;
+    }
+    setProcessActionPending(true);
+    setError(null);
+    const url = `/api/review/${reviewRecordId}/process`;
+    console.log(`[REVIEW_PROCESS] POST ${url} resample=${processResample}`);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ resample: processResample }),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Process start failed: ${response.status} ${text}`);
+      }
+      const payload = (await response.json()) as ReviewProcessingJob;
+      console.log(
+        `[REVIEW_PROCESS] queued jobId=${payload.job_id} recordId=${payload.record_id} resample=${String(payload.details?.resample)}`,
+      );
+      setProcessingJob(payload);
+    } catch (err) {
+      console.error("[REVIEW_PROCESS] start error", err);
+      setProcessActionPending(false);
+      setError(err instanceof Error ? err.message : "Unknown processing start error");
+    }
+  }
 
   useEffect(() => {
     if (!data || !shouldLoadVectorBeats) {
@@ -1796,6 +1806,41 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
 
       {loading && <div className="status-panel">Loading review data...</div>}
       {error && <div className="status-panel error">{error}</div>}
+      {!loading && !error && artifactsNotReady && (
+        <div className="status-panel">
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+            <div>
+              <strong>Processed review artifacts are not ready.</strong>
+              <div className="meta-line">
+                {`Record ID: ${artifactsNotReady.record_id} | Status: ${artifactsNotReady.processed_status ?? "missing"}`}
+              </div>
+            </div>
+            <label className="channel-select" style={{ alignItems: "center", gap: "0.5rem" }}>
+              <input
+                type="checkbox"
+                checked={processResample}
+                onChange={(event) => setProcessResample(event.target.checked)}
+                disabled={processActionPending || processingJob?.status === "running"}
+              />
+              <span>{`Resample to 500 Hz (${processResample ? "On" : "Off"})`}</span>
+            </label>
+            <div style={{ display: "flex", gap: "0.75rem", alignItems: "center" }}>
+              <button
+                className="window-button"
+                disabled={processActionPending || processingJob?.status === "running"}
+                onClick={() => void handleProcessReview()}
+              >
+                {processActionPending || processingJob?.status === "running" ? "Processing..." : "Process"}
+              </button>
+              {processingJob ? (
+                <span className="meta-line">
+                  {`Job ${processingJob.job_id.slice(0, 8)} | ${processingJob.status} | resample=${String(processingJob.details?.resample)}`}
+                </span>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      )}
 
       {!loading && !error && data && (
         <div className={showWideVectorMode ? "content-stack vector-mode-content" : "content-stack"}>
@@ -1962,10 +2007,6 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
         if (payload.status === "ended") {
           stopped = true;
           setPollingStopped(true);
-          if (timeoutId !== undefined) {
-            window.clearTimeout(timeoutId);
-            timeoutId = undefined;
-          }
         } else {
           setPollingStopped(false);
         }

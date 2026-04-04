@@ -1452,8 +1452,18 @@ def _artifact_type_for_channel(channel: str) -> str:
     return f"review_{channel.lower()}"
 
 
-def _process_review_artifacts_for_record(record_id: str) -> None:
-    logger.info("[PROCESSING] start record_id=%s", record_id)
+def _clear_review_caches_for_record(record_id: str) -> None:
+    for key in list(REVIEW_ARTIFACT_CACHE.keys()):
+        if key[0] == record_id:
+            REVIEW_ARTIFACT_CACHE.pop(key, None)
+    for key in list(VECTOR3D_IMAGE_CACHE.keys()):
+        if key[0] == record_id:
+            VECTOR3D_IMAGE_CACHE.pop(key, None)
+
+
+def _process_review_artifacts_for_record(record_id: str, *, resample: bool = True) -> None:
+    logger.info("[PROCESSING] start record_id=%s resample=%s", record_id, resample)
+    _clear_review_caches_for_record(record_id)
     _upsert_processed_record(record_id, status="processing", error_message=None)
     try:
         record = _fetch_recording_by_id(record_id)
@@ -1488,12 +1498,17 @@ def _process_review_artifacts_for_record(record_id: str) -> None:
         calibration_effective_sps = _effective_sps_from_stats(calibration_stats) or float(sample_rate_hz)
         decoded_session_raw = _decode_ads1298_packets(session_bytes)
         decoded_calibration_raw = _decode_ads1298_packets(calibration_bytes)
-        decoded_session = _resample_channels(decoded_session_raw, session_effective_sps, sample_rate_hz)
-        decoded_calibration = _resample_channels(decoded_calibration_raw, calibration_effective_sps, sample_rate_hz)
+        if resample:
+            decoded_session = _resample_channels(decoded_session_raw, session_effective_sps, sample_rate_hz)
+            decoded_calibration = _resample_channels(decoded_calibration_raw, calibration_effective_sps, sample_rate_hz)
+        else:
+            decoded_session = decoded_session_raw
+            decoded_calibration = decoded_calibration_raw
 
         logger.info(
-            "[PROCESSING] resample record_id=%s sample_rate_hz=%s calibration_effective_sps=%s calibration_raw_samples=%s calibration_resampled_samples=%s session_effective_sps=%s session_raw_samples=%s session_resampled_samples=%s",
+            "[PROCESSING] transform record_id=%s resample=%s sample_rate_hz=%s calibration_effective_sps=%s calibration_raw_samples=%s calibration_processed_samples=%s session_effective_sps=%s session_raw_samples=%s session_processed_samples=%s",
             record_id,
+            resample,
             sample_rate_hz,
             calibration_effective_sps,
             calibration_stats.get("sample_count_per_channel"),
@@ -1520,10 +1535,10 @@ def _process_review_artifacts_for_record(record_id: str) -> None:
             _upsert_processed_artifact(record_id, _artifact_type_for_channel(channel), object_key)
             REVIEW_ARTIFACT_CACHE[_review_cache_key(record_id, channel)] = artifact
         _upsert_processed_record(record_id, status="ready", error_message=None)
-        logger.info("[PROCESSING] ready record_id=%s", record_id)
+        logger.info("[PROCESSING] ready record_id=%s resample=%s", record_id, resample)
     except Exception as exc:
         _upsert_processed_record(record_id, status="error", error_message=str(exc))
-        logger.exception("[PROCESSING] failed record_id=%s", record_id)
+        logger.exception("[PROCESSING] failed record_id=%s resample=%s", record_id, resample)
         raise
 
 
@@ -1543,32 +1558,45 @@ def _load_review_artifact(record_id: str, channel: str) -> Dict[str, Any]:
         or processed.get("processing_version") != REVIEW_PROCESSING_VERSION
         or not artifact_key
     ):
-        _process_review_artifacts_for_record(record_id)
-        artifact_key = _fetch_processed_artifact_key(record_id, artifact_type)
-        if not artifact_key:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Processed review artifact missing for record_id={record_id}, channel={channel}.",
-            )
+        logger.info(
+            "[REVIEW] artifacts_not_ready record_id=%s channel=%s processed_status=%s artifact_key=%r processing_version=%s",
+            record_id,
+            channel,
+            processed.get("status") if processed else None,
+            artifact_key,
+            processed.get("processing_version") if processed else None,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "review_artifacts_not_ready",
+                "record_id": record_id,
+                "channel": channel,
+                "processed_status": processed.get("status") if processed else None,
+                "artifact_key": artifact_key,
+                "processing_version": processed.get("processing_version") if processed else None,
+            },
+        )
     try:
         artifact = _fetch_storage_json(artifact_key)
     except HTTPException as exc:
         if exc.status_code != 502:
             raise
         logger.warning(
-            "[PROCESSING] artifact fetch failed record_id=%s channel=%s object_key=%s; regenerating",
+            "[REVIEW] artifact_fetch_unavailable record_id=%s channel=%s object_key=%s",
             record_id,
             channel,
             artifact_key,
         )
-        _process_review_artifacts_for_record(record_id)
-        artifact_key = _fetch_processed_artifact_key(record_id, artifact_type)
-        if not artifact_key:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Processed review artifact missing after regeneration for record_id={record_id}, channel={channel}.",
-            ) from exc
-        artifact = _fetch_storage_json(artifact_key)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "review_artifact_fetch_unavailable",
+                "record_id": record_id,
+                "channel": channel,
+                "artifact_key": artifact_key,
+            },
+        ) from exc
     REVIEW_ARTIFACT_CACHE[cache_key] = artifact
     return artifact
 
@@ -1640,6 +1668,10 @@ def _set_job(job_id: str, **fields: Any) -> None:
 
 class SessionAnalysisStartRequest(BaseModel):
     record_id: str = Field(..., description="Supabase ecg_recordings.id")
+
+
+class ReviewProcessRequest(BaseModel):
+    resample: bool = True
 
 
 class CalibrationSignalQualityResponse(BaseModel):
@@ -2313,6 +2345,36 @@ def _session_analysis_job(job_id: str, record_id: str) -> None:
         )
 
 
+def _review_processing_job(job_id: str, record_id: str, resample: bool) -> None:
+    logger.info("[REVIEW_PROCESS] start job_id=%s record_id=%s resample=%s", job_id, record_id, resample)
+    _set_job(
+        job_id,
+        status="running",
+        record_id=record_id,
+        details={"resample": resample},
+        error=None,
+    )
+    try:
+        _process_review_artifacts_for_record(record_id, resample=resample)
+        _set_job(
+            job_id,
+            status="ready",
+            record_id=record_id,
+            details={"resample": resample},
+            error=None,
+        )
+        logger.info("[REVIEW_PROCESS] ready job_id=%s record_id=%s resample=%s", job_id, record_id, resample)
+    except Exception as exc:
+        _set_job(
+            job_id,
+            status="error",
+            record_id=record_id,
+            details={"resample": resample},
+            error=str(exc),
+        )
+        logger.exception("[REVIEW_PROCESS] failed job_id=%s record_id=%s resample=%s", job_id, record_id, resample)
+
+
 @app.post("/session_analysis/start", response_model=SessionAnalysisJob)
 async def session_analysis_start(
     payload: SessionAnalysisStartRequest,
@@ -2345,6 +2407,58 @@ async def session_analysis_status(job_id: str) -> SessionAnalysisJob:
         job.get("record_id", ""),
         job_id,
         job.get("status", "unknown"),
+    )
+    return SessionAnalysisJob(
+        job_id=job_id,
+        status=job.get("status", "unknown"),
+        record_id=job.get("record_id", ""),
+        details=job.get("details"),
+        error=job.get("error"),
+    )
+
+
+@app.post("/review/{record_id}/process", response_model=SessionAnalysisJob)
+async def review_process_start(
+    record_id: str,
+    payload: ReviewProcessRequest,
+    background_tasks: BackgroundTasks,
+) -> SessionAnalysisJob:
+    job_id = uuid4().hex
+    _clear_review_caches_for_record(record_id)
+    _set_job(
+        job_id,
+        status="queued",
+        record_id=record_id,
+        details={"resample": payload.resample},
+        error=None,
+    )
+    background_tasks.add_task(_review_processing_job, job_id, record_id, payload.resample)
+    logger.info(
+        "[REVIEW_PROCESS] queued job_id=%s record_id=%s resample=%s",
+        job_id,
+        record_id,
+        payload.resample,
+    )
+    return SessionAnalysisJob(
+        job_id=job_id,
+        status="queued",
+        record_id=record_id,
+        details={"resample": payload.resample},
+        error=None,
+    )
+
+
+@app.get("/review/process/{job_id}", response_model=SessionAnalysisJob)
+async def review_process_status(job_id: str) -> SessionAnalysisJob:
+    job = ANALYSIS_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    logger.info(
+        "[REVIEW_PROCESS] status job_id=%s record_id=%s status=%s details=%s",
+        job_id,
+        job.get("record_id", ""),
+        job.get("status", "unknown"),
+        job.get("details"),
     )
     return SessionAnalysisJob(
         job_id=job_id,
