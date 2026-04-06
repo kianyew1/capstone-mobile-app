@@ -60,3 +60,4 @@ buffer.txt
 calibration_mv.csv
 channels_volts.csv
 ecg-review-web/.env
+/signal-processing-intense/.venv
