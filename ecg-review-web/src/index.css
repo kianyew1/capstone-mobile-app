@@ -51,6 +51,12 @@ select {
   flex-wrap: wrap;
 }
 
+.review-topbar-controls {
+  flex-wrap: nowrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+
 .route-nav {
   display: inline-flex;
   gap: 10px;
@@ -61,12 +67,53 @@ select {
   border: 1px solid rgba(98, 138, 170, 0.18);
 }
 
+.route-nav-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.route-nav-extra {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 18px;
+  flex-wrap: wrap;
+}
+
 .route-link {
   padding: 9px 14px;
   border-radius: 999px;
   color: #456378;
   text-decoration: none;
   font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.route-action-button {
+  border: 1px solid rgba(98, 138, 170, 0.18);
+  background: rgba(255, 255, 255, 0.82);
+  cursor: pointer;
+}
+
+.route-action-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.route-process-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+  color: #456378;
+  font-weight: 600;
+}
+
+.route-process-status {
+  font-size: 0.82rem;
+  color: #456378;
   font-weight: 600;
 }
 
@@ -115,11 +162,39 @@ h1 {
   box-shadow: 0 18px 36px rgba(24, 53, 78, 0.08);
 }
 
+.review-topbar-controls .channel-select,
+.review-topbar-controls .record-input-card,
+.review-topbar-controls .scale-card {
+  min-width: 0;
+  padding: 12px 14px;
+  border-radius: 14px;
+  gap: 6px;
+}
+
+.review-topbar-controls .channel-select {
+  width: 150px;
+}
+
+.review-topbar-controls .record-input-card {
+  width: 240px;
+}
+
+.review-topbar-controls .scale-card {
+  width: 190px;
+}
+
 .channel-select span,
 .record-input-card span {
   font-size: 0.82rem;
   font-weight: 600;
   color: #567386;
+}
+
+.review-topbar-controls .channel-select span,
+.review-topbar-controls .record-input-card span,
+.review-topbar-controls .scale-card > span,
+.review-topbar-controls .scale-field span {
+  font-size: 0.76rem;
 }
 
 .channel-select select,
@@ -131,6 +206,13 @@ h1 {
   border-radius: 12px;
   background: #f8fbfd;
   color: #17324d;
+}
+
+.review-topbar-controls .channel-select select,
+.review-topbar-controls .record-input-card input,
+.review-topbar-controls .scale-field input {
+  padding: 8px 10px;
+  border-radius: 10px;
 }
 
 .scale-card {
@@ -187,6 +269,13 @@ h1 {
   color: #f7fbff;
   cursor: pointer;
   box-shadow: 0 12px 24px rgba(23, 70, 109, 0.18);
+}
+
+.review-topbar-controls .apply-button {
+  padding: 10px 14px;
+  border-radius: 12px;
+  font-size: 0.9rem;
+  box-shadow: 0 10px 18px rgba(23, 70, 109, 0.16);
 }
 
 .content-stack {
@@ -777,6 +866,11 @@ h1 {
 @media (max-width: 1100px) {
   .topbar {
     flex-direction: column;
+  }
+
+  .review-topbar-controls {
+    width: 100%;
+    flex-wrap: wrap;
   }
 }
 

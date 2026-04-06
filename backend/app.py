@@ -87,6 +87,7 @@ LAST_CALIBRATION_META = {
 
 ANALYSIS_JOBS: Dict[str, Dict[str, Any]] = {}
 DEFAULT_SAMPLE_RATE_HZ = 500
+REVIEW_WINDOW_SECONDS = 10
 REVIEW_ARTIFACT_CACHE: Dict[tuple[str, str, str], Dict[str, Any]] = {}
 VECTOR3D_IMAGE_CACHE: Dict[tuple[str, str, int, float, float, int], str] = {}
 VECTOR3D_PRELOAD_STATE: Dict[tuple[str, str, float, float, int], Dict[str, Any]] = {}
@@ -1366,7 +1367,7 @@ def _build_review_section_from_samples(
     samples: List[float],
     sample_rate_hz: int,
     include_interval_rows: bool = False,
-    window_seconds: int = 10,
+    window_seconds: int = REVIEW_WINDOW_SECONDS,
 ) -> Dict[str, Any]:
     processed = _process_window(samples, sample_rate_hz)
     cleaned = processed.get("cleaned", []) or list(samples)
@@ -1601,6 +1602,74 @@ def _load_review_artifact(record_id: str, channel: str) -> Dict[str, Any]:
     return artifact
 
 
+def _slice_signal_markers_for_window(
+    signal_markers: Optional[Dict[str, List[int]]],
+    start_index: int,
+    end_index: int,
+) -> Dict[str, List[int]]:
+    sliced: Dict[str, List[int]] = {}
+    for label, positions in (signal_markers or {}).items():
+        sliced[label] = [
+            position - start_index
+            for position in positions
+            if start_index <= position < end_index
+        ]
+    return sliced
+
+
+def _build_review_section_summary(section: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "meta": section.get("meta", {}),
+        "beats": section.get("beats", {"count": 0, "items": []}),
+        "beat_count_total": section.get("beat_count_total", 0),
+        "beat_count_included": section.get("beat_count_included", 0),
+        "beat_count_excluded": section.get("beat_count_excluded", 0),
+        "excluded_reason_counts": section.get("excluded_reason_counts", {}),
+        "window_count": section.get("window_count", 1),
+        "interval_related": section.get("interval_related"),
+        "interval_related_rows": section.get("interval_related_rows", []),
+    }
+
+
+def _build_review_window_section(
+    section: Dict[str, Any],
+    sample_rate_hz: int,
+    window_index: int,
+    window_seconds: int = REVIEW_WINDOW_SECONDS,
+) -> Dict[str, Any]:
+    signal = list((section.get("signal", {}) or {}).get("full", []) or [])
+    signal_markers = (section.get("signal", {}) or {}).get("markers", {}) or {}
+    r_peaks = list((section.get("signal", {}) or {}).get("r_peaks", []) or [])
+    beats = list((section.get("beats", {}) or {}).get("items", []) or [])
+    window_samples = max(1, sample_rate_hz * window_seconds)
+    window_count = max(1, (len(signal) + window_samples - 1) // window_samples)
+    bounded_window_index = max(1, min(window_index, window_count))
+    start_index = (bounded_window_index - 1) * window_samples
+    end_index = min(len(signal), start_index + window_samples)
+    interval_rows = list(section.get("interval_related_rows", []) or [])
+    interval_related = next(
+        (row for row in interval_rows if row.get("interval_index") == bounded_window_index),
+        None,
+    )
+    return {
+        "meta": section.get("meta", {}),
+        "signal": {
+            "full": signal[start_index:end_index],
+            "r_peaks": [peak - start_index for peak in r_peaks if start_index <= peak < end_index],
+            "markers": _slice_signal_markers_for_window(signal_markers, start_index, end_index),
+        },
+        "beats": {
+            "count": len([beat for beat in beats if beat.get("window_index") == bounded_window_index]),
+            "items": [beat for beat in beats if beat.get("window_index") == bounded_window_index],
+        },
+        "window_index": bounded_window_index,
+        "window_count": window_count,
+        "window_start_sample": start_index + 1 if signal else 1,
+        "window_end_sample": end_index,
+        "interval_related": interval_related,
+    }
+
+
 def _build_review_section(
     object_key: str,
     raw_bytes: bytes,
@@ -1787,12 +1856,43 @@ class ReviewSection(BaseModel):
     interval_related_rows: List[ReviewIntervalRow] = Field(default_factory=list)
 
 
-class ReviewResponse(BaseModel):
+class ReviewSectionSummary(BaseModel):
+    meta: ReviewMeta
+    beats: ReviewBeats
+    beat_count_total: int = 0
+    beat_count_included: int = 0
+    beat_count_excluded: int = 0
+    excluded_reason_counts: Dict[str, int] = Field(default_factory=dict)
+    window_count: int = 1
+    interval_related: Optional[ReviewIntervalRow] = None
+    interval_related_rows: List[ReviewIntervalRow] = Field(default_factory=list)
+
+
+class ReviewSummaryResponse(BaseModel):
     record_id: str
     channel: str
     sample_rate_hz: int
-    calibration: ReviewSection
-    session: ReviewSection
+    calibration: ReviewSectionSummary
+    session: ReviewSectionSummary
+
+
+class ReviewWindowSection(BaseModel):
+    meta: ReviewMeta
+    signal: ReviewSignal
+    beats: ReviewBeats
+    window_index: int = 1
+    window_count: int = 1
+    window_start_sample: int = 1
+    window_end_sample: int = 0
+    interval_related: Optional[ReviewIntervalRow] = None
+
+
+class ReviewWindowResponse(BaseModel):
+    record_id: str
+    channel: str
+    sample_rate_hz: int
+    section: str
+    window: ReviewWindowSection
 
 
 class ReviewSessionWindowResponse(BaseModel):
@@ -2469,24 +2569,19 @@ async def review_process_status(job_id: str) -> SessionAnalysisJob:
     )
 
 
-@app.get("/review/latest", response_model=ReviewResponse)
-async def review_latest(channel: str = "CH2", session_window_index: int = 1) -> ReviewResponse:
+@app.get("/review/latest", response_model=ReviewSummaryResponse)
+async def review_latest(channel: str = "CH2") -> ReviewSummaryResponse:
     latest_id = _fetch_latest_recording_id()
     if not latest_id:
         raise HTTPException(status_code=404, detail="No recordings found.")
-    return await review_record(
-        latest_id,
-        channel=channel,
-        session_window_index=session_window_index,
-    )
+    return await review_record(latest_id, channel=channel)
 
 
-@app.get("/review/{record_id}", response_model=ReviewResponse)
+@app.get("/review/{record_id}", response_model=ReviewSummaryResponse)
 async def review_record(
     record_id: str,
     channel: str = "CH2",
-    session_window_index: int = 1,
-) -> ReviewResponse:
+) -> ReviewSummaryResponse:
     selected_channel = (channel or "CH2").upper()
     if selected_channel not in CHANNEL_LABELS:
         raise HTTPException(status_code=400, detail="Invalid channel.")
@@ -2502,21 +2597,67 @@ async def review_record(
     sample_rate_hz = int(artifact.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
 
     logger.info(
-        "[REVIEW] response record_id=%s channel=%s calibration_samples=%s calibration_beats=%s session_samples=%s session_beats=%s session_intervals=%s",
+        "[REVIEW] summary record_id=%s channel=%s calibration_beats=%s session_beats=%s session_windows=%s session_intervals=%s",
         record_id,
         selected_channel,
-        calibration_section["meta"]["sample_count"],
         calibration_section["beats"]["count"],
-        session_section["meta"]["sample_count"],
         session_section["beats"]["count"],
+        session_section.get("window_count", 1),
         len(session_section["interval_related_rows"]),
     )
-    return ReviewResponse(
+    return ReviewSummaryResponse(
         record_id=record_id,
         channel=selected_channel,
         sample_rate_hz=sample_rate_hz,
-        calibration=ReviewSection(**calibration_section),
-        session=ReviewSection(**session_section),
+        calibration=ReviewSectionSummary(**_build_review_section_summary(calibration_section)),
+        session=ReviewSectionSummary(**_build_review_section_summary(session_section)),
+    )
+
+
+@app.get("/review/{record_id}/window", response_model=ReviewWindowResponse)
+async def review_window(
+    record_id: str,
+    section: str = "session",
+    channel: str = "CH2",
+    window_index: int = 1,
+) -> ReviewWindowResponse:
+    selected_channel = (channel or "CH2").upper()
+    selected_section = (section or "session").lower()
+    if selected_channel not in CHANNEL_LABELS:
+        raise HTTPException(status_code=400, detail="Invalid channel.")
+    if selected_section not in {"calibration", "session"}:
+        raise HTTPException(status_code=400, detail="Invalid section.")
+
+    logger.info(
+        "[REVIEW] window request record_id=%s channel=%s section=%s window_index=%s",
+        record_id,
+        selected_channel,
+        selected_section,
+        window_index,
+    )
+    artifact = _load_review_artifact(record_id, selected_channel)
+    sample_rate_hz = int(artifact.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
+    section_payload = _build_review_window_section(
+        artifact.get(selected_section, {}),
+        sample_rate_hz,
+        window_index,
+    )
+    logger.info(
+        "[REVIEW] window response record_id=%s channel=%s section=%s window=%s/%s samples=%s beats=%s",
+        record_id,
+        selected_channel,
+        selected_section,
+        section_payload["window_index"],
+        section_payload["window_count"],
+        len(section_payload["signal"]["full"]),
+        section_payload["beats"]["count"],
+    )
+    return ReviewWindowResponse(
+        record_id=record_id,
+        channel=selected_channel,
+        sample_rate_hz=sample_rate_hz,
+        section=selected_section,
+        window=ReviewWindowSection(**section_payload),
     )
 
 
@@ -2540,7 +2681,7 @@ async def review_session_window(
     sample_rate_hz = int(artifact.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
     session_section = artifact.get("session", {})
     signal = session_section.get("signal", {}).get("full", []) or []
-    window_samples = sample_rate_hz * 20
+    window_samples = sample_rate_hz * REVIEW_WINDOW_SECONDS
     window_count = max(1, (len(signal) + window_samples - 1) // window_samples)
     bounded_window_index = max(1, min(session_window_index, window_count))
     start_index = (bounded_window_index - 1) * window_samples

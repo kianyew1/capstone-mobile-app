@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 type ReviewMeta = {
   object_key: string;
@@ -42,41 +42,61 @@ type ReviewIntervalRow = {
   ECG_Rate_Mean: number | null;
 };
 
-type ReviewSection = {
-  meta: ReviewMeta;
-  signal: {
-    full: number[];
-    r_peaks: number[];
-    markers: {
-      P: number[];
-      Q: number[];
-      R: number[];
-      S: number[];
-      T: number[];
-    };
+type ReviewSignal = {
+  full: number[];
+  r_peaks: number[];
+  markers: {
+    P: number[];
+    Q: number[];
+    R: number[];
+    S: number[];
+    T: number[];
   };
+};
+
+type ReviewSectionSummary = {
   beats: {
     count: number;
     items: ReviewBeat[];
   };
+  meta: ReviewMeta;
   beat_count_total: number;
   beat_count_included: number;
   beat_count_excluded: number;
   excluded_reason_counts: Record<string, number>;
+  window_count: number;
+  interval_related: ReviewIntervalRow | null;
+  interval_related_rows: ReviewIntervalRow[];
+};
+
+type ReviewWindowSection = {
+  meta: ReviewMeta;
+  signal: ReviewSignal;
+  beats: {
+    count: number;
+    items: ReviewBeat[];
+  };
   window_index: number;
   window_count: number;
   window_start_sample: number;
   window_end_sample: number;
   interval_related: ReviewIntervalRow | null;
-  interval_related_rows: ReviewIntervalRow[];
 };
 
-type ReviewResponse = {
+type ReviewSummaryResponse = {
   record_id: string;
   channel: "CH2" | "CH3" | "CH4";
   sample_rate_hz: number;
-  calibration: ReviewSection;
-  session: ReviewSection;
+  calibration: ReviewSectionSummary;
+  session: ReviewSectionSummary;
+};
+
+type ReviewWindowResponse = {
+  record_id: string;
+  channel: "CH2" | "CH3" | "CH4";
+  sample_rate_hz: number;
+  section: "calibration" | "session";
+  window: ReviewWindowSection;
 };
 
 type ReviewProcessingJob = {
@@ -302,11 +322,17 @@ function getVectorBeatRange(data: VectorBeatResponse | null): { min: number; max
   return getSymmetricFiniteRange(data.lead_x, data.lead_y, data.lead_z);
 }
 
-function getBeatSamples(fullSignal: number[], beat: ReviewBeat | null): number[] {
+function getBeatSamplesForWindow(
+  fullSignal: number[],
+  beat: ReviewBeat | null,
+  windowStartSample: number,
+): number[] {
   if (!beat) {
     return [];
   }
-  return fullSignal.slice(Math.max(0, beat.start_sample - 1), Math.max(0, beat.end_sample));
+  const startIndex = Math.max(0, beat.start_sample - windowStartSample);
+  const endIndex = Math.max(0, beat.end_sample - windowStartSample + 1);
+  return fullSignal.slice(startIndex, endIndex);
 }
 
 function createVectorLoopGeometry(
@@ -342,19 +368,22 @@ function createVectorLoopGeometry(
   };
 }
 
-function TopNav({ currentPath }: { currentPath: string }) {
+function TopNav({ currentPath, extra }: { currentPath: string; extra?: ReactNode }) {
   return (
-    <nav className="route-nav">
-      <a href="/" className={currentPath === "/" ? "route-link active" : "route-link"}>
-        Review
-      </a>
-      <a
-        href="/session"
-        className={currentPath.startsWith("/session") ? "route-link active" : "route-link"}
-      >
-        Live Session
-      </a>
-    </nav>
+    <div className="route-nav-row">
+      <nav className="route-nav">
+        <a href="/" className={currentPath === "/" ? "route-link active" : "route-link"}>
+          Review
+        </a>
+        <a
+          href="/session"
+          className={currentPath.startsWith("/session") ? "route-link active" : "route-link"}
+        >
+          Live Session
+        </a>
+      </nav>
+      {extra ? <div className="route-nav-extra">{extra}</div> : null}
+    </div>
   );
 }
 
@@ -1170,7 +1199,8 @@ function Vector3DReviewSection({
 
 function ReviewSectionCard({
   title,
-  section,
+  summary,
+  window,
   sampleRateHz,
   beatIndex,
   yMin,
@@ -1178,21 +1208,21 @@ function ReviewSectionCard({
   onBeatIndexChange,
 }: {
   title: string;
-  section: ReviewSection;
+  summary: ReviewSectionSummary;
+  window: ReviewWindowSection | null;
   sampleRateHz: number;
   beatIndex: number;
   yMin: number;
   yMax: number;
   onBeatIndexChange: (value: number) => void;
 }) {
-  const beat = section.beats.items.find((item) => item.index === beatIndex) ?? section.beats.items[0] ?? null;
-  const beatSamples = useMemo(() => getBeatSamples(section.signal.full, beat), [section.signal.full, beat]);
-  const displayWindowStart = beat ? beat.window_start_sample : 1;
-  const displayWindowEnd =
-    beat ? beat.window_end_sample : Math.min(section.signal.full.length, sampleRateHz * 10);
-  const windowSamples = section.signal.full.slice(
-    Math.max(0, displayWindowStart - 1),
-    displayWindowEnd,
+  const beat = window?.beats.items.find((item) => item.index === beatIndex) ?? window?.beats.items[0] ?? null;
+  const windowSamples = window?.signal.full ?? [];
+  const displayWindowStart = window?.window_start_sample ?? 1;
+  const displayWindowEnd = window?.window_end_sample ?? Math.min(summary.meta.sample_count, sampleRateHz * 10);
+  const beatSamples = useMemo(
+    () => getBeatSamplesForWindow(windowSamples, beat, displayWindowStart),
+    [windowSamples, beat, displayWindowStart],
   );
   const highlightStart =
     beat && beat.start_sample >= displayWindowStart ? beat.start_sample - displayWindowStart : null;
@@ -1205,8 +1235,8 @@ function ReviewSectionCard({
         <div>
           <h2>{title}</h2>
           <p className="meta-line">
-            object_key={section.meta.object_key} | byte_length={section.meta.byte_length} | sample_count={section.meta.sample_count}
-            {` | included_beats=${section.beat_count_included}/${section.beat_count_total}`}
+            object_key={summary.meta.object_key} | byte_length={summary.meta.byte_length} | sample_count={summary.meta.sample_count}
+            {` | included_beats=${summary.beat_count_included}/${summary.beat_count_total}`}
           </p>
         </div>
       </div>
@@ -1220,7 +1250,7 @@ function ReviewSectionCard({
             yMax={yMax}
             highlightStart={highlightStart}
             highlightEnd={highlightEnd}
-            subtitle={`Samples ${displayWindowStart}-${displayWindowEnd} | Window ${beat?.window_index ?? 1} of ${section.window_count}`}
+            subtitle={`Samples ${displayWindowStart}-${displayWindowEnd} | Window ${window?.window_index ?? 1} of ${summary.window_count}`}
           />
         </div>
         <div className="beat-column">
@@ -1228,7 +1258,7 @@ function ReviewSectionCard({
             title={`${title} Heartbeat`}
             beat={beat}
             samples={beatSamples}
-            beatCount={section.beats.count}
+            beatCount={summary.beats.count}
             sampleRateHz={sampleRateHz}
             yMin={yMin}
             yMax={yMax}
@@ -1245,13 +1275,13 @@ function ReviewSectionCard({
               <input
                 type="number"
                 min={1}
-                max={Math.max(section.beats.count, 1)}
+                max={Math.max(summary.beats.count, 1)}
                 value={beat?.index ?? beatIndex}
                 onChange={(event) =>
                   onBeatIndexChange(
                     Math.min(
                       Math.max(Number(event.target.value) || 1, 1),
-                      Math.max(section.beats.count, 1),
+                      Math.max(summary.beats.count, 1),
                     ),
                   )
                 }
@@ -1259,10 +1289,10 @@ function ReviewSectionCard({
             </label>
             <button
               className="window-button"
-              disabled={!beat || beat.index >= section.beats.count}
+              disabled={!beat || beat.index >= summary.beats.count}
               onClick={() =>
                 onBeatIndexChange(
-                  Math.min(section.beats.count, (beat?.index ?? section.beats.count) + 1),
+                  Math.min(summary.beats.count, (beat?.index ?? summary.beats.count) + 1),
                 )
               }
             >
@@ -1276,43 +1306,43 @@ function ReviewSectionCard({
         <div className="card-header">
           <h3>Interval-Related Analysis</h3>
         </div>
-        <IntervalSummary row={section.interval_related} />
+        <IntervalSummary row={window?.interval_related ?? summary.interval_related} />
       </div>
     </section>
   );
 }
 
 function SessionReviewCard({
-  section,
+  summary,
+  window,
   sampleRateHz,
   beatIndex,
   yMin,
   yMax,
   onBeatIndexChange,
 }: {
-  section: ReviewSection;
+  summary: ReviewSectionSummary;
+  window: ReviewWindowSection | null;
   sampleRateHz: number;
   beatIndex: number;
   yMin: number;
   yMax: number;
   onBeatIndexChange: (value: number) => void;
 }) {
-  const beats = section.beats.items;
-  const beat = beats.find((item) => item.index === beatIndex) ?? beats[0] ?? null;
-  const beatSamples = useMemo(() => getBeatSamples(section.signal.full, beat), [section.signal.full, beat]);
-  const displayWindowStart = beat ? beat.window_start_sample : 1;
-  const displayWindowEnd = beat ? beat.window_end_sample : Math.min(section.signal.full.length, sampleRateHz * 10);
-  const windowSamples = section.signal.full.slice(
-    Math.max(0, displayWindowStart - 1),
-    displayWindowEnd,
+  const beat = window?.beats.items.find((item) => item.index === beatIndex) ?? window?.beats.items[0] ?? null;
+  const windowSamples = window?.signal.full ?? [];
+  const displayWindowStart = window?.window_start_sample ?? 1;
+  const displayWindowEnd = window?.window_end_sample ?? Math.min(summary.meta.sample_count, sampleRateHz * 10);
+  const beatSamples = useMemo(
+    () => getBeatSamplesForWindow(windowSamples, beat, displayWindowStart),
+    [windowSamples, beat, displayWindowStart],
   );
   const highlightStart =
     beat && beat.start_sample >= displayWindowStart ? beat.start_sample - displayWindowStart : null;
   const highlightEnd =
     beat && beat.end_sample >= displayWindowStart ? beat.end_sample - displayWindowStart : null;
-  const selectedWindowIndex = beat?.window_index ?? 1;
-  const selectedIntervalRow =
-    section.interval_related_rows.find((row) => row.interval_index === selectedWindowIndex) ?? null;
+  const selectedWindowIndex = window?.window_index ?? beat?.window_index ?? 1;
+  const selectedIntervalRow = window?.interval_related ?? null;
 
   return (
     <section className="review-section">
@@ -1320,8 +1350,8 @@ function SessionReviewCard({
         <div>
           <h2>Session Signal</h2>
           <p className="meta-line">
-            object_key={section.meta.object_key} | byte_length={section.meta.byte_length} | sample_count={section.meta.sample_count}
-            {` | included_beats=${section.beat_count_included}/${section.beat_count_total}`}
+            object_key={summary.meta.object_key} | byte_length={summary.meta.byte_length} | sample_count={summary.meta.sample_count}
+            {` | included_beats=${summary.beat_count_included}/${summary.beat_count_total}`}
           </p>
         </div>
       </div>
@@ -1335,7 +1365,7 @@ function SessionReviewCard({
             yMax={yMax}
             highlightStart={highlightStart}
             highlightEnd={highlightEnd}
-            subtitle={`Samples ${displayWindowStart}-${displayWindowEnd} | Window ${beat?.window_index ?? 1} of ${section.window_count}`}
+            subtitle={`Samples ${displayWindowStart}-${displayWindowEnd} | Window ${selectedWindowIndex} of ${summary.window_count}`}
           />
         </div>
         <div className="beat-column">
@@ -1343,7 +1373,7 @@ function SessionReviewCard({
             title="Session Heartbeat"
             beat={beat}
             samples={beatSamples}
-            beatCount={section.beats.count}
+            beatCount={summary.beats.count}
             sampleRateHz={sampleRateHz}
             yMin={yMin}
             yMax={yMax}
@@ -1360,13 +1390,13 @@ function SessionReviewCard({
               <input
                 type="number"
                 min={1}
-                max={Math.max(section.beats.count, 1)}
+                max={Math.max(summary.beats.count, 1)}
                 value={beat?.index ?? beatIndex}
                 onChange={(event) =>
                   onBeatIndexChange(
                     Math.min(
                       Math.max(Number(event.target.value) || 1, 1),
-                      Math.max(section.beats.count, 1),
+                      Math.max(summary.beats.count, 1),
                     ),
                   )
                 }
@@ -1374,10 +1404,10 @@ function SessionReviewCard({
             </label>
             <button
               className="window-button"
-              disabled={!beat || beat.index >= section.beats.count}
+              disabled={!beat || beat.index >= summary.beats.count}
               onClick={() =>
                 onBeatIndexChange(
-                  Math.min(section.beats.count, (beat?.index ?? section.beats.count) + 1),
+                  Math.min(summary.beats.count, (beat?.index ?? summary.beats.count) + 1),
                 )
               }
             >
@@ -1390,7 +1420,7 @@ function SessionReviewCard({
       <div className="interval-card">
         <div className="card-header">
           <h3>Interval-Related Analysis</h3>
-          <span>{`Window ${selectedWindowIndex} of ${section.window_count}`}</span>
+          <span>{`Window ${selectedWindowIndex} of ${summary.window_count}`}</span>
         </div>
         <IntervalSummary row={selectedIntervalRow} />
       </div>
@@ -1399,10 +1429,16 @@ function SessionReviewCard({
 }
 
 function ReviewPage({ currentPath }: { currentPath: string }) {
+  const searchParams = new URLSearchParams(window.location.search);
+  const initialRequestedRecordId = searchParams.get("recordId") ?? "";
   const [reviewMode, setReviewMode] = useState<(typeof REVIEW_MODES)[number]>("CH2");
+  const [requestedRecordIdInput, setRequestedRecordIdInput] = useState(initialRequestedRecordId);
+  const [requestedRecordId, setRequestedRecordId] = useState(initialRequestedRecordId);
   const [yMaxMv, setYMaxMv] = useState(DEFAULT_ECG_Y_MAX_MV);
   const [yMinMv, setYMinMv] = useState(DEFAULT_ECG_Y_MIN_MV);
-  const [data, setData] = useState<ReviewResponse | null>(null);
+  const [data, setData] = useState<ReviewSummaryResponse | null>(null);
+  const [calibrationWindow, setCalibrationWindow] = useState<ReviewWindowSection | null>(null);
+  const [sessionWindow, setSessionWindow] = useState<ReviewWindowSection | null>(null);
   const [reviewRecordId, setReviewRecordId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1432,6 +1468,11 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
   const calibrationVectorRange = getVectorBeatRange(calibrationVector) ?? { min: yMinMv, max: yMaxMv };
   const sessionVectorRange = getVectorBeatRange(sessionVector) ?? { min: yMinMv, max: yMaxMv };
   const [reviewRefreshToken, setReviewRefreshToken] = useState(0);
+  const canProcessReview = Boolean(reviewRecordId);
+  const calibrationWindowIndex =
+    data?.calibration.beats.items.find((item) => item.index === calibrationBeat)?.window_index ?? 1;
+  const sessionWindowIndex =
+    data?.session.beats.items.find((item) => item.index === sessionBeat)?.window_index ?? 1;
 
   useEffect(() => {
     let active = true;
@@ -1439,7 +1480,9 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
       setLoading(true);
       setError(null);
       setArtifactsNotReady(null);
-      const url = `/api/review/latest?channel=${selectedChannel}`;
+      const url = requestedRecordId
+        ? `/api/review/${requestedRecordId}?channel=${selectedChannel}`
+        : `/api/review/latest?channel=${selectedChannel}`;
       console.log(`[REVIEW] GET ${url}`);
       try {
         const response = await fetch(url);
@@ -1469,20 +1512,24 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
             setArtifactsNotReady(notReady);
             setReviewRecordId(notReady.record_id);
             setData(null);
+            setCalibrationWindow(null);
+            setSessionWindow(null);
             return;
           }
           throw new Error(`Review fetch failed: ${response.status} ${text}`);
         }
-        const payload = (await response.json()) as ReviewResponse;
+        const payload = (await response.json()) as ReviewSummaryResponse;
         console.log(
-          `[REVIEW] response recordId=${payload.record_id} channel=${payload.channel} calibrationSamples=${payload.calibration.signal.full.length} sessionSamples=${payload.session.signal.full.length} sessionBeats=${payload.session.beats.count}`,
+          `[REVIEW] response recordId=${payload.record_id} channel=${payload.channel} calibrationBeats=${payload.calibration.beats.count} sessionBeats=${payload.session.beats.count} sessionWindows=${payload.session.window_count}`,
         );
         if (!active) return;
         setData(payload);
+        setCalibrationWindow(null);
+        setSessionWindow(null);
         setReviewRecordId(payload.record_id);
         setArtifactsNotReady(null);
-        setCalibrationBeat(1);
-        setSessionBeat(1);
+        setCalibrationBeat(payload.calibration.beats.items[0]?.index ?? 1);
+        setSessionBeat(payload.session.beats.items[0]?.index ?? 1);
         setCalibrationVectorMovement(100);
         setSessionVectorMovement(100);
       } catch (err) {
@@ -1498,7 +1545,77 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     return () => {
       active = false;
     };
-  }, [selectedChannel, reviewRefreshToken]);
+  }, [selectedChannel, requestedRecordId, reviewRefreshToken]);
+
+  useEffect(() => {
+    if (!data) {
+      setCalibrationWindow(null);
+      return;
+    }
+    const summary = data;
+    let active = true;
+    async function loadCalibrationWindow() {
+      const url = `/api/review/${summary.record_id}/window?section=calibration&channel=${selectedChannel}&window_index=${calibrationWindowIndex}`;
+      console.log(`[REVIEW_WINDOW] GET ${url}`);
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Calibration window fetch failed: ${response.status} ${text}`);
+        }
+        const payload = (await response.json()) as ReviewWindowResponse;
+        if (!active) return;
+        console.log(
+          `[REVIEW_WINDOW] calibration recordId=${payload.record_id} window=${payload.window.window_index}/${payload.window.window_count} samples=${payload.window.signal.full.length} beats=${payload.window.beats.count}`,
+        );
+        setCalibrationWindow(payload.window);
+      } catch (err) {
+        if (!active) return;
+        console.error("[REVIEW_WINDOW] calibration error", err);
+        setCalibrationWindow(null);
+        setError(err instanceof Error ? err.message : "Unknown calibration window error");
+      }
+    }
+    void loadCalibrationWindow();
+    return () => {
+      active = false;
+    };
+  }, [data, selectedChannel, calibrationWindowIndex]);
+
+  useEffect(() => {
+    if (!data) {
+      setSessionWindow(null);
+      return;
+    }
+    const summary = data;
+    let active = true;
+    async function loadSessionWindow() {
+      const url = `/api/review/${summary.record_id}/window?section=session&channel=${selectedChannel}&window_index=${sessionWindowIndex}`;
+      console.log(`[REVIEW_WINDOW] GET ${url}`);
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Session window fetch failed: ${response.status} ${text}`);
+        }
+        const payload = (await response.json()) as ReviewWindowResponse;
+        if (!active) return;
+        console.log(
+          `[REVIEW_WINDOW] session recordId=${payload.record_id} window=${payload.window.window_index}/${payload.window.window_count} samples=${payload.window.signal.full.length} beats=${payload.window.beats.count}`,
+        );
+        setSessionWindow(payload.window);
+      } catch (err) {
+        if (!active) return;
+        console.error("[REVIEW_WINDOW] session error", err);
+        setSessionWindow(null);
+        setError(err instanceof Error ? err.message : "Unknown session window error");
+      }
+    }
+    void loadSessionWindow();
+    return () => {
+      active = false;
+    };
+  }, [data, selectedChannel, sessionWindowIndex]);
 
   useEffect(() => {
     if (!processingJob || !["queued", "running"].includes(processingJob.status)) {
@@ -1584,6 +1701,53 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
       setError(err instanceof Error ? err.message : "Unknown processing start error");
     }
   }
+
+  function applyRequestedRecordId() {
+    const next = requestedRecordIdInput.trim();
+    const nextQuery = new URLSearchParams(window.location.search);
+    if (next) {
+      nextQuery.set("recordId", next);
+    } else {
+      nextQuery.delete("recordId");
+    }
+    const nextUrl = nextQuery.toString() ? `${currentPath}?${nextQuery.toString()}` : currentPath;
+    window.history.replaceState({}, "", nextUrl);
+    setRequestedRecordId(next);
+    setLoading(true);
+    setError(null);
+    setArtifactsNotReady(null);
+    setData(null);
+    setCalibrationWindow(null);
+    setSessionWindow(null);
+    setProcessingJob(null);
+  }
+
+  const reviewNavExtra = canProcessReview ? (
+    <>
+      <label className="route-process-toggle">
+        <input
+          type="checkbox"
+          checked={processResample}
+          onChange={(event) => setProcessResample(event.target.checked)}
+          disabled={processActionPending || processingJob?.status === "running"}
+        />
+        <span>{`Resample ${processResample ? "On" : "Off"}`}</span>
+      </label>
+      <button
+        className={`route-link route-action-button ${processActionPending || processingJob?.status === "running" ? "active" : ""}`}
+        disabled={processActionPending || processingJob?.status === "running"}
+        onClick={() => void handleProcessReview()}
+        type="button"
+      >
+        {processActionPending || processingJob?.status === "running" ? "Processing..." : "Process"}
+      </button>
+      {processingJob ? (
+        <span className="route-process-status">
+          {`${processingJob.status} · ${String(processingJob.details?.resample)}`}
+        </span>
+      ) : null}
+    </>
+  ) : null;
 
   useEffect(() => {
     if (!data || !shouldLoadVectorBeats) {
@@ -1765,12 +1929,23 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <TopNav currentPath={currentPath} />
+          <TopNav currentPath={currentPath} extra={reviewNavExtra} />
           <p className="eyebrow">ECG Review Workspace</p>
           <h1>Calibration and Session Review</h1>
           <p className="subtitle">NeuroKit2-backed signal review for calibration and exercise session traces.</p>
         </div>
-        <div className="topbar-controls">
+        <div className="topbar-controls review-topbar-controls">
+          <label className="channel-select record-input-card">
+            <span>Record ID</span>
+            <input
+              value={requestedRecordIdInput}
+              onChange={(event) => setRequestedRecordIdInput(event.target.value)}
+              placeholder="Leave blank for latest record"
+            />
+          </label>
+          <button className="apply-button" onClick={applyRequestedRecordId}>
+            Apply
+          </button>
           <label className="channel-select">
             <span>View</span>
             <select value={reviewMode} onChange={(event) => setReviewMode(event.target.value as (typeof REVIEW_MODES)[number])}>
@@ -1815,29 +1990,7 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
                 {`Record ID: ${artifactsNotReady.record_id} | Status: ${artifactsNotReady.processed_status ?? "missing"}`}
               </div>
             </div>
-            <label className="channel-select" style={{ alignItems: "center", gap: "0.5rem" }}>
-              <input
-                type="checkbox"
-                checked={processResample}
-                onChange={(event) => setProcessResample(event.target.checked)}
-                disabled={processActionPending || processingJob?.status === "running"}
-              />
-              <span>{`Resample to 500 Hz (${processResample ? "On" : "Off"})`}</span>
-            </label>
-            <div style={{ display: "flex", gap: "0.75rem", alignItems: "center" }}>
-              <button
-                className="window-button"
-                disabled={processActionPending || processingJob?.status === "running"}
-                onClick={() => void handleProcessReview()}
-              >
-                {processActionPending || processingJob?.status === "running" ? "Processing..." : "Process"}
-              </button>
-              {processingJob ? (
-                <span className="meta-line">
-                  {`Job ${processingJob.job_id.slice(0, 8)} | ${processingJob.status} | resample=${String(processingJob.details?.resample)}`}
-                </span>
-              ) : null}
-            </div>
+            <div className="meta-line">Use the Process controls in the header to generate review artifacts.</div>
           </div>
         </div>
       )}
@@ -1901,23 +2054,31 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
               </div>
             ) : (
             <>
-              <ReviewSectionCard
-                title="Calibration Signal"
-                section={data.calibration}
-                sampleRateHz={data.sample_rate_hz}
-                beatIndex={calibrationBeat}
-                yMin={yMinMv}
-                yMax={yMaxMv}
-                onBeatIndexChange={setCalibrationBeat}
-              />
-              <SessionReviewCard
-                section={data.session}
-                sampleRateHz={data.sample_rate_hz}
-                beatIndex={sessionBeat}
-                yMin={yMinMv}
-                yMax={yMaxMv}
-                onBeatIndexChange={setSessionBeat}
-              />
+              {calibrationWindow && sessionWindow ? (
+                <>
+                  <ReviewSectionCard
+                    title="Calibration Signal"
+                    summary={data.calibration}
+                    window={calibrationWindow}
+                    sampleRateHz={data.sample_rate_hz}
+                    beatIndex={calibrationBeat}
+                    yMin={yMinMv}
+                    yMax={yMaxMv}
+                    onBeatIndexChange={setCalibrationBeat}
+                  />
+                  <SessionReviewCard
+                    summary={data.session}
+                    window={sessionWindow}
+                    sampleRateHz={data.sample_rate_hz}
+                    beatIndex={sessionBeat}
+                    yMin={yMinMv}
+                    yMax={yMaxMv}
+                    onBeatIndexChange={setSessionBeat}
+                  />
+                </>
+              ) : (
+                <div className="status-panel">Loading review windows...</div>
+              )}
             </>
           )}
         </div>
