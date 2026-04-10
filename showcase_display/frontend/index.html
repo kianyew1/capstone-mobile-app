@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Showcase ECG Display</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Exhibition Signal Display</p>
+          <h1>Live CH2 Monitor</h1>
+          <p class="subtitle">
+            Browser-side Bluetooth streaming with rolling 500-sample updates for a stable live presentation.
+          </p>
+        </div>
+        <div class="topbar-controls">
+          <div class="status-chip" id="connection-chip" data-state="disconnected">Disconnected</div>
+          <button class="route-action-button connect-button" id="connect-button" type="button">Connect Device</button>
+        </div>
+      </header>
+
+      <section class="review-section chart-section">
+        <div class="live-quadrant-card live-signal-card">
+          <div class="card-header">
+            <div>
+              <h2>Lead CH2 live waveform</h2>
+              <p>Displayed using NeuroKit's `ecg_clean(..., method=&quot;neurokit&quot;)` on the full rolling CH2 buffer before plotting.</p>
+              <p>
+                <span id="device-name">Not connected</span>
+                ·
+                <span id="samples-received">0</span> samples received
+                · 2500 displayed · 5000 buffered · 500-sample delay
+              </p>
+            </div>
+            <span id="chart-meta">Waiting for signal...</span>
+          </div>
+          <div class="canvas-shell">
+            <canvas id="live-canvas" width="1067" height="390" class="live-canvas live-waveform-canvas"></canvas>
+            <div class="disconnect-overlay" id="disconnect-overlay">
+              <div class="overlay-card">
+                <p class="eyebrow">Signal unavailable</p>
+                <h3>Bluetooth disconnected</h3>
+                <p>Reconnect the hardware device to resume the live CH2 display.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>
