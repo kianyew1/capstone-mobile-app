@@ -177,6 +177,37 @@ type LiveVisualResponse = {
   };
 };
 
+type StaticReviewWindow = {
+  window_index: number;
+  start_sec: number;
+  end_sec: number;
+  status: "ready" | "error" | string;
+  error?: string;
+  images: Partial<Record<"ch2" | "ch3" | "ch4" | "frontal" | "transverse" | "sagittal" | "vcg3d", string>>;
+};
+
+type StaticReviewManifest = {
+  record_id: string;
+  status: "running" | "ready" | "error" | string;
+  processing_version: string;
+  sample_rate_hz: number;
+  window_seconds: number;
+  total_window_count: number;
+  target_window_count: number;
+  completed_window_count: number;
+  windows: StaticReviewWindow[];
+  updated_at?: string;
+  error?: string;
+};
+
+type StaticReviewJob = {
+  job_id: string;
+  status: string;
+  record_id: string;
+  details?: Record<string, unknown>;
+  error?: string | null;
+};
+
 const CHANNELS = ["CH2", "CH3", "CH4"] as const;
 const REVIEW_MODES = ["CH2", "CH3", "CH4", "2D Vectorcardiography", "3D Vectorgraphy"] as const;
 const DEFAULT_ECG_Y_MAX_MV = 0.6;
@@ -2087,11 +2118,317 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
   );
 }
 
-function LiveSessionPage({ currentPath }: { currentPath: string }) {
+void ReviewPage;
+
+function StaticReviewPage({ currentPath }: { currentPath: string }) {
   const searchParams = new URLSearchParams(window.location.search);
   const initialRecordId = searchParams.get("recordId") ?? "";
   const [recordIdInput, setRecordIdInput] = useState(initialRecordId);
   const [recordId, setRecordId] = useState(initialRecordId);
+  const [manifest, setManifest] = useState<StaticReviewManifest | null>(null);
+  const [selectedWindowIndex, setSelectedWindowIndex] = useState(1);
+  const [loadingManifest, setLoadingManifest] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [job, setJob] = useState<StaticReviewJob | null>(null);
+  const [processing, setProcessing] = useState(false);
+  const [imageCacheProgress, setImageCacheProgress] = useState<{ done: number; total: number; active: boolean } | null>(null);
+
+  const readyOrKnownWindows = manifest?.windows ?? [];
+  const selectedWindow = readyOrKnownWindows.find((windowItem) => windowItem.window_index === selectedWindowIndex) ?? readyOrKnownWindows[0] ?? null;
+  const sliderMax = Math.max(1, readyOrKnownWindows.length || manifest?.completed_window_count || 1);
+
+  const imageUrl = (objectKey?: string) =>
+    objectKey
+      ? `/api/review_static/${encodeURIComponent(recordId)}/image?object_key=${encodeURIComponent(objectKey)}&v=${encodeURIComponent(manifest?.updated_at ?? "")}`
+      : "";
+
+  const imageUrlsForWindow = (windowItem?: StaticReviewWindow | null) =>
+    windowItem?.images
+      ? Object.values(windowItem.images)
+          .filter(Boolean)
+          .map((objectKey) => imageUrl(objectKey))
+      : [];
+
+  async function loadManifest(targetRecordId = recordId, silent = false) {
+    const trimmed = targetRecordId.trim();
+    if (!trimmed) {
+      setManifest(null);
+      setError(null);
+      return;
+    }
+    if (!silent) setLoadingManifest(true);
+    try {
+      const response = await fetch(`/api/review_static/${encodeURIComponent(trimmed)}/manifest`);
+      if (!response.ok) {
+        if (response.status === 404) {
+          setManifest(null);
+          if (!silent) setError("Static review plots have not been generated for this record yet.");
+          return;
+        }
+        const text = await response.text();
+        throw new Error(`Manifest fetch failed: ${response.status} ${text}`);
+      }
+      const payload = (await response.json()) as StaticReviewManifest;
+      setManifest(payload);
+      setError(null);
+      const knownWindows = payload.windows ?? [];
+      if (knownWindows.length > 0 && !knownWindows.some((item) => item.window_index === selectedWindowIndex)) {
+        setSelectedWindowIndex(knownWindows[0].window_index);
+      }
+    } catch (err) {
+      if (!silent) setError(err instanceof Error ? err.message : "Unknown manifest error");
+    } finally {
+      if (!silent) setLoadingManifest(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadManifest(recordId);
+    // selectedWindowIndex is intentionally excluded so slider changes do not refetch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordId]);
+
+  useEffect(() => {
+    if (!job || !["queued", "running"].includes(job.status)) return;
+    let active = true;
+    let timeoutId: number | undefined;
+    const jobId = job.job_id;
+    async function poll() {
+      try {
+        const response = await fetch(`/api/review_static/process/${jobId}`);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Static review job poll failed: ${response.status} ${text}`);
+        }
+        const payload = (await response.json()) as StaticReviewJob;
+        if (!active) return;
+        setJob(payload);
+        await loadManifest(payload.record_id, true);
+        if (payload.status === "ready") {
+          setProcessing(false);
+          await loadManifest(payload.record_id, true);
+          return;
+        }
+        if (payload.status === "error") {
+          setProcessing(false);
+          setError(payload.error || "Static review plot generation failed.");
+          return;
+        }
+        timeoutId = window.setTimeout(poll, 1800);
+      } catch (err) {
+        if (!active) return;
+        setProcessing(false);
+        setError(err instanceof Error ? err.message : "Unknown static review job error");
+      }
+    }
+    timeoutId = window.setTimeout(poll, 900);
+    return () => {
+      active = false;
+      if (timeoutId) window.clearTimeout(timeoutId);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job?.job_id, job?.status]);
+
+  useEffect(() => {
+    if (!recordId || manifest?.status !== "ready" || !readyOrKnownWindows.length) {
+      setImageCacheProgress(null);
+      return;
+    }
+
+    const urls = Array.from(new Set(readyOrKnownWindows.flatMap((windowItem) => imageUrlsForWindow(windowItem))));
+    if (!urls.length) {
+      setImageCacheProgress(null);
+      return;
+    }
+
+    let cancelled = false;
+    let cursor = 0;
+    let done = 0;
+    const workerCount = Math.min(6, urls.length);
+    setImageCacheProgress({ done: 0, total: urls.length, active: true });
+
+    async function cacheWorker() {
+      while (!cancelled) {
+        const nextIndex = cursor;
+        cursor += 1;
+        if (nextIndex >= urls.length) break;
+        try {
+          const response = await fetch(urls[nextIndex], { cache: "force-cache" });
+          if (response.ok) {
+            await response.blob();
+          }
+        } catch {
+          // Cache warming is best-effort; visible images still load normally.
+        } finally {
+          done += 1;
+          if (!cancelled) {
+            setImageCacheProgress({ done, total: urls.length, active: done < urls.length });
+          }
+        }
+      }
+    }
+
+    void Promise.all(Array.from({ length: workerCount }, () => cacheWorker())).then(() => {
+      if (!cancelled) {
+        setImageCacheProgress({ done: urls.length, total: urls.length, active: false });
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordId, manifest?.status, manifest?.updated_at]);
+
+
+  function applyRecordId() {
+    const next = recordIdInput.trim();
+    const nextUrl = next ? `${currentPath}?recordId=${encodeURIComponent(next)}` : currentPath;
+    window.history.replaceState({}, "", nextUrl);
+    setRecordId(next);
+    setManifest(null);
+    setJob(null);
+    setSelectedWindowIndex(1);
+    setError(null);
+  }
+
+  async function startProcessing(force = false) {
+    const trimmed = recordIdInput.trim() || recordId.trim();
+    if (!trimmed) {
+      setError("Enter a record_id before generating review plots.");
+      return;
+    }
+    setProcessing(true);
+    setError(null);
+    setRecordId(trimmed);
+    const nextUrl = `${currentPath}?recordId=${encodeURIComponent(trimmed)}`;
+    window.history.replaceState({}, "", nextUrl);
+    try {
+      const response = await fetch(`/api/review_static/${encodeURIComponent(trimmed)}/process`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force }),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Static review process start failed: ${response.status} ${text}`);
+      }
+      const payload = (await response.json()) as StaticReviewJob;
+      setJob(payload);
+      await loadManifest(trimmed, true);
+    } catch (err) {
+      setProcessing(false);
+      setError(err instanceof Error ? err.message : "Unknown static review process error");
+    }
+  }
+
+  const progressLabel = manifest
+    ? `${manifest.completed_window_count} / ${manifest.target_window_count || manifest.total_window_count} windows ready`
+    : "No generated static review manifest loaded";
+
+  const windowLabel = selectedWindow
+    ? `Window ${selectedWindow.window_index} · ${selectedWindow.start_sec.toFixed(0)}s - ${selectedWindow.end_sec.toFixed(0)}s`
+    : "No window selected";
+
+  return (
+    <main className="app-shell static-review-shell">
+      <header className="topbar">
+        <div>
+          <TopNav currentPath={currentPath} />
+          <p className="eyebrow">Static ECG Review Workspace</p>
+          <h1>Calibration vs Session Window Comparison</h1>
+          <p className="subtitle">Backend-generated mean-beat and vectorcardiography comparison plots. The frontend only loads precomputed images.</p>
+        </div>
+        <div className="topbar-controls review-topbar-controls">
+          <div className="channel-select record-input-card static-record-card">
+            <div className="static-record-field">
+              <span>Record ID</span>
+              <input value={recordIdInput} onChange={(event) => setRecordIdInput(event.target.value)} placeholder="Paste ecg_recordings.id" />
+            </div>
+            <button className="apply-button" onClick={applyRecordId} type="button">
+              Load
+            </button>
+            <button className="apply-button" disabled={processing} onClick={() => void startProcessing(false)} type="button">
+              {processing ? "Generating..." : "Generate"}
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {loadingManifest ? <div className="status-panel">Loading static review manifest...</div> : null}
+      {error ? <div className="status-panel error">{error}</div> : null}
+
+      <div className="content-stack">
+        <div className="record-meta">
+          <span>Record ID: {recordId || "n/a"}</span>
+          <span>Status: {manifest?.status ?? job?.status ?? "not generated"}</span>
+          <span>{progressLabel}</span>
+          {imageCacheProgress ? (
+            <span>
+              Image cache: {imageCacheProgress.done} / {imageCacheProgress.total}
+              {imageCacheProgress.active ? " warming" : " ready"}
+            </span>
+          ) : null}
+          {manifest?.updated_at ? <span>Updated: {new Date(manifest.updated_at).toLocaleString()}</span> : null}
+        </div>
+
+        <section className="review-section static-review-controls">
+          <div>
+            <h2>{windowLabel}</h2>
+            <p className="meta-line">Use the slider to inspect the n-th 20-second session window that has been generated.</p>
+          </div>
+          <input
+            className="static-window-slider"
+            type="range"
+            min={1}
+            max={sliderMax}
+            value={Math.min(selectedWindowIndex, sliderMax)}
+            onChange={(event) => setSelectedWindowIndex(Number(event.target.value))}
+            disabled={!readyOrKnownWindows.length}
+          />
+        </section>
+
+        {selectedWindow?.status === "error" ? (
+          <div className="status-panel error">{selectedWindow.error || "This window failed to generate."}</div>
+        ) : selectedWindow ? (
+          <section className="static-review-grid">
+            <div className="static-review-column">
+              <StaticReviewImage title="CH2 Mean Beat" src={imageUrl(selectedWindow.images.ch2)} />
+              <StaticReviewImage title="CH3 Mean Beat" src={imageUrl(selectedWindow.images.ch3)} />
+              <StaticReviewImage title="CH4 Mean Beat" src={imageUrl(selectedWindow.images.ch4)} />
+            </div>
+            <div className="static-review-column">
+              <StaticReviewImage title="Frontal Plane" src={imageUrl(selectedWindow.images.frontal)} />
+              <StaticReviewImage title="Transverse Plane" src={imageUrl(selectedWindow.images.transverse)} />
+              <StaticReviewImage title="Sagittal Plane" src={imageUrl(selectedWindow.images.sagittal)} />
+            </div>
+            <div className="static-review-column static-review-column-3d">
+              <StaticReviewImage title="3D Vectorcardiography" src={imageUrl(selectedWindow.images.vcg3d)} tall />
+            </div>
+          </section>
+        ) : (
+          <div className="status-panel">Load or generate a static review manifest to view comparison plots.</div>
+        )}
+      </div>
+    </main>
+  );
+}
+
+function StaticReviewImage({ title, src, tall = false }: { title: string; src: string; tall?: boolean }) {
+  return (
+    <article className={tall ? "static-review-image-card static-review-image-card-tall" : "static-review-image-card"}>
+      <div className="card-header">
+        <h3>{title}</h3>
+      </div>
+      {src ? <img src={src} alt={title} loading="eager" decoding="async" /> : <div className="status-panel">Image not available</div>}
+    </article>
+  );
+}
+
+function LiveSessionPage({ currentPath }: { currentPath: string }) {
+  const searchParams = new URLSearchParams(window.location.search);
+  const initialRecordId = searchParams.get("recordId") ?? "";
+  const [recordId] = useState(initialRecordId);
   const [data, setData] = useState<LiveVisualResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -2238,16 +2575,6 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
     };
   }, [recordId]);
 
-  const applyRecordId = () => {
-    const next = recordIdInput.trim();
-    const nextUrl = next ? `/session?recordId=${encodeURIComponent(next)}` : "/session";
-    window.history.replaceState({}, "", nextUrl);
-    setRecordId(next);
-    setData(null);
-    setLoading(true);
-    setPollingStopped(false);
-  };
-
   const playback = useMemo(() => {
     if (!data) return null;
     const currentCount = Math.min(
@@ -2285,15 +2612,6 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
           <p className="eyebrow">Live Session Dashboard</p>
           <h1>Buffered Realtime Session View</h1>
           <p className="subtitle">Four synchronized quadrants with a deliberate 500 ms playback lag for smoother live visualization.</p>
-        </div>
-        <div className="live-controls">
-          <label className="channel-select record-input-card">
-            <span>Record ID</span>
-            <input value={recordIdInput} onChange={(event) => setRecordIdInput(event.target.value)} placeholder="Leave blank for latest active session" />
-          </label>
-          <button className="apply-button" onClick={applyRecordId}>
-            Apply
-          </button>
         </div>
       </header>
 
@@ -2348,5 +2666,5 @@ export default function App() {
   if (pathname.startsWith("/session")) {
     return <LiveSessionPage currentPath={pathname} />;
   }
-  return <ReviewPage currentPath={pathname} />;
+  return <StaticReviewPage currentPath={pathname} />;
 }

@@ -19,7 +19,7 @@ import matplotlib
 import neurokit2 as nk
 import numpy as np
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from pydantic import BaseModel, Field
 
@@ -94,6 +94,12 @@ VECTOR3D_PRELOAD_STATE: Dict[tuple[str, str, float, float, int], Dict[str, Any]]
 VECTOR3D_PRELOAD_LOCK = threading.Lock()
 LIVE_EVENT_SUBSCRIBERS: list[Queue[str]] = []
 LIVE_EVENT_SUBSCRIBERS_LOCK = threading.Lock()
+STATIC_REVIEW_PROCESSING_VERSION = "static_review_meanbeat_v1"
+STATIC_REVIEW_PREFIX = "review-static"
+STATIC_REVIEW_WINDOW_SECONDS = 20
+STATIC_REVIEW_WINDOW_SAMPLES = DEFAULT_SAMPLE_RATE_HZ * STATIC_REVIEW_WINDOW_SECONDS
+STATIC_REVIEW_OUTLIER_Z_THRESHOLD = 2.5
+STATIC_REVIEW_IMAGE_CACHE: Dict[str, bytes] = {}
 
 
 def _normalize_iso_to_sg(value: Optional[str]) -> Optional[str]:
@@ -1743,6 +1749,11 @@ class ReviewProcessRequest(BaseModel):
     resample: bool = True
 
 
+class StaticReviewProcessRequest(BaseModel):
+    max_windows: Optional[int] = None
+    force: bool = False
+
+
 class CalibrationSignalQualityResponse(BaseModel):
     quality_percentage: float
     signal_suitable: bool
@@ -2475,6 +2486,468 @@ def _review_processing_job(job_id: str, record_id: str, resample: bool) -> None:
         logger.exception("[REVIEW_PROCESS] failed job_id=%s record_id=%s resample=%s", job_id, record_id, resample)
 
 
+def _static_review_manifest_key(record_id: str) -> str:
+    return f"{STATIC_REVIEW_PREFIX}/{record_id}/manifest.json"
+
+
+def _static_review_window_prefix(record_id: str, window_index: int) -> str:
+    return f"{STATIC_REVIEW_PREFIX}/{record_id}/windows/window_{window_index:04d}"
+
+
+def _upload_static_manifest(record_id: str, manifest: Dict[str, Any]) -> None:
+    _upload_storage_json(_static_review_manifest_key(record_id), manifest)
+
+
+def _load_static_review_manifest(record_id: str) -> Dict[str, Any]:
+    try:
+        return _fetch_storage_json(_static_review_manifest_key(record_id))
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "static_review_manifest_not_found",
+                "record_id": record_id,
+                "manifest_key": _static_review_manifest_key(record_id),
+            },
+        ) from exc
+
+
+def _clean_ecg_series(samples: List[float], sample_rate_hz: int) -> np.ndarray:
+    if not samples:
+        return np.array([], dtype=float)
+    try:
+        return np.asarray(
+            nk.ecg_clean(samples, sampling_rate=sample_rate_hz, method="neurokit"),
+            dtype=float,
+        )
+    except Exception as exc:
+        logger.warning("[STATIC_REVIEW] ecg_clean fallback raw error=%s", exc)
+        return np.asarray(samples, dtype=float)
+
+
+def _segments_to_epoch_axis(segments: Dict[str, Any]) -> np.ndarray:
+    if not segments:
+        return np.array([], dtype=float)
+    first_key = next(iter(segments))
+    epoch = segments[first_key]
+    try:
+        return np.asarray(epoch.index, dtype=float)
+    except Exception:
+        return np.arange(len(epoch), dtype=float)
+
+
+def segmentation_timestamps_fromCH4(
+    raw_ch4_20s: List[float],
+    sample_rate_hz: int = DEFAULT_SAMPLE_RATE_HZ,
+) -> Dict[str, Any]:
+    cleaned_ch4 = _clean_ecg_series(raw_ch4_20s, sample_rate_hz)
+    if cleaned_ch4.size < sample_rate_hz:
+        return {
+            "cleaned_ch4": cleaned_ch4,
+            "rpeaks": np.array([], dtype=int),
+            "epoch_axis": np.array([], dtype=float),
+            "center_idx": 0,
+            "boundaries": [],
+        }
+    try:
+        _, peak_info = nk.ecg_peaks(cleaned_ch4, sampling_rate=sample_rate_hz, method="neurokit")
+        rpeaks = np.asarray(peak_info.get("ECG_R_Peaks", []), dtype=int)
+    except Exception as exc:
+        logger.warning("[STATIC_REVIEW] ecg_peaks failed error=%s", exc)
+        rpeaks = np.array([], dtype=int)
+    if rpeaks.size == 0:
+        return {
+            "cleaned_ch4": cleaned_ch4,
+            "rpeaks": rpeaks,
+            "epoch_axis": np.array([], dtype=float),
+            "center_idx": 0,
+            "boundaries": [],
+        }
+
+    try:
+        segments = nk.ecg_segment(
+            cleaned_ch4,
+            rpeaks=rpeaks,
+            sampling_rate=sample_rate_hz,
+            show=False,
+        )
+        epoch_axis = _segments_to_epoch_axis(segments)
+    except Exception as exc:
+        logger.warning("[STATIC_REVIEW] ecg_segment failed error=%s", exc)
+        # Fallback keeps a 35/65 split similar to NeuroKit's default segmented window.
+        beat_len = int(round(sample_rate_hz * 0.8))
+        pre = int(round(beat_len * 0.35))
+        epoch_axis = (np.arange(beat_len) - pre) / float(sample_rate_hz)
+
+    if epoch_axis.size == 0:
+        return {
+            "cleaned_ch4": cleaned_ch4,
+            "rpeaks": rpeaks,
+            "epoch_axis": epoch_axis,
+            "center_idx": 0,
+            "boundaries": [],
+        }
+
+    center_idx = int(np.argmin(np.abs(epoch_axis)))
+    beat_length = int(epoch_axis.size)
+    boundaries = []
+    for rpeak in rpeaks:
+        start = int(rpeak) - center_idx
+        end = start + beat_length - 1
+        boundaries.append({"rpeak": int(rpeak), "start": start, "end": end})
+    return {
+        "cleaned_ch4": cleaned_ch4,
+        "rpeaks": rpeaks,
+        "epoch_axis": epoch_axis,
+        "center_idx": center_idx,
+        "boundaries": boundaries,
+    }
+
+
+def _beat_matrix_from_boundaries(
+    cleaned: np.ndarray,
+    boundaries: List[Dict[str, int]],
+    beat_length: int,
+) -> np.ndarray:
+    beats: List[np.ndarray] = []
+    for boundary in boundaries:
+        start = int(boundary["start"])
+        end = int(boundary["end"]) + 1
+        if start < 0 or end > cleaned.size:
+            continue
+        beat = cleaned[start:end]
+        if beat.size == beat_length:
+            beats.append(beat.astype(float))
+    if not beats:
+        return np.empty((0, beat_length), dtype=float)
+    return np.vstack(beats)
+
+
+def _reject_outlier_beats(
+    beat_matrix: np.ndarray,
+    z_threshold: float = STATIC_REVIEW_OUTLIER_Z_THRESHOLD,
+) -> tuple[np.ndarray, np.ndarray]:
+    if beat_matrix.size == 0 or beat_matrix.shape[0] <= 2:
+        keep = np.ones((beat_matrix.shape[0],), dtype=bool)
+        return beat_matrix, keep
+    center = np.nanmedian(beat_matrix, axis=0)
+    spread = np.nanstd(beat_matrix, axis=0)
+    spread = np.where(spread < 1e-9, np.nan, spread)
+    z_scores = np.abs((beat_matrix - center) / spread)
+    per_beat_score = np.nanmax(z_scores, axis=1)
+    keep = np.isfinite(per_beat_score) & (per_beat_score <= z_threshold)
+    if not np.any(keep):
+        keep = np.ones((beat_matrix.shape[0],), dtype=bool)
+    return beat_matrix[keep], keep
+
+
+def raw20s_to_meanbeat(
+    raw_window: Dict[str, List[float]],
+    ch4_segmentation: Dict[str, Any],
+    sample_rate_hz: int = DEFAULT_SAMPLE_RATE_HZ,
+) -> Dict[str, Any]:
+    epoch_axis = np.asarray(ch4_segmentation.get("epoch_axis", []), dtype=float)
+    boundaries = list(ch4_segmentation.get("boundaries", []))
+    beat_length = int(epoch_axis.size)
+    if beat_length <= 0 or not boundaries:
+        raise ValueError("Cannot compute mean beat without CH4-derived segmentation boundaries.")
+
+    mean_beats: Dict[str, List[float]] = {}
+    raw_counts: Dict[str, int] = {}
+    kept_counts: Dict[str, int] = {}
+    for channel in CHANNEL_LABELS:
+        cleaned = _clean_ecg_series(raw_window.get(channel, []), sample_rate_hz)
+        beat_matrix = _beat_matrix_from_boundaries(cleaned, boundaries, beat_length)
+        filtered_matrix, keep_mask = _reject_outlier_beats(beat_matrix)
+        if filtered_matrix.size == 0:
+            mean = np.full((beat_length,), np.nan, dtype=float)
+        else:
+            mean = np.nanmean(filtered_matrix, axis=0)
+        mean_beats[channel] = mean.astype(float).tolist()
+        raw_counts[channel] = int(beat_matrix.shape[0])
+        kept_counts[channel] = int(np.sum(keep_mask)) if keep_mask.size else 0
+
+    return {
+        "epoch_axis": epoch_axis.astype(float).tolist(),
+        "mean_beats": mean_beats,
+        "raw_beat_counts": raw_counts,
+        "kept_beat_counts": kept_counts,
+    }
+
+
+def _window_channels(channels: Dict[str, List[float]], start: int, end: int) -> Dict[str, List[float]]:
+    return {channel: list(channels.get(channel, [])[start:end]) for channel in CHANNEL_LABELS}
+
+
+def _plot_to_png_bytes(fig: plt.Figure) -> bytes:
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=100, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    payload = buffer.getvalue()
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(payload))
+        optimized = io.BytesIO()
+        image.save(optimized, format="PNG", optimize=True)
+        payload = optimized.getvalue()
+    except Exception:
+        pass
+    return payload
+
+
+def _safe_series(values: List[float]) -> np.ndarray:
+    return np.asarray(values, dtype=float)
+
+
+def _finite_axis_limit(*arrays: np.ndarray, default: float = 0.25) -> float:
+    finite_values: List[float] = []
+    for array in arrays:
+        finite = np.asarray(array, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        if finite.size:
+            finite_values.append(float(np.max(np.abs(finite))))
+    max_abs = max(finite_values) if finite_values else default
+    return max(default, max_abs * 1.15)
+
+
+def _make_waveform_compare_png(
+    calibration: Dict[str, Any],
+    session: Dict[str, Any],
+    channel: str,
+    window_label: str,
+) -> bytes:
+    cal_x = _safe_series(calibration["epoch_axis"])
+    ses_x = _safe_series(session["epoch_axis"])
+    cal_y = _safe_series(calibration["mean_beats"][channel])
+    ses_y = _safe_series(session["mean_beats"][channel])
+    y_limit = _finite_axis_limit(cal_y, ses_y, default=0.15)
+    fig, ax = plt.subplots(figsize=(5.6, 4.2))
+    ax.plot(cal_x, cal_y, color="#8a8f98", linewidth=1.6, label="Calibration")
+    ax.plot(ses_x, ses_y, color="#d13f3f", linewidth=1.6, label="Session window")
+    ax.axhline(0, color="#607080", linewidth=0.8, alpha=0.35)
+    ax.axvline(0, color="#607080", linewidth=0.8, alpha=0.35)
+    ax.set_ylim(-y_limit, y_limit)
+    ax.set_title(f"{channel} representative mean beat\\n{window_label}", fontsize=11)
+    ax.set_xlabel("Aligned beat axis (s)")
+    ax.set_ylabel("mV")
+    ax.grid(True, alpha=0.22)
+    ax.legend(loc="upper right", fontsize=8)
+    return _plot_to_png_bytes(fig)
+
+
+def _make_2d_vcg_compare_png(
+    calibration: Dict[str, Any],
+    session: Dict[str, Any],
+    plane: str,
+    x_channel: str,
+    y_channel: str,
+    window_label: str,
+) -> bytes:
+    cal_x = _safe_series(calibration["mean_beats"][x_channel])
+    cal_y = _safe_series(calibration["mean_beats"][y_channel])
+    ses_x = _safe_series(session["mean_beats"][x_channel])
+    ses_y = _safe_series(session["mean_beats"][y_channel])
+    limit = _finite_axis_limit(cal_x, cal_y, ses_x, ses_y, default=0.15)
+    fig, ax = plt.subplots(figsize=(5.6, 4.2))
+    ax.plot(cal_x, cal_y, color="#8a8f98", linewidth=1.5, label="Calibration")
+    ax.plot(ses_x, ses_y, color="#d13f3f", linewidth=1.5, label="Session window")
+    ax.axhline(0, color="#607080", linewidth=0.8, alpha=0.35)
+    ax.axvline(0, color="#607080", linewidth=0.8, alpha=0.35)
+    ax.set_xlim(-limit, limit)
+    ax.set_ylim(-limit, limit)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title(f"{plane} VCG-style comparison\\n{window_label}", fontsize=11)
+    ax.set_xlabel(f"{x_channel} (mV)")
+    ax.set_ylabel(f"{y_channel} (mV)")
+    ax.grid(True, alpha=0.22)
+    ax.legend(loc="upper right", fontsize=8)
+    return _plot_to_png_bytes(fig)
+
+
+def _make_3d_vcg_compare_png(
+    calibration: Dict[str, Any],
+    session: Dict[str, Any],
+    window_label: str,
+) -> bytes:
+    cal_x = _safe_series(calibration["mean_beats"]["CH2"])
+    cal_y = _safe_series(calibration["mean_beats"]["CH4"])
+    cal_z = _safe_series(calibration["mean_beats"]["CH3"])
+    ses_x = _safe_series(session["mean_beats"]["CH2"])
+    ses_y = _safe_series(session["mean_beats"]["CH4"])
+    ses_z = _safe_series(session["mean_beats"]["CH3"])
+    limit = _finite_axis_limit(cal_x, cal_y, cal_z, ses_x, ses_y, ses_z, default=0.15)
+    fig = plt.figure(figsize=(5.6, 4.2))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot(cal_x, cal_y, cal_z, color="#8a8f98", linewidth=1.3, label="Calibration")
+    ax.plot(ses_x, ses_y, ses_z, color="#d13f3f", linewidth=1.3, label="Session window")
+    ax.set_xlim(-limit, limit)
+    ax.set_ylim(-limit, limit)
+    ax.set_zlim(-limit, limit)
+    ax.set_xlabel("CH2")
+    ax.set_ylabel("CH4")
+    ax.set_zlabel("CH3")
+    ax.set_title(f"3D VCG-style comparison\\n{window_label}", fontsize=11)
+    ax.view_init(elev=24, azim=42)
+    ax.legend(loc="upper left", fontsize=8)
+    return _plot_to_png_bytes(fig)
+
+
+def _generate_static_review_window_images(
+    record_id: str,
+    window_index: int,
+    window_label: str,
+    calibration_result: Dict[str, Any],
+    session_result: Dict[str, Any],
+) -> Dict[str, str]:
+    prefix = _static_review_window_prefix(record_id, window_index)
+    image_payloads = {
+        "ch2": _make_waveform_compare_png(calibration_result, session_result, "CH2", window_label),
+        "ch3": _make_waveform_compare_png(calibration_result, session_result, "CH3", window_label),
+        "ch4": _make_waveform_compare_png(calibration_result, session_result, "CH4", window_label),
+        "frontal": _make_2d_vcg_compare_png(calibration_result, session_result, "Frontal Plane", "CH2", "CH3", window_label),
+        "transverse": _make_2d_vcg_compare_png(calibration_result, session_result, "Transverse Plane", "CH2", "CH4", window_label),
+        "sagittal": _make_2d_vcg_compare_png(calibration_result, session_result, "Sagittal Plane", "CH4", "CH3", window_label),
+        "vcg3d": _make_3d_vcg_compare_png(calibration_result, session_result, window_label),
+    }
+    image_keys: Dict[str, str] = {}
+    for name, payload in image_payloads.items():
+        object_key = f"{prefix}/{name}.png"
+        _upload_storage_bytes(object_key, payload)
+        STATIC_REVIEW_IMAGE_CACHE[object_key] = payload
+        image_keys[name] = object_key
+    return image_keys
+
+
+def _static_review_job(job_id: str, record_id: str, max_windows: Optional[int] = None, force: bool = False) -> None:
+    logger.info("[STATIC_REVIEW] start job_id=%s record_id=%s max_windows=%s force=%s", job_id, record_id, max_windows, force)
+    _set_job(job_id, status="running", record_id=record_id, details={"completed_window_count": 0}, error=None)
+    try:
+        if not force:
+            try:
+                existing = _load_static_review_manifest(record_id)
+                if existing.get("processing_version") == STATIC_REVIEW_PROCESSING_VERSION and existing.get("status") == "ready":
+                    _set_job(job_id, status="ready", record_id=record_id, details=existing, error=None)
+                    return
+            except HTTPException:
+                pass
+
+        record = _fetch_recording_by_id(record_id)
+        session_key = record.get("session_object_key")
+        calibration_key = record.get("calibration_object_key")
+        if not session_key or not calibration_key:
+            raise HTTPException(status_code=400, detail="Missing session_object_key or calibration_object_key in record.")
+
+        sample_rate_hz = int(record.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
+        window_samples = sample_rate_hz * STATIC_REVIEW_WINDOW_SECONDS
+        session_bytes = _fetch_storage_bytes(session_key)
+        calibration_bytes = _fetch_storage_bytes(calibration_key)
+        session_channels = _decode_ads1298_packets(session_bytes)
+        calibration_channels = _decode_ads1298_packets(calibration_bytes)
+
+        calibration_window = _window_channels(calibration_channels, 0, window_samples)
+        calibration_segmentation = segmentation_timestamps_fromCH4(calibration_window["CH4"], sample_rate_hz)
+        calibration_result = raw20s_to_meanbeat(calibration_window, calibration_segmentation, sample_rate_hz)
+
+        total_window_count = min(len(session_channels.get("CH2", [])), len(session_channels.get("CH3", [])), len(session_channels.get("CH4", []))) // window_samples
+        if max_windows is not None and max_windows > 0:
+            total_to_process = min(total_window_count, max_windows)
+        else:
+            total_to_process = total_window_count
+
+        manifest: Dict[str, Any] = {
+            "record_id": record_id,
+            "status": "running",
+            "processing_version": STATIC_REVIEW_PROCESSING_VERSION,
+            "sample_rate_hz": sample_rate_hz,
+            "window_seconds": STATIC_REVIEW_WINDOW_SECONDS,
+            "window_samples": window_samples,
+            "total_window_count": total_window_count,
+            "target_window_count": total_to_process,
+            "completed_window_count": 0,
+            "calibration_object_key": calibration_key,
+            "session_object_key": session_key,
+            "manifest_object_key": _static_review_manifest_key(record_id),
+            "windows": [],
+            "created_at": _sg_now_iso(),
+            "updated_at": _sg_now_iso(),
+        }
+        _upload_static_manifest(record_id, manifest)
+
+        for zero_index in range(total_to_process):
+            start = zero_index * window_samples
+            end = start + window_samples
+            window_index = zero_index + 1
+            start_sec = start / sample_rate_hz
+            end_sec = end / sample_rate_hz
+            window_label = f"Window {window_index} | {start_sec:.0f}s - {end_sec:.0f}s"
+            try:
+                session_window = _window_channels(session_channels, start, end)
+                session_segmentation = segmentation_timestamps_fromCH4(session_window["CH4"], sample_rate_hz)
+                session_result = raw20s_to_meanbeat(session_window, session_segmentation, sample_rate_hz)
+                images = _generate_static_review_window_images(
+                    record_id=record_id,
+                    window_index=window_index,
+                    window_label=window_label,
+                    calibration_result=calibration_result,
+                    session_result=session_result,
+                )
+                window_entry = {
+                    "window_index": window_index,
+                    "start_sample": start,
+                    "end_sample": end,
+                    "start_sec": start_sec,
+                    "end_sec": end_sec,
+                    "status": "ready",
+                    "images": images,
+                    "raw_beat_counts": session_result.get("raw_beat_counts", {}),
+                    "kept_beat_counts": session_result.get("kept_beat_counts", {}),
+                }
+            except Exception as exc:
+                logger.exception("[STATIC_REVIEW] window_failed record_id=%s window=%s", record_id, window_index)
+                window_entry = {
+                    "window_index": window_index,
+                    "start_sample": start,
+                    "end_sample": end,
+                    "start_sec": start_sec,
+                    "end_sec": end_sec,
+                    "status": "error",
+                    "error": str(exc),
+                    "images": {},
+                }
+            manifest["windows"].append(window_entry)
+            manifest["completed_window_count"] = len([item for item in manifest["windows"] if item.get("status") == "ready"])
+            manifest["updated_at"] = _sg_now_iso()
+            _upload_static_manifest(record_id, manifest)
+            _set_job(
+                job_id,
+                status="running",
+                record_id=record_id,
+                details={
+                    "completed_window_count": manifest["completed_window_count"],
+                    "target_window_count": total_to_process,
+                },
+                error=None,
+            )
+
+        manifest["status"] = "ready"
+        manifest["updated_at"] = _sg_now_iso()
+        _upload_static_manifest(record_id, manifest)
+        _set_job(job_id, status="ready", record_id=record_id, details=manifest, error=None)
+        logger.info("[STATIC_REVIEW] ready job_id=%s record_id=%s windows=%s", job_id, record_id, total_to_process)
+    except Exception as exc:
+        logger.exception("[STATIC_REVIEW] failed job_id=%s record_id=%s", job_id, record_id)
+        try:
+            manifest = _load_static_review_manifest(record_id)
+            manifest["status"] = "error"
+            manifest["error"] = str(exc)
+            manifest["updated_at"] = _sg_now_iso()
+            _upload_static_manifest(record_id, manifest)
+        except Exception:
+            pass
+        _set_job(job_id, status="error", record_id=record_id, details={"record_id": record_id}, error=str(exc))
+
+
 @app.post("/session_analysis/start", response_model=SessionAnalysisJob)
 async def session_analysis_start(
     payload: SessionAnalysisStartRequest,
@@ -2566,6 +3039,65 @@ async def review_process_status(job_id: str) -> SessionAnalysisJob:
         record_id=job.get("record_id", ""),
         details=job.get("details"),
         error=job.get("error"),
+    )
+
+
+@app.get("/review_static/{record_id}/manifest")
+async def static_review_manifest(record_id: str) -> Dict[str, Any]:
+    return _load_static_review_manifest(record_id)
+
+
+@app.post("/review_static/{record_id}/process", response_model=SessionAnalysisJob)
+async def static_review_process_start(
+    record_id: str,
+    payload: StaticReviewProcessRequest,
+    background_tasks: BackgroundTasks,
+) -> SessionAnalysisJob:
+    job_id = uuid4().hex
+    _set_job(
+        job_id,
+        status="queued",
+        record_id=record_id,
+        details={"max_windows": payload.max_windows, "force": payload.force},
+        error=None,
+    )
+    background_tasks.add_task(_static_review_job, job_id, record_id, payload.max_windows, payload.force)
+    return SessionAnalysisJob(
+        job_id=job_id,
+        status="queued",
+        record_id=record_id,
+        details={"max_windows": payload.max_windows, "force": payload.force},
+        error=None,
+    )
+
+
+@app.get("/review_static/process/{job_id}", response_model=SessionAnalysisJob)
+async def static_review_process_status(job_id: str) -> SessionAnalysisJob:
+    job = ANALYSIS_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return SessionAnalysisJob(
+        job_id=job_id,
+        status=job.get("status", "unknown"),
+        record_id=job.get("record_id", ""),
+        details=job.get("details"),
+        error=job.get("error"),
+    )
+
+
+@app.get("/review_static/{record_id}/image")
+async def static_review_image(record_id: str, object_key: str) -> Response:
+    expected_prefix = f"{STATIC_REVIEW_PREFIX}/{record_id}/"
+    if not object_key.startswith(expected_prefix) or not object_key.endswith(".png"):
+        raise HTTPException(status_code=400, detail="Invalid static review image key.")
+    payload = STATIC_REVIEW_IMAGE_CACHE.get(object_key)
+    if payload is None:
+        payload = _fetch_storage_bytes(object_key)
+        STATIC_REVIEW_IMAGE_CACHE[object_key] = payload
+    return Response(
+        content=payload,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=3600"},
     )
 
 
