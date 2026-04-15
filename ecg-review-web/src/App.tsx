@@ -2415,12 +2415,34 @@ function StaticReviewPage({ currentPath }: { currentPath: string }) {
 }
 
 function StaticReviewImage({ title, src, tall = false }: { title: string; src: string; tall?: boolean }) {
+  const [loadedSrc, setLoadedSrc] = useState("");
+  const isLoading = Boolean(src) && loadedSrc !== src;
+
+  useEffect(() => {
+    setLoadedSrc("");
+  }, [src]);
+
   return (
     <article className={tall ? "static-review-image-card static-review-image-card-tall" : "static-review-image-card"}>
       <div className="card-header">
         <h3>{title}</h3>
       </div>
-      {src ? <img src={src} alt={title} loading="eager" decoding="async" /> : <div className="status-panel">Image not available</div>}
+      {src ? (
+        <div className="static-review-image-frame">
+          {isLoading ? <div className="static-review-image-placeholder">Loading...</div> : null}
+          <img
+            className={isLoading ? "static-review-image-hidden" : ""}
+            src={src}
+            alt={title}
+            loading="eager"
+            decoding="async"
+            onLoad={() => setLoadedSrc(src)}
+            onError={() => setLoadedSrc(src)}
+          />
+        </div>
+      ) : (
+        <div className="status-panel">Image not available</div>
+      )}
     </article>
   );
 }
