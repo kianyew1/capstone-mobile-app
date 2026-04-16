@@ -177,6 +177,29 @@ h3 {
   accent-color: #0d697a;
 }
 
+.capture-length-card {
+  min-width: 220px;
+}
+
+.radio-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.radio-row label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: #36556c;
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.radio-row input {
+  accent-color: #0d697a;
+}
+
 .review-section {
   padding: 24px 26px;
   border-radius: 28px;
@@ -320,7 +343,8 @@ h3 {
 }
 
 .disconnect-overlay,
-.contact-overlay {
+.contact-overlay,
+.pause-overlay {
   position: absolute;
   inset: 0;
   display: none;
@@ -333,7 +357,8 @@ h3 {
 }
 
 .disconnect-overlay.visible,
-.contact-overlay.visible {
+.contact-overlay.visible,
+.pause-overlay.visible {
   display: flex;
 }
 
@@ -353,6 +378,16 @@ h3 {
   background: rgba(255, 255, 255, 0.78);
   border-color: rgba(43, 95, 139, 0.16);
   box-shadow: 0 16px 34px rgba(23, 48, 73, 0.12);
+}
+
+.pause-overlay {
+  background: rgba(136, 26, 26, 0.44);
+  backdrop-filter: blur(2px);
+  z-index: 4;
+}
+
+.pause-overlay .overlay-card {
+  border-color: rgba(136, 26, 26, 0.24);
 }
 
 .overlay-card {

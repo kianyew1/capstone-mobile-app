@@ -19,11 +19,13 @@ const captureProgressValueEl = document.getElementById("capture-progress-value")
 const captureProgressFillEl = document.getElementById("capture-progress-fill");
 const disconnectOverlay = document.getElementById("disconnect-overlay");
 const contactOverlay = document.getElementById("contact-overlay");
+const pauseOverlay = document.getElementById("pause-overlay");
 const stdMinInput = document.getElementById("std-min-input");
 const stdMaxInput = document.getElementById("std-max-input");
 const absMeanMaxInput = document.getElementById("abs-mean-max-input");
 const scaleSlider = document.getElementById("scale-slider");
 const scaleValueEl = document.getElementById("scale-value");
+const captureLengthInputs = Array.from(document.querySelectorAll('input[name="capture-length"]'));
 const resultModal = document.getElementById("result-modal");
 const resultTitle = document.getElementById("result-title");
 const resultSubtitle = document.getElementById("result-subtitle");
@@ -58,6 +60,8 @@ const state = {
   lastShownAnalysisId: 0,
   modalTimerId: 0,
   modalCountdownId: 0,
+  captureTargetSeconds: 20,
+  paused: false,
 };
 
 function setConnectionState(mode, label) {
@@ -81,21 +85,34 @@ function clearFrontendState() {
   state.skippedWarmupPacket = false;
   state.lastNotificationPayloadHex = null;
   state.lastNotificationAtMs = 0;
+  state.paused = false;
+  pauseOverlay?.classList.remove("visible");
   updateCaptureProgress(0, 'Waiting for electrodes');
 }
 
-function updateCaptureProgress(seconds, label) {
-  const safeSeconds = Math.max(0, Math.min(20, Number(seconds) || 0));
-  const percent = (safeSeconds / 20) * 100;
+function updateCaptureProgress(seconds, label, totalSeconds = state.captureTargetSeconds) {
+  const targetSeconds = Math.max(1, Number(totalSeconds) || 20);
+  const safeSeconds = Math.max(0, Math.min(targetSeconds, Number(seconds) || 0));
+  const percent = (safeSeconds / targetSeconds) * 100;
   captureCountdownEl.textContent = label;
-  if (captureProgressValueEl) captureProgressValueEl.textContent = `${safeSeconds.toFixed(1)}s / 20.0s`;
+  if (captureProgressValueEl) captureProgressValueEl.textContent = `${safeSeconds.toFixed(1)}s / ${targetSeconds.toFixed(1)}s`;
   if (captureProgressFillEl) captureProgressFillEl.style.width = `${percent.toFixed(1)}%`;
+}
+
+async function setPaused(paused) {
+  state.paused = paused;
+  pauseOverlay?.classList.toggle("visible", paused);
+  if (paused) {
+    contactOverlay.classList.remove("visible");
+    updateCaptureProgress(0, "Paused");
+  }
+  await updateConfig({ paused });
 }
 
 function drawChart(samples) {
   const width = canvas.width;
   const height = canvas.height;
-  const margin = { top: 22, right: 24, bottom: 50, left: 86 };
+  const margin = { top: 22, right: 24, bottom: 76, left: 86 };
   const plotWidth = width - margin.left - margin.right;
   const plotHeight = height - margin.top - margin.bottom;
 
@@ -147,24 +164,18 @@ function drawChart(samples) {
   for (let index = 0; index <= xTicks; index += 1) {
     const x = margin.left + (plotWidth / xTicks) * index;
     const seconds = (VISIBLE_SAMPLES / SAMPLE_RATE_HZ) * (index / xTicks);
-    ctx.fillText(`${seconds.toFixed(1)}s`, x - 12, height - 14);
+    ctx.fillText(`${seconds.toFixed(1)}s`, x - 12, margin.top + plotHeight + 24);
   }
   for (const tick of yTicks) {
     const y = margin.top + plotHeight - ((tick - yMin) / span) * plotHeight;
     ctx.fillText(`${tick.toFixed(2)} mV`, 8, y + 4);
   }
 
-  ctx.save();
-  ctx.translate(22, height / 2);
-  ctx.rotate(-Math.PI / 2);
   ctx.fillStyle = '#6d8395';
   ctx.font = '14px Segoe UI';
-  ctx.fillText('Amplitude (mV)', 0, 0);
-  ctx.restore();
-
-  ctx.fillStyle = '#6d8395';
-  ctx.font = '14px Segoe UI';
-  ctx.fillText(`Displayed rolling window (latest ${VISIBLE_SAMPLES} samples)`, margin.left, height - 14);
+  ctx.textAlign = 'center';
+  ctx.fillText(`Displayed rolling window (latest ${VISIBLE_SAMPLES} samples)`, margin.left + plotWidth / 2, height - 8);
+  ctx.textAlign = 'start';
 
   if (!samples.length) {
     ctx.fillStyle = '#6d8395';
@@ -361,6 +372,16 @@ function updateUiFromSnapshot(snapshot) {
   if (Number.isFinite(Number(snapshot?.contact_abs_mean_max_mv))) {
     setControlValue(absMeanMaxInput, Number(snapshot.contact_abs_mean_max_mv).toFixed(1));
   }
+  if (Number.isFinite(Number(snapshot?.capture_target_seconds))) {
+    state.captureTargetSeconds = Number(snapshot.capture_target_seconds);
+    for (const input of captureLengthInputs) {
+      input.checked = Number(input.value) === state.captureTargetSeconds;
+    }
+  }
+  if (typeof snapshot?.paused === "boolean") {
+    state.paused = snapshot.paused;
+    pauseOverlay?.classList.toggle("visible", state.paused);
+  }
   if (contactDebugEl) {
     const std = Number(snapshot?.contact_std_mv || 0);
     const stdMin = Number(snapshot?.contact_std_min_mv || 0);
@@ -373,11 +394,16 @@ function updateUiFromSnapshot(snapshot) {
   const displayEnd = Math.max(0, state.previewCh2.length - DISPLAY_LAG_SAMPLES);
   const displayStart = Math.max(0, displayEnd - VISIBLE_SAMPLES);
   const displayedSamples = state.previewCh2.slice(displayStart, displayEnd);
-  drawChart(displayedSamples);
+  if (!state.paused) {
+    drawChart(displayedSamples);
+  }
 
-  if (snapshot?.capture_status === "analyzing") {
+  if (state.paused) {
     contactOverlay.classList.remove("visible");
-    updateCaptureProgress(20, "Computing CH2 summary...");
+    updateCaptureProgress(0, "Paused");
+  } else if (snapshot?.capture_status === "analyzing") {
+    contactOverlay.classList.remove("visible");
+    updateCaptureProgress(state.captureTargetSeconds, "Computing CH2 summary...");
   } else if (state.connected && snapshot?.capture_status !== "ready") {
     if (snapshot?.contact_detected) {
       contactOverlay.classList.remove("visible");
@@ -389,7 +415,10 @@ function updateUiFromSnapshot(snapshot) {
     }
   } else {
     contactOverlay.classList.remove("visible");
-    updateCaptureProgress(snapshot?.capture_status === "ready" ? 20 : 0, snapshot?.capture_status === "ready" ? "20s capture complete" : "Waiting for electrodes");
+    updateCaptureProgress(
+      snapshot?.capture_status === "ready" ? state.captureTargetSeconds : 0,
+      snapshot?.capture_status === "ready" ? `${state.captureTargetSeconds}s capture complete` : "Waiting for electrodes",
+    );
   }
 
   const analysis = snapshot?.analysis_result;
@@ -628,6 +657,15 @@ connectButton.addEventListener('click', async () => {
   }
 });
 
+window.addEventListener("keydown", (event) => {
+  if (event.code !== "Space") return;
+  const target = event.target;
+  const isTyping = target instanceof HTMLInputElement || target instanceof HTMLSelectElement || target instanceof HTMLTextAreaElement;
+  if (isTyping) return;
+  event.preventDefault();
+  void setPaused(!state.paused);
+});
+
 stdMinInput?.addEventListener("change", () => {
   const value = Number(stdMinInput.value);
   if (Number.isFinite(value)) {
@@ -648,6 +686,18 @@ absMeanMaxInput?.addEventListener("change", () => {
     void updateConfig({ contact_abs_mean_max_mv: value });
   }
 });
+
+for (const input of captureLengthInputs) {
+  input.addEventListener("change", () => {
+    if (!input.checked) return;
+    const value = Number(input.value);
+    if (Number.isFinite(value)) {
+      state.captureTargetSeconds = value;
+      updateCaptureProgress(0, "Waiting for electrodes", value);
+      void updateConfig({ capture_target_seconds: value });
+    }
+  });
+}
 
 scaleSlider?.addEventListener("input", () => {
   fixedYLimitMv = Number(scaleSlider.value);

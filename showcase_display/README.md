@@ -43,10 +43,10 @@ python showcase_display/backend/app.py
 - Rolling buffer: 5000 samples
 - Visible chart window: 2500 samples
 - Display delay: 500 samples behind the latest received data
-- Cleaning scope: the full rolling 5000-sample CH2 buffer is cleaned before plotting, then the latest eligible 2500 samples are shown
+- Cleaning scope: the full rolling 5000-sample CH2 buffer is cleaned and clipped to +/-2.0 mV before plotting, then the latest eligible 2500 samples are shown
 - CSV persistence cadence: every 500 received samples
 - Contact detection: minimum/maximum standard deviation and maximum absolute mean over latest 1500 samples / 3 seconds
-- Capture target: 10000 samples / 20 seconds
+- Capture target: selectable 5000 / 7500 / 10000 samples, equivalent to 10 / 15 / 20 seconds
 - Result modal duration: 8 seconds
 
 ## Exhibition controls
@@ -54,6 +54,7 @@ python showcase_display/backend/app.py
 - `Max STD`: rejects signals that are too noisy.
 - `Max abs mean`: rejects signals whose 3-second raw mean is too far from 0 mV.
 - `Graph scale`: adjusts the live chart y-axis from +/-0.10 mV to +/-5.00 mV.
+- `Capture length`: selects a 10, 15, or 20 second capture before showing the result modal.
 
 ## Output
 The active rolling CSV is stored at:

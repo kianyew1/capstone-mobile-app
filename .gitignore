@@ -64,3 +64,4 @@ ecg-review-web/.env
 /signal-processing-intense/plots
 Capstone final report USE ME.docx
 signal_report.md
+showcase_display/data/live_ch2.csv
