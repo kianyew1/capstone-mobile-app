@@ -46,6 +46,7 @@ button {
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .eyebrow {
@@ -138,6 +139,44 @@ h3 {
   color: #9d2f2f;
 }
 
+.control-card {
+  min-width: 170px;
+  padding: 10px 12px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.84);
+  border: 1px solid rgba(98, 138, 170, 0.18);
+  display: grid;
+  gap: 4px;
+}
+
+.control-card span {
+  font-size: 0.74rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #567386;
+}
+
+.control-card small {
+  color: #6d8395;
+  font-size: 0.76rem;
+}
+
+.control-card input[type="number"] {
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: 10px;
+  border: 1px solid #bfd0dd;
+  background: #f8fbfd;
+  color: #173049;
+  font-weight: 700;
+}
+
+.control-card input[type="range"] {
+  width: 170px;
+  accent-color: #0d697a;
+}
+
 .review-section {
   padding: 24px 26px;
   border-radius: 28px;
@@ -211,6 +250,59 @@ h3 {
   font-size: 0.95rem;
 }
 
+.chart-status {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+  text-align: right;
+}
+
+#contact-debug {
+  max-width: 900px;
+  color: #36556c;
+  font-family: "Consolas", "SFMono-Regular", monospace;
+  font-size: 0.82rem;
+}
+
+.capture-progress {
+  min-width: min(720px, 54vw);
+  padding: 12px 14px;
+  border-radius: 18px;
+  background: rgba(235, 244, 250, 0.92);
+  border: 1px solid rgba(103, 141, 170, 0.18);
+}
+
+.capture-progress-topline {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: center;
+  margin-bottom: 9px;
+}
+
+#capture-countdown,
+#capture-progress-value {
+  color: #17466d;
+  font-weight: 800;
+}
+
+.capture-progress-track {
+  width: 100%;
+  height: 12px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(167, 190, 207, 0.36);
+}
+
+.capture-progress-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2f7f94, #56b58d);
+  transition: width 180ms ease;
+}
+
 .canvas-shell {
   position: relative;
 }
@@ -227,7 +319,8 @@ h3 {
   min-height: 390px;
 }
 
-.disconnect-overlay {
+.disconnect-overlay,
+.contact-overlay {
   position: absolute;
   inset: 0;
   display: none;
@@ -239,8 +332,27 @@ h3 {
   backdrop-filter: blur(6px);
 }
 
-.disconnect-overlay.visible {
+.disconnect-overlay.visible,
+.contact-overlay.visible {
   display: flex;
+}
+
+.contact-overlay {
+  display: none;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 18px;
+  background: rgba(110, 124, 136, 0.22);
+  backdrop-filter: none;
+  pointer-events: none;
+}
+
+.contact-overlay .overlay-card {
+  max-width: 560px;
+  padding: 18px 22px;
+  background: rgba(255, 255, 255, 0.78);
+  border-color: rgba(43, 95, 139, 0.16);
+  box-shadow: 0 16px 34px rgba(23, 48, 73, 0.12);
 }
 
 .overlay-card {
@@ -255,6 +367,76 @@ h3 {
 .overlay-card p:not(.eyebrow) {
   margin-top: 10px;
   color: #58748a;
+}
+
+.result-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 34px;
+  background: rgba(20, 42, 62, 0.34);
+  backdrop-filter: blur(10px);
+}
+
+.result-modal.visible {
+  display: flex;
+}
+
+.result-modal-card {
+  width: min(1680px, 96vw);
+  max-height: 94vh;
+  overflow: auto;
+  padding: 26px;
+  border-radius: 30px;
+  background: linear-gradient(180deg, #fbfdfe 0%, #eef5f9 100%);
+  border: 1px solid rgba(103, 141, 170, 0.2);
+  box-shadow: 0 30px 90px rgba(11, 34, 54, 0.28);
+}
+
+.result-modal-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  align-items: flex-start;
+  margin-bottom: 18px;
+}
+
+.result-countdown {
+  min-width: 70px;
+  padding: 12px 15px;
+  border-radius: 999px;
+  background: #173049;
+  color: #ffffff;
+  text-align: center;
+  font-weight: 900;
+}
+
+.result-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.result-grid article {
+  padding: 16px;
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.86);
+  border: 1px solid rgba(103, 141, 170, 0.18);
+}
+
+.result-grid h3 {
+  margin-bottom: 10px;
+}
+
+.result-grid canvas {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 16px;
+  background: #f7fbfd;
 }
 
 @media (max-width: 1200px) {
@@ -280,7 +462,16 @@ h3 {
     flex-direction: column;
   }
 
+  .chart-status {
+    align-items: flex-start;
+    text-align: left;
+  }
+
   .live-waveform-canvas {
     min-height: 270px;
+  }
+
+  .result-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

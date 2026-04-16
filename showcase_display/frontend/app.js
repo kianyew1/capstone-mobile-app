@@ -7,16 +7,39 @@ const DISPLAY_LAG_SAMPLES = 500;
 const STALL_TIMEOUT_MS = 3000;
 const PACKETS_PER_UPLOAD = 20; // 20 * 25 samples = 500 samples
 const MIN_PACKET_INTERVAL_MS = 10;
-const FIXED_Y_LIMIT_MV = 0.15;
+const MODAL_VISIBLE_MS = 8000;
+const CONNECT_RETRY_COUNT = 3;
+let fixedYLimitMv = 0.5;
 
 const connectButton = document.getElementById("connect-button");
 const connectionChip = document.getElementById("connection-chip");
-const deviceNameEl = document.getElementById("device-name");
-const samplesReceivedEl = document.getElementById("samples-received");
-const chartMetaEl = document.getElementById("chart-meta");
+const contactDebugEl = document.getElementById("contact-debug");
+const captureCountdownEl = document.getElementById("capture-countdown");
+const captureProgressValueEl = document.getElementById("capture-progress-value");
+const captureProgressFillEl = document.getElementById("capture-progress-fill");
 const disconnectOverlay = document.getElementById("disconnect-overlay");
+const contactOverlay = document.getElementById("contact-overlay");
+const stdMinInput = document.getElementById("std-min-input");
+const stdMaxInput = document.getElementById("std-max-input");
+const absMeanMaxInput = document.getElementById("abs-mean-max-input");
+const scaleSlider = document.getElementById("scale-slider");
+const scaleValueEl = document.getElementById("scale-value");
+const resultModal = document.getElementById("result-modal");
+const resultTitle = document.getElementById("result-title");
+const resultSubtitle = document.getElementById("result-subtitle");
+const resultCountdown = document.getElementById("result-countdown");
+const rawResultCanvas = document.getElementById("raw-result-canvas");
+const stackResultCanvas = document.getElementById("stack-result-canvas");
+const meanResultCanvas = document.getElementById("mean-result-canvas");
 const canvas = document.getElementById("live-canvas");
 const ctx = canvas.getContext("2d");
+
+function logBle(message, details = undefined) {
+  if (!window.SHOWCASE_DEBUG) {
+    return;
+  }
+  console.log(`[BLE] ${message}`, details ?? "");
+}
 
 const state = {
   device: null,
@@ -32,11 +55,20 @@ const state = {
   skippedWarmupPacket: false,
   lastNotificationPayloadHex: null,
   lastNotificationAtMs: 0,
+  lastShownAnalysisId: 0,
+  modalTimerId: 0,
+  modalCountdownId: 0,
 };
 
 function setConnectionState(mode, label) {
   connectionChip.dataset.state = mode;
   connectionChip.textContent = label;
+}
+
+function setControlValue(input, value) {
+  if (input && document.activeElement !== input) {
+    input.value = value;
+  }
 }
 
 function clearFrontendState() {
@@ -49,8 +81,15 @@ function clearFrontendState() {
   state.skippedWarmupPacket = false;
   state.lastNotificationPayloadHex = null;
   state.lastNotificationAtMs = 0;
-  samplesReceivedEl.textContent = '0';
-  chartMetaEl.textContent = 'Waiting for signal...';
+  updateCaptureProgress(0, 'Waiting for electrodes');
+}
+
+function updateCaptureProgress(seconds, label) {
+  const safeSeconds = Math.max(0, Math.min(20, Number(seconds) || 0));
+  const percent = (safeSeconds / 20) * 100;
+  captureCountdownEl.textContent = label;
+  if (captureProgressValueEl) captureProgressValueEl.textContent = `${safeSeconds.toFixed(1)}s / 20.0s`;
+  if (captureProgressFillEl) captureProgressFillEl.style.width = `${percent.toFixed(1)}%`;
 }
 
 function drawChart(samples) {
@@ -75,8 +114,8 @@ function drawChart(samples) {
     ctx.stroke();
   }
 
-  const yMin = -FIXED_Y_LIMIT_MV;
-  const yMax = FIXED_Y_LIMIT_MV;
+  const yMin = -fixedYLimitMv;
+  const yMax = fixedYLimitMv;
   const clippedSamples = samples.map((value) =>
     Math.max(yMin, Math.min(yMax, value)),
   );
@@ -125,7 +164,7 @@ function drawChart(samples) {
 
   ctx.fillStyle = '#6d8395';
   ctx.font = '14px Segoe UI';
-  ctx.fillText('Displayed rolling window (latest 1500 samples)', margin.left, height - 14);
+  ctx.fillText(`Displayed rolling window (latest ${VISIBLE_SAMPLES} samples)`, margin.left, height - 14);
 
   if (!samples.length) {
     ctx.fillStyle = '#6d8395';
@@ -155,22 +194,245 @@ function drawChart(samples) {
   ctx.stroke();
 }
 
+function finiteValues(values) {
+  return (Array.isArray(values) ? values : []).filter((value) => Number.isFinite(value));
+}
+
+function drawLineChart(targetCanvas, seriesList, options = {}) {
+  const targetCtx = targetCanvas.getContext("2d");
+  const width = targetCanvas.width;
+  const height = targetCanvas.height;
+  const margin = { top: 42, right: 22, bottom: 42, left: 62 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const allY = seriesList.flatMap((series) => finiteValues(series.y));
+  const yAbs = Math.max(options.yLimit || 0, ...allY.map((value) => Math.abs(value)), 0.02);
+  const yMin = options.yMin ?? -yAbs * 1.12;
+  const yMax = options.yMax ?? yAbs * 1.12;
+  const span = yMax - yMin || 1;
+  const xValues = finiteValues(options.x || []);
+  const fallbackLength = Math.max(...seriesList.map((series) => series.y?.length || 0), 1);
+  const xMin = options.xMin ?? (xValues.length ? Math.min(...xValues) : 0);
+  const xMax = options.xMax ?? (xValues.length ? Math.max(...xValues) : fallbackLength - 1);
+  const xSpan = xMax - xMin || 1;
+
+  targetCtx.clearRect(0, 0, width, height);
+  targetCtx.fillStyle = "#f7fbfd";
+  targetCtx.fillRect(0, 0, width, height);
+
+  targetCtx.strokeStyle = "rgba(121, 147, 167, 0.18)";
+  targetCtx.lineWidth = 1;
+  for (let index = 0; index <= 5; index += 1) {
+    const x = margin.left + (plotWidth / 5) * index;
+    targetCtx.beginPath();
+    targetCtx.moveTo(x, margin.top);
+    targetCtx.lineTo(x, margin.top + plotHeight);
+    targetCtx.stroke();
+    const y = margin.top + (plotHeight / 4) * Math.min(index, 4);
+    if (index <= 4) {
+      targetCtx.beginPath();
+      targetCtx.moveTo(margin.left, y);
+      targetCtx.lineTo(margin.left + plotWidth, y);
+      targetCtx.stroke();
+    }
+  }
+
+  const zeroY = margin.top + plotHeight - ((0 - yMin) / span) * plotHeight;
+  targetCtx.strokeStyle = "rgba(16, 71, 111, 0.28)";
+  targetCtx.beginPath();
+  targetCtx.moveTo(margin.left, zeroY);
+  targetCtx.lineTo(margin.left + plotWidth, zeroY);
+  targetCtx.stroke();
+
+  targetCtx.fillStyle = "#173049";
+  targetCtx.font = "700 15px Segoe UI";
+  targetCtx.fillText(options.title || "", margin.left, 22);
+  targetCtx.fillStyle = "#6d8395";
+  targetCtx.font = "12px Segoe UI";
+  targetCtx.fillText(`${xMin.toFixed(2)}s`, margin.left, height - 12);
+  targetCtx.fillText(`${xMax.toFixed(2)}s`, margin.left + plotWidth - 34, height - 12);
+  targetCtx.fillText(`${yMax.toFixed(2)} mV`, 8, margin.top + 5);
+  targetCtx.fillText(`${yMin.toFixed(2)} mV`, 8, margin.top + plotHeight);
+
+  for (const series of seriesList) {
+    const y = Array.isArray(series.y) ? series.y : [];
+    if (!y.length) continue;
+    targetCtx.strokeStyle = series.color || "#0d697a";
+    targetCtx.globalAlpha = series.alpha ?? 1;
+    targetCtx.lineWidth = series.width || 1.4;
+    targetCtx.beginPath();
+    let hasStarted = false;
+    for (let index = 0; index < y.length; index += 1) {
+      const value = y[index];
+      if (!Number.isFinite(value)) continue;
+      const xValue = Array.isArray(series.x) && Number.isFinite(series.x[index])
+        ? series.x[index]
+        : Array.isArray(options.x) && Number.isFinite(options.x[index])
+          ? options.x[index]
+          : index;
+      const x = margin.left + ((xValue - xMin) / xSpan) * plotWidth;
+      const yPixel = margin.top + plotHeight - ((value - yMin) / span) * plotHeight;
+      if (!hasStarted) {
+        targetCtx.moveTo(x, yPixel);
+        hasStarted = true;
+      } else {
+        targetCtx.lineTo(x, yPixel);
+      }
+    }
+    targetCtx.stroke();
+    targetCtx.globalAlpha = 1;
+  }
+}
+
+function drawAnalysisModal(analysis) {
+  if (analysis?.error) {
+    resultTitle.textContent = "CH2 summary could not be computed";
+    resultSubtitle.textContent = analysis.error;
+  } else {
+    resultTitle.textContent = `Participant CH2 summary · ${Number(analysis.average_bpm || 0).toFixed(1)} BPM`;
+    resultSubtitle.textContent = `${analysis.kept_beat_count || 0} / ${analysis.raw_beat_count || 0} beats kept after standard-deviation filtering.`;
+  }
+
+  drawLineChart(
+    rawResultCanvas,
+    [{ y: analysis.raw_signal || [], x: analysis.raw_axis || [], color: "#0d697a", width: 1.1 }],
+    { title: "Raw 20-second CH2 signal", x: analysis.raw_axis || [], yLimit: fixedYLimitMv },
+  );
+
+  const beatStack = Array.isArray(analysis.beat_stack) ? analysis.beat_stack : [];
+  drawLineChart(
+    stackResultCanvas,
+    beatStack.map((beat) => ({ y: beat, x: analysis.epoch_axis || [], color: "#8a61b8", alpha: 0.28, width: 1 })),
+    { title: "Segmented beats from CH2 R-peaks", x: analysis.epoch_axis || [] },
+  );
+
+  drawLineChart(
+    meanResultCanvas,
+    [{ y: analysis.mean_beat || [], x: analysis.epoch_axis || [], color: "#d13f3f", width: 2.4 }],
+    { title: `Representative mean beat · ${Number(analysis.average_bpm || 0).toFixed(1)} BPM`, x: analysis.epoch_axis || [] },
+  );
+}
+
+async function resetCaptureCycle() {
+  try {
+    const response = await fetch("/api/ch2/reset_cycle", { method: "POST" });
+    const snapshot = await response.json();
+    updateUiFromSnapshot(snapshot);
+  } catch (error) {
+    console.error("Failed to reset capture cycle", error);
+  }
+}
+
+function showResultModal(analysis) {
+  window.clearTimeout(state.modalTimerId);
+  window.clearInterval(state.modalCountdownId);
+  drawAnalysisModal(analysis);
+  resultModal.classList.add("visible");
+  resultModal.setAttribute("aria-hidden", "false");
+  let secondsRemaining = 8;
+  resultCountdown.textContent = `${secondsRemaining}s`;
+  state.modalCountdownId = window.setInterval(() => {
+    secondsRemaining -= 1;
+    resultCountdown.textContent = `${Math.max(0, secondsRemaining)}s`;
+  }, 1000);
+  state.modalTimerId = window.setTimeout(async () => {
+    window.clearInterval(state.modalCountdownId);
+    resultModal.classList.remove("visible");
+    resultModal.setAttribute("aria-hidden", "true");
+    await resetCaptureCycle();
+  }, MODAL_VISIBLE_MS);
+}
+
 function updateUiFromSnapshot(snapshot) {
   state.previewCh2 = Array.isArray(snapshot?.channels?.CH2) ? snapshot.channels.CH2 : [];
   state.totalSamplesReceived = Number(snapshot?.total_samples_received || 0);
   state.totalPacketsReceived = Number(snapshot?.total_packets_received || 0);
-  samplesReceivedEl.textContent = state.totalSamplesReceived.toLocaleString();
-  chartMetaEl.textContent = `${Math.min(state.previewCh2.length, VISIBLE_SAMPLES).toLocaleString()} displayed · ${state.previewCh2.length.toLocaleString()} buffered · ${state.totalPacketsReceived.toLocaleString()} packets`;
+  if (Number.isFinite(Number(snapshot?.y_limit_mv))) {
+    fixedYLimitMv = Number(snapshot.y_limit_mv);
+    setControlValue(scaleSlider, fixedYLimitMv.toFixed(2));
+    if (scaleValueEl) scaleValueEl.textContent = `±${fixedYLimitMv.toFixed(2)} mV`;
+  }
+  if (Number.isFinite(Number(snapshot?.contact_std_min_mv))) {
+    setControlValue(stdMinInput, Number(snapshot.contact_std_min_mv).toFixed(3));
+  }
+  if (Number.isFinite(Number(snapshot?.contact_std_max_mv))) {
+    setControlValue(stdMaxInput, Number(snapshot.contact_std_max_mv).toFixed(3));
+  }
+  if (Number.isFinite(Number(snapshot?.contact_abs_mean_max_mv))) {
+    setControlValue(absMeanMaxInput, Number(snapshot.contact_abs_mean_max_mv).toFixed(1));
+  }
+  if (contactDebugEl) {
+    const std = Number(snapshot?.contact_std_mv || 0);
+    const stdMin = Number(snapshot?.contact_std_min_mv || 0);
+    const stdMax = Number(snapshot?.contact_std_max_mv || 0);
+    const absMean = Number(snapshot?.contact_abs_mean_mv || 0);
+    const absMeanMax = Number(snapshot?.contact_abs_mean_max_mv || 0);
+    contactDebugEl.textContent = `std ${std.toFixed(6)} in [${stdMin.toFixed(6)}, ${stdMax.toFixed(6)}] mV · |mean| ${absMean.toFixed(6)} / ${absMeanMax.toFixed(6)} mV`;
+  }
+
   const displayEnd = Math.max(0, state.previewCh2.length - DISPLAY_LAG_SAMPLES);
   const displayStart = Math.max(0, displayEnd - VISIBLE_SAMPLES);
   const displayedSamples = state.previewCh2.slice(displayStart, displayEnd);
   drawChart(displayedSamples);
+
+  if (snapshot?.capture_status === "analyzing") {
+    contactOverlay.classList.remove("visible");
+    updateCaptureProgress(20, "Computing CH2 summary...");
+  } else if (state.connected && snapshot?.capture_status !== "ready") {
+    if (snapshot?.contact_detected) {
+      contactOverlay.classList.remove("visible");
+      const captured = Number(snapshot?.capture_seconds || 0);
+      updateCaptureProgress(captured, "Stay connected");
+    } else {
+      contactOverlay.classList.add("visible");
+      updateCaptureProgress(0, "Connect LA RA RL");
+    }
+  } else {
+    contactOverlay.classList.remove("visible");
+    updateCaptureProgress(snapshot?.capture_status === "ready" ? 20 : 0, snapshot?.capture_status === "ready" ? "20s capture complete" : "Waiting for electrodes");
+  }
+
+  const analysis = snapshot?.analysis_result;
+  const analysisId = Number(analysis?.analysis_id || 0);
+  if (analysis && analysisId && analysisId !== state.lastShownAnalysisId) {
+    state.lastShownAnalysisId = analysisId;
+    showResultModal(analysis);
+  }
+}
+
+async function fetchHealthSnapshot() {
+  try {
+    const response = await fetch('/api/health');
+    const snapshot = await response.json();
+    if (response.ok && snapshot.ok) {
+      updateUiFromSnapshot(snapshot);
+    }
+  } catch (error) {
+    if (window.SHOWCASE_DEBUG) console.warn('[LIVE] health snapshot failed', error);
+  }
 }
 
 async function resetCsv() {
   const response = await fetch('/api/ch2/reset', { method: 'POST' });
   const snapshot = await response.json();
   updateUiFromSnapshot(snapshot);
+}
+
+async function updateConfig(patch) {
+  try {
+    const response = await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    const snapshot = await response.json();
+    if (!response.ok || !snapshot.ok) {
+      throw new Error(snapshot.error || "Config update failed");
+    }
+    updateUiFromSnapshot(snapshot);
+  } catch (error) {
+    console.error("Failed to update showcase config", error);
+  }
 }
 
 function bytesToHex(uint8) {
@@ -248,9 +510,9 @@ async function handleDisconnect(reason = 'Bluetooth disconnected') {
   state.device = null;
   state.characteristic = null;
   state.connected = false;
-  deviceNameEl.textContent = reason;
   setConnectionState('disconnected', 'Disconnected');
   disconnectOverlay.classList.add('visible');
+  contactOverlay.classList.remove('visible');
   connectButton.disabled = false;
   connectButton.textContent = 'Connect Device';
   clearFrontendState();
@@ -272,29 +534,67 @@ function startStallMonitor() {
     if (!state.connected || !state.lastPacketAt) {
       return;
     }
+    void fetchHealthSnapshot();
     if (performance.now() - state.lastPacketAt > STALL_TIMEOUT_MS) {
       void handleDisconnect('Signal stream timed out');
     }
   }, 1000);
 }
 
+async function connectGattWithRetries(device) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= CONNECT_RETRY_COUNT; attempt += 1) {
+    try {
+      logBle(`GATT connect attempt ${attempt}/${CONNECT_RETRY_COUNT}`, device.name || device.id);
+      setConnectionState('connecting', `Connecting ${attempt}/${CONNECT_RETRY_COUNT}...`);
+      connectButton.textContent = `Connecting ${attempt}/${CONNECT_RETRY_COUNT}...`;
+
+      const server = await device.gatt.connect();
+      if (!device.gatt.connected) {
+        throw new Error('GATT disconnected immediately after connect');
+      }
+
+      logBle('GATT connected. Retrieving ECG service...');
+      const service = await server.getPrimaryService(ECG_SERVICE_UUID);
+      logBle('ECG service found. Retrieving notify characteristic...');
+      const characteristic = await service.getCharacteristic(ECG_CHARACTERISTIC_UUID);
+      logBle('ECG characteristic found.');
+      return { server, service, characteristic };
+    } catch (error) {
+      lastError = error;
+      console.error(`[BLE] GATT setup attempt ${attempt} failed`, error);
+      try {
+        if (device.gatt?.connected) {
+          device.gatt.disconnect();
+        }
+      } catch (disconnectError) {
+        console.warn('[BLE] disconnect after failed attempt also failed', disconnectError);
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 700 * attempt));
+    }
+  }
+  throw lastError || new Error('Bluetooth GATT setup failed');
+}
+
 async function connectBluetooth() {
+  logBle('connectBluetooth start');
   connectButton.disabled = true;
   setConnectionState('connecting', 'Connecting...');
   connectButton.textContent = 'Connecting...';
 
   try {
-    await resetCsv();
-    clearFrontendState();
-
+    logBle('opening browser Bluetooth picker');
     const device = await navigator.bluetooth.requestDevice({
       acceptAllDevices: true,
       optionalServices: [ECG_SERVICE_UUID],
     });
-    const server = await device.gatt.connect();
-    const service = await server.getPrimaryService(ECG_SERVICE_UUID);
-    const characteristic = await service.getCharacteristic(ECG_CHARACTERISTIC_UUID);
+    await resetCsv();
+    clearFrontendState();
+
+    logBle('device selected', { name: device.name, id: device.id });
+    const { characteristic } = await connectGattWithRetries(device);
     await characteristic.startNotifications();
+    logBle('notifications started');
     characteristic.addEventListener('characteristicvaluechanged', handleNotification);
     device.addEventListener('gattserverdisconnected', onGattDisconnected);
 
@@ -302,10 +602,11 @@ async function connectBluetooth() {
     state.characteristic = characteristic;
     state.connected = true;
     state.lastPacketAt = performance.now();
-    deviceNameEl.textContent = device.name || 'Unnamed ECG device';
     setConnectionState('connected', 'Connected');
     connectButton.textContent = 'Connected';
     disconnectOverlay.classList.remove('visible');
+    contactOverlay.classList.add('visible');
+    updateCaptureProgress(0, 'Connect LA RA RL');
     startStallMonitor();
   } catch (error) {
     console.error(error);
@@ -314,12 +615,50 @@ async function connectBluetooth() {
 }
 
 connectButton.addEventListener('click', async () => {
+  logBle('connect button clicked', {
+    connected: state.connected,
+    bluetoothAvailable: Boolean(navigator.bluetooth),
+  });
   if (!navigator.bluetooth) {
     window.alert('Web Bluetooth is not available in this browser. Use Chrome or Edge on localhost.');
     return;
   }
   if (!state.connected) {
     await connectBluetooth();
+  }
+});
+
+stdMinInput?.addEventListener("change", () => {
+  const value = Number(stdMinInput.value);
+  if (Number.isFinite(value)) {
+    void updateConfig({ contact_std_min_mv: value });
+  }
+});
+
+stdMaxInput?.addEventListener("change", () => {
+  const value = Number(stdMaxInput.value);
+  if (Number.isFinite(value)) {
+    void updateConfig({ contact_std_max_mv: value });
+  }
+});
+
+absMeanMaxInput?.addEventListener("change", () => {
+  const value = Number(absMeanMaxInput.value);
+  if (Number.isFinite(value)) {
+    void updateConfig({ contact_abs_mean_max_mv: value });
+  }
+});
+
+scaleSlider?.addEventListener("input", () => {
+  fixedYLimitMv = Number(scaleSlider.value);
+  scaleValueEl.textContent = `±${fixedYLimitMv.toFixed(2)} mV`;
+  drawChart(state.previewCh2.slice(Math.max(0, state.previewCh2.length - DISPLAY_LAG_SAMPLES - VISIBLE_SAMPLES), Math.max(0, state.previewCh2.length - DISPLAY_LAG_SAMPLES)));
+});
+
+scaleSlider?.addEventListener("change", () => {
+  const value = Number(scaleSlider.value);
+  if (Number.isFinite(value)) {
+    void updateConfig({ y_limit_mv: value });
   }
 });
 

@@ -17,6 +17,26 @@
           </p>
         </div>
         <div class="topbar-controls">
+          <label class="control-card">
+            <span>Min STD</span>
+            <input id="std-min-input" type="number" step="0.001" value="0.020" />
+            <small>mV over 3s</small>
+          </label>
+          <label class="control-card">
+            <span>Max STD</span>
+            <input id="std-max-input" type="number" step="0.01" value="1.0" />
+            <small>mV over 3s</small>
+          </label>
+          <label class="control-card">
+            <span>Max abs mean</span>
+            <input id="abs-mean-max-input" type="number" step="0.1" value="1.5" />
+            <small>|mean| mV over 3s</small>
+          </label>
+          <label class="control-card scale-control">
+            <span>Graph scale</span>
+            <input id="scale-slider" type="range" min="0.1" max="5.0" step="0.1" value="0.5" />
+            <small id="scale-value">±0.50 mV</small>
+          </label>
           <div class="status-chip" id="connection-chip" data-state="disconnected">Disconnected</div>
           <button class="route-action-button connect-button" id="connect-button" type="button">Connect Device</button>
         </div>
@@ -27,18 +47,29 @@
           <div class="card-header">
             <div>
               <h2>Lead CH2 live waveform</h2>
-              <p>Displayed using NeuroKit's `ecg_clean(..., method=&quot;neurokit&quot;)` on the full rolling CH2 buffer before plotting.</p>
-              <p>
-                <span id="device-name">Not connected</span>
-                ·
-                <span id="samples-received">0</span> samples received
-                · 2500 displayed · 5000 buffered · 500-sample delay
-              </p>
             </div>
-            <span id="chart-meta">Waiting for signal...</span>
+            <div class="chart-status">
+              <div class="capture-progress" aria-label="20 second capture progress">
+                <div class="capture-progress-topline">
+                  <span id="capture-countdown">Waiting for electrodes</span>
+                  <span id="capture-progress-value">0.0s / 20.0s</span>
+                </div>
+                <div class="capture-progress-track">
+                  <div class="capture-progress-fill" id="capture-progress-fill"></div>
+                </div>
+              </div>
+              <span id="contact-debug">std -- in [--, --] mV · |mean| -- / -- mV</span>
+            </div>
           </div>
           <div class="canvas-shell">
             <canvas id="live-canvas" width="1067" height="390" class="live-canvas live-waveform-canvas"></canvas>
+            <div class="contact-overlay" id="contact-overlay">
+              <div class="overlay-card">
+                <p class="eyebrow">Ready for participant</p>
+                <h3>Connect LA RA RL</h3>
+                <p>Hold the limb leads steadily. The 20-second capture starts automatically once CH2 activity is detected.</p>
+              </div>
+            </div>
             <div class="disconnect-overlay" id="disconnect-overlay">
               <div class="overlay-card">
                 <p class="eyebrow">Signal unavailable</p>
@@ -50,6 +81,33 @@
         </div>
       </section>
     </main>
+
+    <div class="result-modal" id="result-modal" aria-hidden="true">
+      <div class="result-modal-card">
+        <div class="result-modal-header">
+          <div>
+            <p class="eyebrow">20-second CH2 capture complete</p>
+            <h2 id="result-title">Participant CH2 summary</h2>
+            <p id="result-subtitle">Showing the computed signal summary for 8 seconds.</p>
+          </div>
+          <div class="result-countdown" id="result-countdown">8s</div>
+        </div>
+        <div class="result-grid">
+          <article>
+            <h3>Raw 20s CH2 signal</h3>
+            <canvas id="raw-result-canvas" width="520" height="360"></canvas>
+          </article>
+          <article>
+            <h3>Segmented heartbeat stack</h3>
+            <canvas id="stack-result-canvas" width="520" height="360"></canvas>
+          </article>
+          <article>
+            <h3>Representative mean beat</h3>
+            <canvas id="mean-result-canvas" width="520" height="360"></canvas>
+          </article>
+        </div>
+      </div>
+    </div>
 
     <script type="module" src="/static/app.js"></script>
   </body>
