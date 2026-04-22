@@ -21,9 +21,11 @@ struct ADS1298_Sample;
 inline void ledOn()  { digitalWrite(LED_BUILTIN, LOW); }
 inline void ledOff() { digitalWrite(LED_BUILTIN, HIGH); }
 
+// Timing varaibles
 unsigned long lastBlinkMs = 0;
 const unsigned long ADV_BLINK_MS  = 500;
 const unsigned long FAIL_BLINK_MS = 100;
+const unsigned long WAKE_MS = 2000;
 int T_DEBOUNCE = 3000;
 
 // For LED
@@ -32,6 +34,7 @@ const unsigned long LED_ON_DURATION_MS = 5000;
 unsigned long BTN_PRESS_MS = 0;
 bool BTN_PRESSED = false;
 bool LED_ON = false;
+int NUM_PIXELS = 6;
 
 void blinkNonBlocking(unsigned long intervalMs){
   unsigned long now = millis();
@@ -124,11 +127,15 @@ ADS1298_Sample readData();
 void drdyInterrupt();
 void enableTestSignal();
 void disableTestSignal();
-void updateLED(int PIN);
+void updateLED();
+void startUpLED(float brightness, int Delay, int duration, float Decay);
 void goToDeepSleep();
 void enqueueSample(const ADS1298_Sample& sample);
 void write24(uint8_t* p, int32_t v);
 void printStats();
+float batteryRead(int PIN);
+void checkBatt();
+void blinkLED(int time);
 
 // ======================================================
 // BLE
@@ -144,6 +151,7 @@ static const int SAMPLES_PER_PACKET = 25;
 static const uint32_t packetIntervalUs =
   (uint32_t)(1000000.0f * SAMPLES_PER_PACKET / sampleRateHz);
 uint32_t lastSendUs = 0;
+unsigned long previousTime = 0;
 
 // ======================================================
 // DEBUG PRINT (periodic stats)
@@ -157,11 +165,11 @@ uint32_t droppedSamplesTotal = 0;
 uint32_t lastStatsMs = 0;
 
 // ======================================================
-// PACKETIZER (single status + CH2 + CH3 + CH4)
+// PACKETIZER (single status + CH2 + CH3 + CH4 + timestamp)
 // ======================================================
 #define ECG_PACKET_SAMPLES 25
 #define ECG_SIGNALS 3
-#define ECG_PACKET_BYTES ((1 + (ECG_PACKET_SAMPLES * ECG_SIGNALS)) * 3)
+#define ECG_PACKET_BYTES ((1 + (ECG_PACKET_SAMPLES * ECG_SIGNALS) + 1) * 3)
 
 void write24(uint8_t* p, int32_t v){
   p[0] = (v >> 16) & 0xFF;
@@ -200,6 +208,12 @@ void packetizerBuild(uint8_t* out){
     p += 3;
     idx = (idx + 1) % RING_CAPACITY;
   }
+
+  // Add elapsed time for this packet in milliseconds.
+  uint32_t nowMs = millis();
+  write24(p, (int32_t)(nowMs - previousTime));
+  previousTime = nowMs;
+  p += 3;
 }
 
 void enqueueSample(const ADS1298_Sample& sample){
@@ -247,8 +261,20 @@ void printStats(){
 // SETUP
 // ======================================================
 void setup() {
+  checkBatt();
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(PIN_BTN, INPUT_PULLUP);
+  
+  // If on button not held, turn off
+  bool exitLoop = false;
+  unsigned long exitTime = millis() + WAKE_MS;
+  while(digitalRead(PIN_BTN) == LOW){
+    if(millis()>exitTime){
+      startUpLED(150.0, 55, 19, 0.4);
+      break;
+    }
+  }
+  if(millis()<exitTime) goToDeepSleep();
   ledOff();
 
   Serial.begin(115200);
@@ -303,6 +329,9 @@ void setup() {
 
   // ---- LED init ----
   strip.begin();
+
+  // Set start of 1st sample
+  previousTime = millis();
 }
 
 void loop() {
@@ -397,12 +426,11 @@ void loop() {
       BTN_PRESSED = true;
       BTN_PRESS_MS = millis();
       LED_ON = true;
-      updateLED(PIN_ADC);
+      updateLED();
     }
     if((millis()-BTN_PRESS_MS)>=T_DEBOUNCE){
       NRF_GPIOTE->EVENTS_PORT = 0;
-      strip.clear();
-      strip.show();
+      shutdownLED(150.0, 55, 19, 0.4);
       while(digitalRead(PIN_BTN) == LOW);// Wait for button release
       delay(250);
       goToDeepSleep();
@@ -448,6 +476,7 @@ bool initADS1298() {
   Serial.println("  ✓ Assuming VCAP1 >= 1.1V");
 
   Serial.println("\nStep 2: Issue Reset Pulse");
+  sendCommand(ADS1298_CMD_WAKEUP); //In the event it's on Standby
   digitalWrite(PIN_PWDN, LOW);
   delayMicroseconds(T_RESET_PULSE);
   digitalWrite(PIN_PWDN, HIGH);
@@ -483,22 +512,13 @@ bool initADS1298() {
     writeRegister(ADS1298_REG_CH1SET + ch, 0x00);
   }
 
-  Serial.println("  • Configuring Wilson Central Terminal (WCT)...");
-  Serial.println("    WCT1 (0x18): Power up WCTA, route CH2P");
-  Serial.println("    WCT2 (0x19): Power up WCTB and WCTC, route CH2N and CH3P");// WCT1 (Address 0x18):
-  
-  // Bit 7-4: aVF_CH6, aVL_CH5, aVR_CH7, aVR_CH4 = 0000 (not used)
-  // Bit 3: PD_WCTA = 0 (power up WCTA)
-  // Bits 2-0: WCTA[2:0] = 011 (route CH2P to WCTA)
-  // = 0b00000011 = 0x03
-  writeRegister(ADS1298_REG_WCT1, 0x0A);// WCT2 (Address 0x19):
-  
-  // Bit 7: PD_WCTC = 0 (power up WCTC)
-  // Bit 6: PD_WCTB = 0 (power up WCTB)
-  // Bits 5-3: WCTC[2:0] = 101 (route CH3P to WCTC)
-  // Bits 2-0: WCTB[2:0] = 010 (route CH2N to WCTB)
-  // = 0b00101010 = 0x2A
-  writeRegister(ADS1298_REG_WCT2, 0xE3);
+  Serial.println("Configuring Wilson Central Terminal (WCT)");
+  // WCT settings: All three amplifiers turned on
+  // Amplifier A to CH2 Positive (LA)
+  // Amplifier B to CH2 Negative (RA)
+  // Amplifier C to CH3 Positive (LL)
+  writeRegister(ADS1298_REG_WCT1, 0x0A);
+  writeRegister(ADS1298_REG_WCT2, 0xDC);
 
   delay(10);
   Serial.println("  ✓ All registers configured");
@@ -681,6 +701,9 @@ void goToDeepSleep() {
   
   // Turn LED OFF
   digitalWrite(LED_BUILTIN, HIGH);
+
+  // Set Analog front-end to standby to save power
+  sendCommand(ADS1298_CMD_STANDBY);
   
   // Disable Serial to save power
   Serial.flush();
@@ -697,17 +720,92 @@ void goToDeepSleep() {
 }
 
 // ============================================================================
+// Battery helper function
+// ============================================================================
+
+float batteryRead(){
+  int value = analogRead(PIN_ADC);
+  float voltage = value * (3.6/ 1024.0); // 3.6V refrence voltage 10bit ADC (1023)
+  float fillPercent = ((voltage*2.6) - 6.4)/2; // 0-1
+  return fillPercent;
+}
+
+void checkBatt(){
+  if (batteryRead()<0.05){
+    blinkLED(300);
+    goToDeepSleep();
+  } 
+}
+
+// ============================================================================
 // LED helper function
 // ============================================================================
 
-void updateLED(int PIN){
-  int value = analogRead(PIN); // Number between 0-255
-  float bar = 167; //Threshold before it goes to the next bar
+void updateLED(){
+  float value = batteryRead();
   strip.clear();
-  for (int i = 0; i < 6; i++) {
-    if(value>=i*bar){
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    if(value*6>i){
       strip.setPixelColor(i, strip.Color(127, 0, 0));
     }
   }
+  strip.show();
+}
+
+void startUpLED(float brightness, int Delay, int duration, float Decay){
+  for (int j = 0; j < duration; j++){
+    // for loop for 1 frame
+    for (int i = 0; i < NUM_PIXELS; i++) {
+      if(j>=i){
+        int temp = brightness*pow(Decay, (float)(j-i));
+        strip.setPixelColor(i, strip.Color(temp,temp,temp));
+      }else{
+        strip.setPixelColor(i, strip.Color(0,0,0));
+      }
+    }
+    strip.show();
+    delay(Delay);
+  }
+}
+
+void shutdownLED(float brightness, int Delay, int duration, float Decay){
+  for (int j = 0; j < duration; j++){
+    // for loop for 1 frame
+    for (int i = 0; i < NUM_PIXELS; i++) {
+      if(j>=i){
+        int temp = brightness*pow(Decay, (float)(j-i));
+        strip.setPixelColor(i, strip.Color(temp,0,0));
+      }else{
+        strip.setPixelColor(i, strip.Color(0,0,0));
+      }
+    }
+    strip.show();
+    delay(Delay);
+  }
+}
+
+void blinkLED(int time){
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    if (i == 0) strip.setPixelColor(i, strip.Color(50, 0, 0));
+    else strip.setPixelColor(i, strip.Color(0, 0, 0));
+  }
+  strip.show();
+  delay(time);
+  strip.clear();
+  strip.show();
+  delay(time);
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    if (i == 0) strip.setPixelColor(i, strip.Color(50, 0, 0));
+    else strip.setPixelColor(i, strip.Color(0, 0, 0));
+  }
+  strip.show();
+  delay(time);
+  strip.clear();
+  strip.show();
+}
+
+void leadStatusLED(){
+  // Get the status
+  // Write to LED
   strip.show();
 }

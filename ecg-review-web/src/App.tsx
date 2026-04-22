@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 type ReviewMeta = {
   object_key: string;
@@ -42,41 +42,80 @@ type ReviewIntervalRow = {
   ECG_Rate_Mean: number | null;
 };
 
-type ReviewSection = {
-  meta: ReviewMeta;
-  signal: {
-    full: number[];
-    r_peaks: number[];
-    markers: {
-      P: number[];
-      Q: number[];
-      R: number[];
-      S: number[];
-      T: number[];
-    };
+type ReviewSignal = {
+  full: number[];
+  r_peaks: number[];
+  markers: {
+    P: number[];
+    Q: number[];
+    R: number[];
+    S: number[];
+    T: number[];
   };
+};
+
+type ReviewSectionSummary = {
   beats: {
     count: number;
     items: ReviewBeat[];
   };
+  meta: ReviewMeta;
   beat_count_total: number;
   beat_count_included: number;
   beat_count_excluded: number;
   excluded_reason_counts: Record<string, number>;
+  window_count: number;
+  interval_related: ReviewIntervalRow | null;
+  interval_related_rows: ReviewIntervalRow[];
+};
+
+type ReviewWindowSection = {
+  meta: ReviewMeta;
+  signal: ReviewSignal;
+  beats: {
+    count: number;
+    items: ReviewBeat[];
+  };
   window_index: number;
   window_count: number;
   window_start_sample: number;
   window_end_sample: number;
   interval_related: ReviewIntervalRow | null;
-  interval_related_rows: ReviewIntervalRow[];
 };
 
-type ReviewResponse = {
+type ReviewSummaryResponse = {
   record_id: string;
   channel: "CH2" | "CH3" | "CH4";
   sample_rate_hz: number;
-  calibration: ReviewSection;
-  session: ReviewSection;
+  calibration: ReviewSectionSummary;
+  session: ReviewSectionSummary;
+};
+
+type ReviewWindowResponse = {
+  record_id: string;
+  channel: "CH2" | "CH3" | "CH4";
+  sample_rate_hz: number;
+  section: "calibration" | "session";
+  window: ReviewWindowSection;
+};
+
+type ReviewProcessingJob = {
+  job_id: string;
+  status: string;
+  record_id: string;
+  details?: {
+    resample?: boolean;
+  };
+  error?: string | null;
+};
+
+type ReviewArtifactsNotReadyDetail = {
+  code: string;
+  record_id: string;
+  channel: string;
+  processed_status?: string | null;
+  artifact_key?: string | null;
+  processing_version?: string | null;
 };
 
 type VectorBeatResponse = {
@@ -138,12 +177,42 @@ type LiveVisualResponse = {
   };
 };
 
+type StaticReviewWindow = {
+  window_index: number;
+  start_sec: number;
+  end_sec: number;
+  status: "ready" | "error" | string;
+  error?: string;
+  images: Partial<Record<"ch2" | "ch3" | "ch4" | "frontal" | "transverse" | "sagittal" | "vcg3d", string>>;
+};
+
+type StaticReviewManifest = {
+  record_id: string;
+  status: "running" | "ready" | "error" | string;
+  processing_version: string;
+  sample_rate_hz: number;
+  window_seconds: number;
+  total_window_count: number;
+  target_window_count: number;
+  completed_window_count: number;
+  windows: StaticReviewWindow[];
+  updated_at?: string;
+  error?: string;
+};
+
+type StaticReviewJob = {
+  job_id: string;
+  status: string;
+  record_id: string;
+  details?: Record<string, unknown>;
+  error?: string | null;
+};
+
 const CHANNELS = ["CH2", "CH3", "CH4"] as const;
 const REVIEW_MODES = ["CH2", "CH3", "CH4", "2D Vectorcardiography", "3D Vectorgraphy"] as const;
 const DEFAULT_ECG_Y_MAX_MV = 0.6;
 const DEFAULT_ECG_Y_MIN_MV = -0.3;
-const LIVE_VISUAL_BUFFER_SAMPLES = 6000;
-const LIVE_FETCH_INTERVAL_MS = 500;
+const LIVE_VISUAL_BUFFER_SAMPLES = 1000;
 const BEAT_MARKER_COLORS: Record<keyof BeatMarkers, string> = {
   P: "#1f7aec",
   Q: "#9a3412",
@@ -201,6 +270,20 @@ function createPath(
   return { path, min, max };
 }
 
+function downsampleForPlot(points: number[], targetCount: number): number[] {
+  if (targetCount <= 0 || points.length <= targetCount) {
+    return points;
+  }
+  if (targetCount === 1) {
+    return [points[0]];
+  }
+  const lastIndex = points.length - 1;
+  return Array.from({ length: targetCount }, (_, index) => {
+    const sourceIndex = Math.round((index * lastIndex) / (targetCount - 1));
+    return points[sourceIndex];
+  });
+}
+
 function createTicks(min: number, max: number, count: number): number[] {
   if (count <= 1) {
     return [min];
@@ -222,11 +305,65 @@ function formatAxisValue(value: number): string {
   return value.toFixed(2);
 }
 
-function getBeatSamples(fullSignal: number[], beat: ReviewBeat | null): number[] {
+function getFiniteRange(values: number[]): { min: number; max: number } | null {
+  const finite = values.filter((value) => Number.isFinite(value));
+  if (!finite.length) {
+    return null;
+  }
+  let min = finite[0];
+  let max = finite[0];
+  for (let index = 1; index < finite.length; index += 1) {
+    const value = finite[index];
+    if (value < min) min = value;
+    if (value > max) max = value;
+  }
+  if (Math.abs(max - min) < 1e-9) {
+    const padding = Math.max(Math.abs(max) * 0.1, 0.05);
+    return { min: min - padding, max: max + padding };
+  }
+  const padding = Math.max((max - min) * 0.08, 0.05);
+  return { min: min - padding, max: max + padding };
+}
+
+function getCombinedFiniteRange(...seriesList: number[][]): { min: number; max: number } | null {
+  const combined: number[] = [];
+  seriesList.forEach((series) => {
+    combined.push(...series);
+  });
+  return getFiniteRange(combined);
+}
+
+function getSymmetricFiniteRange(...seriesList: number[][]): { min: number; max: number } | null {
+  const combined = getCombinedFiniteRange(...seriesList);
+  if (!combined) {
+    return null;
+  }
+  const maxAbs = Math.max(Math.abs(combined.min), Math.abs(combined.max), 0.05);
+  const padded = maxAbs * 1.1;
+  return {
+    min: -padded,
+    max: padded,
+  };
+}
+
+function getVectorBeatRange(data: VectorBeatResponse | null): { min: number; max: number } | null {
+  if (!data) {
+    return null;
+  }
+  return getSymmetricFiniteRange(data.lead_x, data.lead_y, data.lead_z);
+}
+
+function getBeatSamplesForWindow(
+  fullSignal: number[],
+  beat: ReviewBeat | null,
+  windowStartSample: number,
+): number[] {
   if (!beat) {
     return [];
   }
-  return fullSignal.slice(Math.max(0, beat.start_sample - 1), Math.max(0, beat.end_sample));
+  const startIndex = Math.max(0, beat.start_sample - windowStartSample);
+  const endIndex = Math.max(0, beat.end_sample - windowStartSample + 1);
+  return fullSignal.slice(startIndex, endIndex);
 }
 
 function createVectorLoopGeometry(
@@ -262,67 +399,22 @@ function createVectorLoopGeometry(
   };
 }
 
-function projectVector3DPoint(
-  x: number,
-  y: number,
-  z: number,
-  width: number,
-  height: number,
-  axisMin: number,
-  axisMax: number,
-): { x: number; y: number; depth: number } {
-  const span = axisMax - axisMin || 1;
-  const center = (axisMin + axisMax) / 2;
-  const normalizedX = (x - center) / span;
-  const normalizedY = (y - center) / span;
-  const normalizedZ = (z - center) / span;
-  const yaw = -Math.PI / 4;
-  const pitch = Math.PI / 7;
-
-  const x1 = normalizedX * Math.cos(yaw) + normalizedZ * Math.sin(yaw);
-  const z1 = -normalizedX * Math.sin(yaw) + normalizedZ * Math.cos(yaw);
-  const y1 = normalizedY * Math.cos(pitch) - z1 * Math.sin(pitch);
-  const z2 = normalizedY * Math.sin(pitch) + z1 * Math.cos(pitch);
-  const perspective = 1 / (1 + z2 * 0.6);
-  const scale = Math.min(width, height) * 1.65;
-
-  return {
-    x: width / 2 + x1 * scale * perspective,
-    y: height / 2 - y1 * scale * perspective,
-    depth: z2,
-  };
-}
-
-function blendRollingBuffer(previous: number[], current: number[], shiftSamples: number): number[] {
-  if (!current.length) {
-    return [];
-  }
-  if (!previous.length || previous.length !== current.length) {
-    return current;
-  }
-  const boundedShift = Math.min(Math.max(Math.round(shiftSamples), 0), current.length);
-  if (boundedShift <= 0) {
-    return previous;
-  }
-  if (boundedShift >= current.length) {
-    return current;
-  }
-  return previous.slice(boundedShift).concat(current.slice(current.length - boundedShift));
-}
-
-function TopNav({ currentPath }: { currentPath: string }) {
+function TopNav({ currentPath, extra }: { currentPath: string; extra?: ReactNode }) {
   return (
-    <nav className="route-nav">
-      <a href="/" className={currentPath === "/" ? "route-link active" : "route-link"}>
-        Review
-      </a>
-      <a
-        href="/session"
-        className={currentPath.startsWith("/session") ? "route-link active" : "route-link"}
-      >
-        Live Session
-      </a>
-    </nav>
+    <div className="route-nav-row">
+      <nav className="route-nav">
+        <a href="/" className={currentPath === "/" ? "route-link active" : "route-link"}>
+          Review
+        </a>
+        <a
+          href="/session"
+          className={currentPath.startsWith("/session") ? "route-link active" : "route-link"}
+        >
+          Live Session
+        </a>
+      </nav>
+      {extra ? <div className="route-nav-extra">{extra}</div> : null}
+    </div>
   );
 }
 
@@ -350,9 +442,13 @@ function FullSignalChart({
   const margin = { top: 12, right: 18, bottom: 52, left: 64 };
   const plotWidth = width - margin.left - margin.right;
   const plotHeight = height - margin.top - margin.bottom;
+  const displayedSamples = useMemo(
+    () => downsampleForPlot(samples, Math.max(200, Math.floor(plotWidth))),
+    [samples, plotWidth],
+  );
   const { path, min, max } = useMemo(
-    () => createPath(samples, plotWidth, plotHeight, yMin, yMax),
-    [samples, plotWidth, plotHeight, yMin, yMax],
+    () => createPath(displayedSamples, plotWidth, plotHeight, yMin, yMax),
+    [displayedSamples, plotWidth, plotHeight, yMin, yMax],
   );
   const xTickCount = 9;
   const yTicks = createTicks(yMin, yMax, 5);
@@ -375,7 +471,7 @@ function FullSignalChart({
           <h3>{title}</h3>
           {subtitle ? <span className="chart-subtitle">{subtitle}</span> : null}
         </div>
-        <span>{samples.length} samples</span>
+        <span>{`${samples.length} samples${displayedSamples.length !== samples.length ? ` | plotted ${displayedSamples.length}` : ""}`}</span>
       </div>
       <svg viewBox={`0 0 ${width} ${height}`} className="signal-chart">
         {Array.from({ length: xTickCount }, (_, index) => {
@@ -433,14 +529,10 @@ function LiveWaveformCanvas({
   title,
   samples,
   sampleRateHz,
-  yMin,
-  yMax,
 }: {
   title: string;
   samples: number[];
   sampleRateHz: number;
-  yMin: number;
-  yMax: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -455,6 +547,9 @@ function LiveWaveformCanvas({
     const margin = { top: 18, right: 14, bottom: 36, left: 44 };
     const plotWidth = width - margin.left - margin.right;
     const plotHeight = height - margin.top - margin.bottom;
+    const range = getFiniteRange(samples) ?? { min: -1, max: 1 };
+    const yMin = range.min;
+    const yMax = range.max;
     const span = yMax - yMin || 1;
     const zeroY = margin.top + plotHeight - ((0 - yMin) / span) * plotHeight;
 
@@ -520,7 +615,7 @@ function LiveWaveformCanvas({
       }
     });
     ctx.stroke();
-  }, [samples, sampleRateHz, yMin, yMax]);
+  }, [samples, sampleRateHz]);
 
   return (
     <section className="live-quadrant-card">
@@ -529,87 +624,6 @@ function LiveWaveformCanvas({
         <span>{samples.length} samples</span>
       </div>
       <canvas ref={canvasRef} width={720} height={180} className="live-canvas live-waveform-canvas" />
-    </section>
-  );
-}
-
-function LiveVector3DCanvas({
-  xSamples,
-  ySamples,
-  zSamples,
-  yMin,
-  yMax,
-}: {
-  xSamples: number[];
-  ySamples: number[];
-  zSamples: number[];
-  yMin: number;
-  yMax: number;
-}) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const width = canvas.width;
-    const height = canvas.height;
-    ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = "#f7fbfd";
-    ctx.fillRect(0, 0, width, height);
-
-    const project = (x: number, y: number, z: number) =>
-      projectVector3DPoint(x, y, z, width, height, yMin, yMax);
-    const axes = [
-      { from: [yMin, 0, 0] as const, to: [yMax, 0, 0] as const, color: "#dc2626" },
-      { from: [0, yMin, 0] as const, to: [0, yMax, 0] as const, color: "#2563eb" },
-      { from: [0, 0, yMin] as const, to: [0, 0, yMax] as const, color: "#16a34a" },
-    ];
-
-    axes.forEach((axis) => {
-      const from = project(axis.from[0], axis.from[1], axis.from[2]);
-      const to = project(axis.to[0], axis.to[1], axis.to[2]);
-      ctx.strokeStyle = axis.color;
-      ctx.globalAlpha = 0.68;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(from.x, from.y);
-      ctx.lineTo(to.x, to.y);
-      ctx.stroke();
-      ctx.globalAlpha = 1;
-    });
-
-    const count = Math.min(xSamples.length, ySamples.length, zSamples.length);
-    if (!count) {
-      ctx.fillStyle = "#6d8395";
-      ctx.font = "13px Segoe UI";
-      ctx.fillText("Waiting for live vector data...", 22, height / 2);
-      return;
-    }
-
-    ctx.strokeStyle = "#0d697a";
-    ctx.lineWidth = 1.6;
-    ctx.beginPath();
-    for (let index = 0; index < count; index += 1) {
-      const point = project(xSamples[index], ySamples[index], zSamples[index]);
-      if (index === 0) {
-        ctx.moveTo(point.x, point.y);
-      } else {
-        ctx.lineTo(point.x, point.y);
-      }
-    }
-    ctx.stroke();
-  }, [xSamples, ySamples, zSamples, yMin, yMax]);
-
-  return (
-    <section className="live-quadrant-card live-vector-card">
-      <div className="card-header">
-        <h3>3D Vectorcardiography</h3>
-        <span>{Math.min(xSamples.length, ySamples.length, zSamples.length)} samples</span>
-      </div>
-      <canvas ref={canvasRef} width={720} height={720} className="live-canvas live-vector-canvas" />
     </section>
   );
 }
@@ -1216,7 +1230,8 @@ function Vector3DReviewSection({
 
 function ReviewSectionCard({
   title,
-  section,
+  summary,
+  window,
   sampleRateHz,
   beatIndex,
   yMin,
@@ -1224,17 +1239,26 @@ function ReviewSectionCard({
   onBeatIndexChange,
 }: {
   title: string;
-  section: ReviewSection;
+  summary: ReviewSectionSummary;
+  window: ReviewWindowSection | null;
   sampleRateHz: number;
   beatIndex: number;
   yMin: number;
   yMax: number;
   onBeatIndexChange: (value: number) => void;
 }) {
-  const beat = section.beats.items.find((item) => item.index === beatIndex) ?? section.beats.items[0] ?? null;
-  const beatSamples = useMemo(() => getBeatSamples(section.signal.full, beat), [section.signal.full, beat]);
-  const highlightStart = beat ? Math.max(0, beat.start_sample - 1) : null;
-  const highlightEnd = beat ? beat.end_sample : null;
+  const beat = window?.beats.items.find((item) => item.index === beatIndex) ?? window?.beats.items[0] ?? null;
+  const windowSamples = window?.signal.full ?? [];
+  const displayWindowStart = window?.window_start_sample ?? 1;
+  const displayWindowEnd = window?.window_end_sample ?? Math.min(summary.meta.sample_count, sampleRateHz * 10);
+  const beatSamples = useMemo(
+    () => getBeatSamplesForWindow(windowSamples, beat, displayWindowStart),
+    [windowSamples, beat, displayWindowStart],
+  );
+  const highlightStart =
+    beat && beat.start_sample >= displayWindowStart ? beat.start_sample - displayWindowStart : null;
+  const highlightEnd =
+    beat && beat.end_sample >= displayWindowStart ? beat.end_sample - displayWindowStart : null;
 
   return (
     <section className="review-section">
@@ -1242,21 +1266,22 @@ function ReviewSectionCard({
         <div>
           <h2>{title}</h2>
           <p className="meta-line">
-            object_key={section.meta.object_key} | byte_length={section.meta.byte_length} | sample_count={section.meta.sample_count}
-            {` | included_beats=${section.beat_count_included}/${section.beat_count_total}`}
+            object_key={summary.meta.object_key} | byte_length={summary.meta.byte_length} | sample_count={summary.meta.sample_count}
+            {` | included_beats=${summary.beat_count_included}/${summary.beat_count_total}`}
           </p>
         </div>
       </div>
       <div className="section-grid">
         <div className="signal-column">
           <FullSignalChart
-            title={`${title} Full Signal`}
-            samples={section.signal.full}
+            title={`${title} 10s Window`}
+            samples={windowSamples}
             sampleRateHz={sampleRateHz}
             yMin={yMin}
             yMax={yMax}
             highlightStart={highlightStart}
             highlightEnd={highlightEnd}
+            subtitle={`Samples ${displayWindowStart}-${displayWindowEnd} | Window ${window?.window_index ?? 1} of ${summary.window_count}`}
           />
         </div>
         <div className="beat-column">
@@ -1264,7 +1289,7 @@ function ReviewSectionCard({
             title={`${title} Heartbeat`}
             beat={beat}
             samples={beatSamples}
-            beatCount={section.beats.count}
+            beatCount={summary.beats.count}
             sampleRateHz={sampleRateHz}
             yMin={yMin}
             yMax={yMax}
@@ -1281,13 +1306,13 @@ function ReviewSectionCard({
               <input
                 type="number"
                 min={1}
-                max={Math.max(section.beats.count, 1)}
+                max={Math.max(summary.beats.count, 1)}
                 value={beat?.index ?? beatIndex}
                 onChange={(event) =>
                   onBeatIndexChange(
                     Math.min(
                       Math.max(Number(event.target.value) || 1, 1),
-                      Math.max(section.beats.count, 1),
+                      Math.max(summary.beats.count, 1),
                     ),
                   )
                 }
@@ -1295,10 +1320,10 @@ function ReviewSectionCard({
             </label>
             <button
               className="window-button"
-              disabled={!beat || beat.index >= section.beats.count}
+              disabled={!beat || beat.index >= summary.beats.count}
               onClick={() =>
                 onBeatIndexChange(
-                  Math.min(section.beats.count, (beat?.index ?? section.beats.count) + 1),
+                  Math.min(summary.beats.count, (beat?.index ?? summary.beats.count) + 1),
                 )
               }
             >
@@ -1312,43 +1337,43 @@ function ReviewSectionCard({
         <div className="card-header">
           <h3>Interval-Related Analysis</h3>
         </div>
-        <IntervalSummary row={section.interval_related} />
+        <IntervalSummary row={window?.interval_related ?? summary.interval_related} />
       </div>
     </section>
   );
 }
 
 function SessionReviewCard({
-  section,
+  summary,
+  window,
   sampleRateHz,
   beatIndex,
   yMin,
   yMax,
   onBeatIndexChange,
 }: {
-  section: ReviewSection;
+  summary: ReviewSectionSummary;
+  window: ReviewWindowSection | null;
   sampleRateHz: number;
   beatIndex: number;
   yMin: number;
   yMax: number;
   onBeatIndexChange: (value: number) => void;
 }) {
-  const beats = section.beats.items;
-  const beat = beats.find((item) => item.index === beatIndex) ?? beats[0] ?? null;
-  const beatSamples = useMemo(() => getBeatSamples(section.signal.full, beat), [section.signal.full, beat]);
-  const displayWindowStart = beat ? beat.window_start_sample : 1;
-  const displayWindowEnd = beat ? beat.window_end_sample : Math.min(section.signal.full.length, sampleRateHz * 20);
-  const windowSamples = section.signal.full.slice(
-    Math.max(0, displayWindowStart - 1),
-    displayWindowEnd,
+  const beat = window?.beats.items.find((item) => item.index === beatIndex) ?? window?.beats.items[0] ?? null;
+  const windowSamples = window?.signal.full ?? [];
+  const displayWindowStart = window?.window_start_sample ?? 1;
+  const displayWindowEnd = window?.window_end_sample ?? Math.min(summary.meta.sample_count, sampleRateHz * 10);
+  const beatSamples = useMemo(
+    () => getBeatSamplesForWindow(windowSamples, beat, displayWindowStart),
+    [windowSamples, beat, displayWindowStart],
   );
   const highlightStart =
     beat && beat.start_sample >= displayWindowStart ? beat.start_sample - displayWindowStart : null;
   const highlightEnd =
     beat && beat.end_sample >= displayWindowStart ? beat.end_sample - displayWindowStart : null;
-  const selectedWindowIndex = beat?.window_index ?? 1;
-  const selectedIntervalRow =
-    section.interval_related_rows.find((row) => row.interval_index === selectedWindowIndex) ?? null;
+  const selectedWindowIndex = window?.window_index ?? beat?.window_index ?? 1;
+  const selectedIntervalRow = window?.interval_related ?? null;
 
   return (
     <section className="review-section">
@@ -1356,22 +1381,22 @@ function SessionReviewCard({
         <div>
           <h2>Session Signal</h2>
           <p className="meta-line">
-            object_key={section.meta.object_key} | byte_length={section.meta.byte_length} | sample_count={section.meta.sample_count}
-            {` | included_beats=${section.beat_count_included}/${section.beat_count_total}`}
+            object_key={summary.meta.object_key} | byte_length={summary.meta.byte_length} | sample_count={summary.meta.sample_count}
+            {` | included_beats=${summary.beat_count_included}/${summary.beat_count_total}`}
           </p>
         </div>
       </div>
       <div className="section-grid">
         <div className="signal-column">
           <FullSignalChart
-            title="Session 20s Window"
+            title="Session 10s Window"
             samples={windowSamples}
             sampleRateHz={sampleRateHz}
             yMin={yMin}
             yMax={yMax}
             highlightStart={highlightStart}
             highlightEnd={highlightEnd}
-            subtitle={`Samples ${displayWindowStart}-${displayWindowEnd} | Window ${beat?.window_index ?? 1} of ${section.window_count}`}
+            subtitle={`Samples ${displayWindowStart}-${displayWindowEnd} | Window ${selectedWindowIndex} of ${summary.window_count}`}
           />
         </div>
         <div className="beat-column">
@@ -1379,7 +1404,7 @@ function SessionReviewCard({
             title="Session Heartbeat"
             beat={beat}
             samples={beatSamples}
-            beatCount={section.beats.count}
+            beatCount={summary.beats.count}
             sampleRateHz={sampleRateHz}
             yMin={yMin}
             yMax={yMax}
@@ -1396,13 +1421,13 @@ function SessionReviewCard({
               <input
                 type="number"
                 min={1}
-                max={Math.max(section.beats.count, 1)}
+                max={Math.max(summary.beats.count, 1)}
                 value={beat?.index ?? beatIndex}
                 onChange={(event) =>
                   onBeatIndexChange(
                     Math.min(
                       Math.max(Number(event.target.value) || 1, 1),
-                      Math.max(section.beats.count, 1),
+                      Math.max(summary.beats.count, 1),
                     ),
                   )
                 }
@@ -1410,10 +1435,10 @@ function SessionReviewCard({
             </label>
             <button
               className="window-button"
-              disabled={!beat || beat.index >= section.beats.count}
+              disabled={!beat || beat.index >= summary.beats.count}
               onClick={() =>
                 onBeatIndexChange(
-                  Math.min(section.beats.count, (beat?.index ?? section.beats.count) + 1),
+                  Math.min(summary.beats.count, (beat?.index ?? summary.beats.count) + 1),
                 )
               }
             >
@@ -1426,7 +1451,7 @@ function SessionReviewCard({
       <div className="interval-card">
         <div className="card-header">
           <h3>Interval-Related Analysis</h3>
-          <span>{`Window ${selectedWindowIndex} of ${section.window_count}`}</span>
+          <span>{`Window ${selectedWindowIndex} of ${summary.window_count}`}</span>
         </div>
         <IntervalSummary row={selectedIntervalRow} />
       </div>
@@ -1435,12 +1460,23 @@ function SessionReviewCard({
 }
 
 function ReviewPage({ currentPath }: { currentPath: string }) {
+  const searchParams = new URLSearchParams(window.location.search);
+  const initialRequestedRecordId = searchParams.get("recordId") ?? "";
   const [reviewMode, setReviewMode] = useState<(typeof REVIEW_MODES)[number]>("CH2");
+  const [requestedRecordIdInput, setRequestedRecordIdInput] = useState(initialRequestedRecordId);
+  const [requestedRecordId, setRequestedRecordId] = useState(initialRequestedRecordId);
   const [yMaxMv, setYMaxMv] = useState(DEFAULT_ECG_Y_MAX_MV);
   const [yMinMv, setYMinMv] = useState(DEFAULT_ECG_Y_MIN_MV);
-  const [data, setData] = useState<ReviewResponse | null>(null);
+  const [data, setData] = useState<ReviewSummaryResponse | null>(null);
+  const [calibrationWindow, setCalibrationWindow] = useState<ReviewWindowSection | null>(null);
+  const [sessionWindow, setSessionWindow] = useState<ReviewWindowSection | null>(null);
+  const [reviewRecordId, setReviewRecordId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [artifactsNotReady, setArtifactsNotReady] = useState<ReviewArtifactsNotReadyDetail | null>(null);
+  const [processResample, setProcessResample] = useState(true);
+  const [processingJob, setProcessingJob] = useState<ReviewProcessingJob | null>(null);
+  const [processActionPending, setProcessActionPending] = useState(false);
   const [calibrationBeat, setCalibrationBeat] = useState(1);
   const [sessionBeat, setSessionBeat] = useState(1);
   const [calibrationVector, setCalibrationVector] = useState<VectorBeatResponse | null>(null);
@@ -1459,28 +1495,72 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
   const showVectorMode = reviewMode === "2D Vectorcardiography";
   const showVector3DMode = reviewMode === "3D Vectorgraphy";
   const showWideVectorMode = showVectorMode || showVector3DMode;
+  const shouldLoadVectorBeats = showVectorMode || showVector3DMode;
+  const calibrationVectorRange = getVectorBeatRange(calibrationVector) ?? { min: yMinMv, max: yMaxMv };
+  const sessionVectorRange = getVectorBeatRange(sessionVector) ?? { min: yMinMv, max: yMaxMv };
+  const [reviewRefreshToken, setReviewRefreshToken] = useState(0);
+  const canProcessReview = Boolean(reviewRecordId);
+  const calibrationWindowIndex =
+    data?.calibration.beats.items.find((item) => item.index === calibrationBeat)?.window_index ?? 1;
+  const sessionWindowIndex =
+    data?.session.beats.items.find((item) => item.index === sessionBeat)?.window_index ?? 1;
 
   useEffect(() => {
     let active = true;
     async function load() {
       setLoading(true);
       setError(null);
-      const url = `/api/review/latest?channel=${selectedChannel}`;
+      setArtifactsNotReady(null);
+      const url = requestedRecordId
+        ? `/api/review/${requestedRecordId}?channel=${selectedChannel}`
+        : `/api/review/latest?channel=${selectedChannel}`;
       console.log(`[REVIEW] GET ${url}`);
       try {
         const response = await fetch(url);
         if (!response.ok) {
-          const text = await response.text();
+          let detail: unknown = null;
+          let text = "";
+          try {
+            const payload = await response.json();
+            detail = payload?.detail ?? null;
+            text = JSON.stringify(payload);
+          } catch {
+            text = await response.text();
+          }
+          if (
+            response.status === 409 &&
+            detail &&
+            typeof detail === "object" &&
+            "code" in detail &&
+            ((detail as { code?: string }).code === "review_artifacts_not_ready" ||
+              (detail as { code?: string }).code === "review_artifact_fetch_unavailable")
+          ) {
+            const notReady = detail as ReviewArtifactsNotReadyDetail;
+            console.log(
+              `[REVIEW] artifacts not ready recordId=${notReady.record_id} channel=${notReady.channel} status=${notReady.processed_status ?? "none"}`,
+            );
+            if (!active) return;
+            setArtifactsNotReady(notReady);
+            setReviewRecordId(notReady.record_id);
+            setData(null);
+            setCalibrationWindow(null);
+            setSessionWindow(null);
+            return;
+          }
           throw new Error(`Review fetch failed: ${response.status} ${text}`);
         }
-        const payload = (await response.json()) as ReviewResponse;
+        const payload = (await response.json()) as ReviewSummaryResponse;
         console.log(
-          `[REVIEW] response recordId=${payload.record_id} channel=${payload.channel} calibrationSamples=${payload.calibration.signal.full.length} sessionSamples=${payload.session.signal.full.length} sessionBeats=${payload.session.beats.count}`,
+          `[REVIEW] response recordId=${payload.record_id} channel=${payload.channel} calibrationBeats=${payload.calibration.beats.count} sessionBeats=${payload.session.beats.count} sessionWindows=${payload.session.window_count}`,
         );
         if (!active) return;
         setData(payload);
-        setCalibrationBeat(1);
-        setSessionBeat(1);
+        setCalibrationWindow(null);
+        setSessionWindow(null);
+        setReviewRecordId(payload.record_id);
+        setArtifactsNotReady(null);
+        setCalibrationBeat(payload.calibration.beats.items[0]?.index ?? 1);
+        setSessionBeat(payload.session.beats.items[0]?.index ?? 1);
         setCalibrationVectorMovement(100);
         setSessionVectorMovement(100);
       } catch (err) {
@@ -1496,10 +1576,212 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     return () => {
       active = false;
     };
-  }, [selectedChannel]);
+  }, [selectedChannel, requestedRecordId, reviewRefreshToken]);
 
   useEffect(() => {
-    if (!data || !showVectorMode) {
+    if (!data) {
+      setCalibrationWindow(null);
+      return;
+    }
+    const summary = data;
+    let active = true;
+    async function loadCalibrationWindow() {
+      const url = `/api/review/${summary.record_id}/window?section=calibration&channel=${selectedChannel}&window_index=${calibrationWindowIndex}`;
+      console.log(`[REVIEW_WINDOW] GET ${url}`);
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Calibration window fetch failed: ${response.status} ${text}`);
+        }
+        const payload = (await response.json()) as ReviewWindowResponse;
+        if (!active) return;
+        console.log(
+          `[REVIEW_WINDOW] calibration recordId=${payload.record_id} window=${payload.window.window_index}/${payload.window.window_count} samples=${payload.window.signal.full.length} beats=${payload.window.beats.count}`,
+        );
+        setCalibrationWindow(payload.window);
+      } catch (err) {
+        if (!active) return;
+        console.error("[REVIEW_WINDOW] calibration error", err);
+        setCalibrationWindow(null);
+        setError(err instanceof Error ? err.message : "Unknown calibration window error");
+      }
+    }
+    void loadCalibrationWindow();
+    return () => {
+      active = false;
+    };
+  }, [data, selectedChannel, calibrationWindowIndex]);
+
+  useEffect(() => {
+    if (!data) {
+      setSessionWindow(null);
+      return;
+    }
+    const summary = data;
+    let active = true;
+    async function loadSessionWindow() {
+      const url = `/api/review/${summary.record_id}/window?section=session&channel=${selectedChannel}&window_index=${sessionWindowIndex}`;
+      console.log(`[REVIEW_WINDOW] GET ${url}`);
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Session window fetch failed: ${response.status} ${text}`);
+        }
+        const payload = (await response.json()) as ReviewWindowResponse;
+        if (!active) return;
+        console.log(
+          `[REVIEW_WINDOW] session recordId=${payload.record_id} window=${payload.window.window_index}/${payload.window.window_count} samples=${payload.window.signal.full.length} beats=${payload.window.beats.count}`,
+        );
+        setSessionWindow(payload.window);
+      } catch (err) {
+        if (!active) return;
+        console.error("[REVIEW_WINDOW] session error", err);
+        setSessionWindow(null);
+        setError(err instanceof Error ? err.message : "Unknown session window error");
+      }
+    }
+    void loadSessionWindow();
+    return () => {
+      active = false;
+    };
+  }, [data, selectedChannel, sessionWindowIndex]);
+
+  useEffect(() => {
+    if (!processingJob || !["queued", "running"].includes(processingJob.status)) {
+      return;
+    }
+    let active = true;
+    let timeoutId: number | undefined;
+    const jobId = processingJob.job_id;
+
+    async function poll() {
+      const url = `/api/review/process/${jobId}`;
+      console.log(`[REVIEW_PROCESS] GET ${url}`);
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Process status failed: ${response.status} ${text}`);
+        }
+        const payload = (await response.json()) as ReviewProcessingJob;
+        if (!active) return;
+        console.log(
+          `[REVIEW_PROCESS] status jobId=${payload.job_id} recordId=${payload.record_id} status=${payload.status} resample=${String(payload.details?.resample)}`,
+        );
+        setProcessingJob(payload);
+        if (payload.status === "ready") {
+          setProcessActionPending(false);
+          setArtifactsNotReady(null);
+          setReviewRefreshToken((value) => value + 1);
+          return;
+        }
+        if (payload.status === "error") {
+          setProcessActionPending(false);
+          setError(payload.error || "Processing failed.");
+          return;
+        }
+        timeoutId = window.setTimeout(poll, 1000);
+      } catch (err) {
+        if (!active) return;
+        console.error("[REVIEW_PROCESS] poll error", err);
+        setProcessActionPending(false);
+        setError(err instanceof Error ? err.message : "Unknown processing status error");
+      }
+    }
+
+    timeoutId = window.setTimeout(poll, 1000);
+    return () => {
+      active = false;
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [processingJob]);
+
+  async function handleProcessReview() {
+    if (!reviewRecordId) {
+      setError("No review record available to process.");
+      return;
+    }
+    setProcessActionPending(true);
+    setError(null);
+    const url = `/api/review/${reviewRecordId}/process`;
+    console.log(`[REVIEW_PROCESS] POST ${url} resample=${processResample}`);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ resample: processResample }),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Process start failed: ${response.status} ${text}`);
+      }
+      const payload = (await response.json()) as ReviewProcessingJob;
+      console.log(
+        `[REVIEW_PROCESS] queued jobId=${payload.job_id} recordId=${payload.record_id} resample=${String(payload.details?.resample)}`,
+      );
+      setProcessingJob(payload);
+    } catch (err) {
+      console.error("[REVIEW_PROCESS] start error", err);
+      setProcessActionPending(false);
+      setError(err instanceof Error ? err.message : "Unknown processing start error");
+    }
+  }
+
+  function applyRequestedRecordId() {
+    const next = requestedRecordIdInput.trim();
+    const nextQuery = new URLSearchParams(window.location.search);
+    if (next) {
+      nextQuery.set("recordId", next);
+    } else {
+      nextQuery.delete("recordId");
+    }
+    const nextUrl = nextQuery.toString() ? `${currentPath}?${nextQuery.toString()}` : currentPath;
+    window.history.replaceState({}, "", nextUrl);
+    setRequestedRecordId(next);
+    setLoading(true);
+    setError(null);
+    setArtifactsNotReady(null);
+    setData(null);
+    setCalibrationWindow(null);
+    setSessionWindow(null);
+    setProcessingJob(null);
+  }
+
+  const reviewNavExtra = canProcessReview ? (
+    <>
+      <label className="route-process-toggle">
+        <input
+          type="checkbox"
+          checked={processResample}
+          onChange={(event) => setProcessResample(event.target.checked)}
+          disabled={processActionPending || processingJob?.status === "running"}
+        />
+        <span>{`Resample ${processResample ? "On" : "Off"}`}</span>
+      </label>
+      <button
+        className={`route-link route-action-button ${processActionPending || processingJob?.status === "running" ? "active" : ""}`}
+        disabled={processActionPending || processingJob?.status === "running"}
+        onClick={() => void handleProcessReview()}
+        type="button"
+      >
+        {processActionPending || processingJob?.status === "running" ? "Processing..." : "Process"}
+      </button>
+      {processingJob ? (
+        <span className="route-process-status">
+          {`${processingJob.status} · ${String(processingJob.details?.resample)}`}
+        </span>
+      ) : null}
+    </>
+  ) : null;
+
+  useEffect(() => {
+    if (!data || !shouldLoadVectorBeats) {
       setCalibrationVector(null);
       return;
     }
@@ -1533,10 +1815,10 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     return () => {
       active = false;
     };
-  }, [data, calibrationBeat, showVectorMode]);
+  }, [data, calibrationBeat, shouldLoadVectorBeats]);
 
   useEffect(() => {
-    if (!data || !showVectorMode) {
+    if (!data || !shouldLoadVectorBeats) {
       setSessionVector(null);
       return;
     }
@@ -1570,7 +1852,7 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     return () => {
       active = false;
     };
-  }, [data, sessionBeat, showVectorMode]);
+  }, [data, sessionBeat, shouldLoadVectorBeats]);
 
   useEffect(() => {
     if (!data || !showVector3DMode) {
@@ -1581,7 +1863,7 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     let active = true;
     async function loadCalibrationVector3d() {
       setLoadingCalibrationVector3d(true);
-      const url = `/api/review/${recordId}/vector3d_beat?section=calibration&beat_index=${calibrationBeat}&progress_percent=${calibrationVectorMovement}&y_min_mv=${yMinMv}&y_max_mv=${yMaxMv}`;
+      const url = `/api/review/${recordId}/vector3d_beat?section=calibration&beat_index=${calibrationBeat}&progress_percent=${calibrationVectorMovement}&y_min_mv=${calibrationVectorRange.min}&y_max_mv=${calibrationVectorRange.max}`;
       console.log(`[VECTOR3D] GET ${url}`);
       try {
         const response = await fetch(url);
@@ -1607,7 +1889,7 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     return () => {
       active = false;
     };
-  }, [data, calibrationBeat, calibrationVectorMovement, showVector3DMode, yMinMv, yMaxMv]);
+  }, [data, calibrationBeat, calibrationVectorMovement, showVector3DMode, calibrationVectorRange.min, calibrationVectorRange.max]);
 
   useEffect(() => {
     if (!data || !showVector3DMode) {
@@ -1618,7 +1900,7 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     let active = true;
     async function loadSessionVector3d() {
       setLoadingSessionVector3d(true);
-      const url = `/api/review/${recordId}/vector3d_beat?section=session&beat_index=${sessionBeat}&progress_percent=${sessionVectorMovement}&y_min_mv=${yMinMv}&y_max_mv=${yMaxMv}`;
+      const url = `/api/review/${recordId}/vector3d_beat?section=session&beat_index=${sessionBeat}&progress_percent=${sessionVectorMovement}&y_min_mv=${sessionVectorRange.min}&y_max_mv=${sessionVectorRange.max}`;
       console.log(`[VECTOR3D] GET ${url}`);
       try {
         const response = await fetch(url);
@@ -1644,7 +1926,7 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     return () => {
       active = false;
     };
-  }, [data, sessionBeat, sessionVectorMovement, showVector3DMode, yMinMv, yMaxMv]);
+  }, [data, sessionBeat, sessionVectorMovement, showVector3DMode, sessionVectorRange.min, sessionVectorRange.max]);
 
   useEffect(() => {
     if (!data || !showVector3DMode) {
@@ -1652,8 +1934,8 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     }
     const recordId = data.record_id;
     const requests = [
-      `/api/review/${recordId}/vector3d_preload?section=calibration&start_beat_index=${calibrationBeat}&progress_percent=${calibrationVectorMovement}&y_min_mv=${yMinMv}&y_max_mv=${yMaxMv}`,
-      `/api/review/${recordId}/vector3d_preload?section=session&start_beat_index=${sessionBeat}&progress_percent=${sessionVectorMovement}&y_min_mv=${yMinMv}&y_max_mv=${yMaxMv}`,
+      `/api/review/${recordId}/vector3d_preload?section=calibration&start_beat_index=${calibrationBeat}&progress_percent=${calibrationVectorMovement}&y_min_mv=${calibrationVectorRange.min}&y_max_mv=${calibrationVectorRange.max}`,
+      `/api/review/${recordId}/vector3d_preload?section=session&start_beat_index=${sessionBeat}&progress_percent=${sessionVectorMovement}&y_min_mv=${sessionVectorRange.min}&y_max_mv=${sessionVectorRange.max}`,
     ];
     requests.forEach((url) => {
       console.log(`[VECTOR3D] PRELOAD ${url}`);
@@ -1668,20 +1950,33 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
     calibrationVectorMovement,
     sessionBeat,
     sessionVectorMovement,
-    yMinMv,
-    yMaxMv,
+    calibrationVectorRange.min,
+    calibrationVectorRange.max,
+    sessionVectorRange.min,
+    sessionVectorRange.max,
   ]);
 
   return (
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <TopNav currentPath={currentPath} />
+          <TopNav currentPath={currentPath} extra={reviewNavExtra} />
           <p className="eyebrow">ECG Review Workspace</p>
           <h1>Calibration and Session Review</h1>
           <p className="subtitle">NeuroKit2-backed signal review for calibration and exercise session traces.</p>
         </div>
-        <div className="topbar-controls">
+        <div className="topbar-controls review-topbar-controls">
+          <label className="channel-select record-input-card">
+            <span>Record ID</span>
+            <input
+              value={requestedRecordIdInput}
+              onChange={(event) => setRequestedRecordIdInput(event.target.value)}
+              placeholder="Leave blank for latest record"
+            />
+          </label>
+          <button className="apply-button" onClick={applyRequestedRecordId}>
+            Apply
+          </button>
           <label className="channel-select">
             <span>View</span>
             <select value={reviewMode} onChange={(event) => setReviewMode(event.target.value as (typeof REVIEW_MODES)[number])}>
@@ -1692,24 +1987,44 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
               ))}
             </select>
           </label>
-          <div className="scale-card">
-            <span>Y scale (mV)</span>
-            <div className="scale-inputs">
-              <label className="scale-field">
-                <span>Min</span>
-                <input type="number" step="0.1" value={yMinMv} onChange={(event) => setYMinMv(Number(event.target.value) || 0)} />
-              </label>
-              <label className="scale-field">
-                <span>Max</span>
-                <input type="number" step="0.1" value={yMaxMv} onChange={(event) => setYMaxMv(Number(event.target.value) || 0)} />
-              </label>
+          {!showWideVectorMode ? (
+            <div className="scale-card">
+              <span>Y scale (mV)</span>
+              <div className="scale-inputs">
+                <label className="scale-field">
+                  <span>Min</span>
+                  <input type="number" step="0.1" value={yMinMv} onChange={(event) => setYMinMv(Number(event.target.value) || 0)} />
+                </label>
+                <label className="scale-field">
+                  <span>Max</span>
+                  <input type="number" step="0.1" value={yMaxMv} onChange={(event) => setYMaxMv(Number(event.target.value) || 0)} />
+                </label>
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="scale-card">
+              <span>Vector scale</span>
+              <div className="meta-line">Auto-fit to current beat range.</div>
+            </div>
+          )}
         </div>
       </header>
 
       {loading && <div className="status-panel">Loading review data...</div>}
       {error && <div className="status-panel error">{error}</div>}
+      {!loading && !error && artifactsNotReady && (
+        <div className="status-panel">
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+            <div>
+              <strong>Processed review artifacts are not ready.</strong>
+              <div className="meta-line">
+                {`Record ID: ${artifactsNotReady.record_id} | Status: ${artifactsNotReady.processed_status ?? "missing"}`}
+              </div>
+            </div>
+            <div className="meta-line">Use the Process controls in the header to generate review artifacts.</div>
+          </div>
+        </div>
+      )}
 
       {!loading && !error && data && (
         <div className={showWideVectorMode ? "content-stack vector-mode-content" : "content-stack"}>
@@ -1727,8 +2042,8 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
                 data={calibrationVector}
                 loading={loadingCalibrationVector}
                 movementPercent={calibrationVectorMovement}
-                yMin={yMinMv}
-                yMax={yMaxMv}
+                yMin={calibrationVectorRange.min}
+                yMax={calibrationVectorRange.max}
                 onBeatIndexChange={setCalibrationBeat}
                 onMovementPercentChange={setCalibrationVectorMovement}
               />
@@ -1739,8 +2054,8 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
                 data={sessionVector}
                 loading={loadingSessionVector}
                 movementPercent={sessionVectorMovement}
-                yMin={yMinMv}
-                yMax={yMaxMv}
+                yMin={sessionVectorRange.min}
+                yMax={sessionVectorRange.max}
                 onBeatIndexChange={setSessionBeat}
                 onMovementPercentChange={setSessionVectorMovement}
                 />
@@ -1770,23 +2085,31 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
               </div>
             ) : (
             <>
-              <ReviewSectionCard
-                title="Calibration Signal"
-                section={data.calibration}
-                sampleRateHz={data.sample_rate_hz}
-                beatIndex={calibrationBeat}
-                yMin={yMinMv}
-                yMax={yMaxMv}
-                onBeatIndexChange={setCalibrationBeat}
-              />
-              <SessionReviewCard
-                section={data.session}
-                sampleRateHz={data.sample_rate_hz}
-                beatIndex={sessionBeat}
-                yMin={yMinMv}
-                yMax={yMaxMv}
-                onBeatIndexChange={setSessionBeat}
-              />
+              {calibrationWindow && sessionWindow ? (
+                <>
+                  <ReviewSectionCard
+                    title="Calibration Signal"
+                    summary={data.calibration}
+                    window={calibrationWindow}
+                    sampleRateHz={data.sample_rate_hz}
+                    beatIndex={calibrationBeat}
+                    yMin={yMinMv}
+                    yMax={yMaxMv}
+                    onBeatIndexChange={setCalibrationBeat}
+                  />
+                  <SessionReviewCard
+                    summary={data.session}
+                    window={sessionWindow}
+                    sampleRateHz={data.sample_rate_hz}
+                    beatIndex={sessionBeat}
+                    yMin={yMinMv}
+                    yMax={yMaxMv}
+                    onBeatIndexChange={setSessionBeat}
+                  />
+                </>
+              ) : (
+                <div className="status-panel">Loading review windows...</div>
+              )}
             </>
           )}
         </div>
@@ -1795,42 +2118,364 @@ function ReviewPage({ currentPath }: { currentPath: string }) {
   );
 }
 
-function LiveSessionPage({ currentPath }: { currentPath: string }) {
+void ReviewPage;
+
+function StaticReviewPage({ currentPath }: { currentPath: string }) {
   const searchParams = new URLSearchParams(window.location.search);
   const initialRecordId = searchParams.get("recordId") ?? "";
   const [recordIdInput, setRecordIdInput] = useState(initialRecordId);
   const [recordId, setRecordId] = useState(initialRecordId);
+  const [manifest, setManifest] = useState<StaticReviewManifest | null>(null);
+  const [selectedWindowIndex, setSelectedWindowIndex] = useState(1);
+  const [loadingManifest, setLoadingManifest] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [job, setJob] = useState<StaticReviewJob | null>(null);
+  const [processing, setProcessing] = useState(false);
+  const [imageCacheProgress, setImageCacheProgress] = useState<{ done: number; total: number; active: boolean } | null>(null);
+
+  const readyOrKnownWindows = manifest?.windows ?? [];
+  const selectedWindow = readyOrKnownWindows.find((windowItem) => windowItem.window_index === selectedWindowIndex) ?? readyOrKnownWindows[0] ?? null;
+  const sliderMax = Math.max(1, readyOrKnownWindows.length || manifest?.completed_window_count || 1);
+
+  const imageUrl = (objectKey?: string) =>
+    objectKey
+      ? `/api/review_static/${encodeURIComponent(recordId)}/image?object_key=${encodeURIComponent(objectKey)}&v=${encodeURIComponent(manifest?.updated_at ?? "")}`
+      : "";
+
+  const imageUrlsForWindow = (windowItem?: StaticReviewWindow | null) =>
+    windowItem?.images
+      ? Object.values(windowItem.images)
+          .filter(Boolean)
+          .map((objectKey) => imageUrl(objectKey))
+      : [];
+
+  async function loadManifest(targetRecordId = recordId, silent = false) {
+    const trimmed = targetRecordId.trim();
+    if (!trimmed) {
+      setManifest(null);
+      setError(null);
+      return;
+    }
+    if (!silent) setLoadingManifest(true);
+    try {
+      const response = await fetch(`/api/review_static/${encodeURIComponent(trimmed)}/manifest`);
+      if (!response.ok) {
+        if (response.status === 404) {
+          setManifest(null);
+          if (!silent) setError("Static review plots have not been generated for this record yet.");
+          return;
+        }
+        const text = await response.text();
+        throw new Error(`Manifest fetch failed: ${response.status} ${text}`);
+      }
+      const payload = (await response.json()) as StaticReviewManifest;
+      setManifest(payload);
+      setError(null);
+      const knownWindows = payload.windows ?? [];
+      if (knownWindows.length > 0 && !knownWindows.some((item) => item.window_index === selectedWindowIndex)) {
+        setSelectedWindowIndex(knownWindows[0].window_index);
+      }
+    } catch (err) {
+      if (!silent) setError(err instanceof Error ? err.message : "Unknown manifest error");
+    } finally {
+      if (!silent) setLoadingManifest(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadManifest(recordId);
+    // selectedWindowIndex is intentionally excluded so slider changes do not refetch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordId]);
+
+  useEffect(() => {
+    if (!job || !["queued", "running"].includes(job.status)) return;
+    let active = true;
+    let timeoutId: number | undefined;
+    const jobId = job.job_id;
+    async function poll() {
+      try {
+        const response = await fetch(`/api/review_static/process/${jobId}`);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Static review job poll failed: ${response.status} ${text}`);
+        }
+        const payload = (await response.json()) as StaticReviewJob;
+        if (!active) return;
+        setJob(payload);
+        await loadManifest(payload.record_id, true);
+        if (payload.status === "ready") {
+          setProcessing(false);
+          await loadManifest(payload.record_id, true);
+          return;
+        }
+        if (payload.status === "error") {
+          setProcessing(false);
+          setError(payload.error || "Static review plot generation failed.");
+          return;
+        }
+        timeoutId = window.setTimeout(poll, 1800);
+      } catch (err) {
+        if (!active) return;
+        setProcessing(false);
+        setError(err instanceof Error ? err.message : "Unknown static review job error");
+      }
+    }
+    timeoutId = window.setTimeout(poll, 900);
+    return () => {
+      active = false;
+      if (timeoutId) window.clearTimeout(timeoutId);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job?.job_id, job?.status]);
+
+  useEffect(() => {
+    if (!recordId || manifest?.status !== "ready" || !readyOrKnownWindows.length) {
+      setImageCacheProgress(null);
+      return;
+    }
+
+    const urls = Array.from(new Set(readyOrKnownWindows.flatMap((windowItem) => imageUrlsForWindow(windowItem))));
+    if (!urls.length) {
+      setImageCacheProgress(null);
+      return;
+    }
+
+    let cancelled = false;
+    let cursor = 0;
+    let done = 0;
+    const workerCount = Math.min(6, urls.length);
+    setImageCacheProgress({ done: 0, total: urls.length, active: true });
+
+    async function cacheWorker() {
+      while (!cancelled) {
+        const nextIndex = cursor;
+        cursor += 1;
+        if (nextIndex >= urls.length) break;
+        try {
+          const response = await fetch(urls[nextIndex], { cache: "force-cache" });
+          if (response.ok) {
+            await response.blob();
+          }
+        } catch {
+          // Cache warming is best-effort; visible images still load normally.
+        } finally {
+          done += 1;
+          if (!cancelled) {
+            setImageCacheProgress({ done, total: urls.length, active: done < urls.length });
+          }
+        }
+      }
+    }
+
+    void Promise.all(Array.from({ length: workerCount }, () => cacheWorker())).then(() => {
+      if (!cancelled) {
+        setImageCacheProgress({ done: urls.length, total: urls.length, active: false });
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordId, manifest?.status, manifest?.updated_at]);
+
+
+  function applyRecordId() {
+    const next = recordIdInput.trim();
+    const nextUrl = next ? `${currentPath}?recordId=${encodeURIComponent(next)}` : currentPath;
+    window.history.replaceState({}, "", nextUrl);
+    setRecordId(next);
+    setManifest(null);
+    setJob(null);
+    setSelectedWindowIndex(1);
+    setError(null);
+  }
+
+  async function startProcessing(force = false) {
+    const trimmed = recordIdInput.trim() || recordId.trim();
+    if (!trimmed) {
+      setError("Enter a record_id before generating review plots.");
+      return;
+    }
+    setProcessing(true);
+    setError(null);
+    setRecordId(trimmed);
+    const nextUrl = `${currentPath}?recordId=${encodeURIComponent(trimmed)}`;
+    window.history.replaceState({}, "", nextUrl);
+    try {
+      const response = await fetch(`/api/review_static/${encodeURIComponent(trimmed)}/process`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force }),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Static review process start failed: ${response.status} ${text}`);
+      }
+      const payload = (await response.json()) as StaticReviewJob;
+      setJob(payload);
+      await loadManifest(trimmed, true);
+    } catch (err) {
+      setProcessing(false);
+      setError(err instanceof Error ? err.message : "Unknown static review process error");
+    }
+  }
+
+  const progressLabel = manifest
+    ? `${manifest.completed_window_count} / ${manifest.target_window_count || manifest.total_window_count} windows ready`
+    : "No generated static review manifest loaded";
+
+  const windowLabel = selectedWindow
+    ? `Window ${selectedWindow.window_index} · ${selectedWindow.start_sec.toFixed(0)}s - ${selectedWindow.end_sec.toFixed(0)}s`
+    : "No window selected";
+
+  return (
+    <main className="app-shell static-review-shell">
+      <header className="topbar">
+        <div>
+          <TopNav currentPath={currentPath} />
+          <p className="eyebrow">Static ECG Review Workspace</p>
+          <h1>Calibration vs Session Window Comparison</h1>
+          <p className="subtitle">Backend-generated mean-beat and vectorcardiography comparison plots. The frontend only loads precomputed images.</p>
+        </div>
+        <div className="topbar-controls review-topbar-controls">
+          <div className="channel-select record-input-card static-record-card">
+            <div className="static-record-field">
+              <span>Record ID</span>
+              <input value={recordIdInput} onChange={(event) => setRecordIdInput(event.target.value)} placeholder="Paste ecg_recordings.id" />
+            </div>
+            <button className="apply-button" onClick={applyRecordId} type="button">
+              Load
+            </button>
+            <button className="apply-button" disabled={processing} onClick={() => void startProcessing(false)} type="button">
+              {processing ? "Generating..." : "Generate"}
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {loadingManifest ? <div className="status-panel">Loading static review manifest...</div> : null}
+      {error ? <div className="status-panel error">{error}</div> : null}
+
+      <div className="content-stack">
+        <div className="record-meta">
+          <span>Record ID: {recordId || "n/a"}</span>
+          <span>Status: {manifest?.status ?? job?.status ?? "not generated"}</span>
+          <span>{progressLabel}</span>
+          {imageCacheProgress ? (
+            <span>
+              Image cache: {imageCacheProgress.done} / {imageCacheProgress.total}
+              {imageCacheProgress.active ? " warming" : " ready"}
+            </span>
+          ) : null}
+          {manifest?.updated_at ? <span>Updated: {new Date(manifest.updated_at).toLocaleString()}</span> : null}
+        </div>
+
+        <section className="review-section static-review-controls">
+          <div>
+            <h2>{windowLabel}</h2>
+            <p className="meta-line">Use the slider to inspect the n-th 20-second session window that has been generated.</p>
+          </div>
+          <input
+            className="static-window-slider"
+            type="range"
+            min={1}
+            max={sliderMax}
+            value={Math.min(selectedWindowIndex, sliderMax)}
+            onChange={(event) => setSelectedWindowIndex(Number(event.target.value))}
+            disabled={!readyOrKnownWindows.length}
+          />
+        </section>
+
+        {selectedWindow?.status === "error" ? (
+          <div className="status-panel error">{selectedWindow.error || "This window failed to generate."}</div>
+        ) : selectedWindow ? (
+          <section className="static-review-grid">
+            <div className="static-review-column">
+              <StaticReviewImage title="CH2 Mean Beat" src={imageUrl(selectedWindow.images.ch2)} />
+              <StaticReviewImage title="CH3 Mean Beat" src={imageUrl(selectedWindow.images.ch3)} />
+              <StaticReviewImage title="CH4 Mean Beat" src={imageUrl(selectedWindow.images.ch4)} />
+            </div>
+            <div className="static-review-column">
+              <StaticReviewImage title="Frontal Plane" src={imageUrl(selectedWindow.images.frontal)} />
+              <StaticReviewImage title="Transverse Plane" src={imageUrl(selectedWindow.images.transverse)} />
+              <StaticReviewImage title="Sagittal Plane" src={imageUrl(selectedWindow.images.sagittal)} />
+            </div>
+            <div className="static-review-column static-review-column-3d">
+              <StaticReviewImage title="3D Vectorcardiography" src={imageUrl(selectedWindow.images.vcg3d)} tall />
+            </div>
+          </section>
+        ) : (
+          <div className="status-panel">Load or generate a static review manifest to view comparison plots.</div>
+        )}
+      </div>
+    </main>
+  );
+}
+
+function StaticReviewImage({ title, src, tall = false }: { title: string; src: string; tall?: boolean }) {
+  const [loadedSrc, setLoadedSrc] = useState("");
+  const isLoading = Boolean(src) && loadedSrc !== src;
+
+  useEffect(() => {
+    setLoadedSrc("");
+  }, [src]);
+
+  return (
+    <article className={tall ? "static-review-image-card static-review-image-card-tall" : "static-review-image-card"}>
+      <div className="card-header">
+        <h3>{title}</h3>
+      </div>
+      {src ? (
+        <div className="static-review-image-frame">
+          {isLoading ? <div className="static-review-image-placeholder">Loading...</div> : null}
+          <img
+            className={isLoading ? "static-review-image-hidden" : ""}
+            src={src}
+            alt={title}
+            loading="eager"
+            decoding="async"
+            onLoad={() => setLoadedSrc(src)}
+            onError={() => setLoadedSrc(src)}
+          />
+        </div>
+      ) : (
+        <div className="status-panel">Image not available</div>
+      )}
+    </article>
+  );
+}
+
+function LiveSessionPage({ currentPath }: { currentPath: string }) {
+  const searchParams = new URLSearchParams(window.location.search);
+  const initialRecordId = searchParams.get("recordId") ?? "";
+  const [recordId] = useState(initialRecordId);
   const [data, setData] = useState<LiveVisualResponse | null>(null);
-  const [previousData, setPreviousData] = useState<LiveVisualResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [pollingStopped, setPollingStopped] = useState(false);
-  const [transitionStartedAtMs, setTransitionStartedAtMs] = useState(0);
-  const [animationNowMs, setAnimationNowMs] = useState(0);
-  const latestDataRef = useRef<LiveVisualResponse | null>(null);
-
-  useEffect(() => {
-    let frameId = 0;
-    const animate = (now: number) => {
-      setAnimationNowMs(now);
-      frameId = window.requestAnimationFrame(animate);
-    };
-    frameId = window.requestAnimationFrame(animate);
-    return () => window.cancelAnimationFrame(frameId);
-  }, []);
 
   useEffect(() => {
     let active = true;
-    let intervalId: number | undefined;
     let stopped = false;
+    let inFlight = false;
+    let eventSource: EventSource | null = null;
 
     async function load() {
+      if (!active || stopped || inFlight) {
+        console.log(
+          `[LIVE] skip load active=${active} stopped=${stopped} inFlight=${inFlight} recordId=${recordId || "latest"}`,
+        );
+        return;
+      }
+      inFlight = true;
       const query = new URLSearchParams();
       if (recordId) {
         query.set("record_id", recordId);
       }
       const url = `/api/session/live/visual?${query.toString()}`;
-      console.log(`[LIVE] GET ${url}`);
+      console.log(`[LIVE] fetch start url=${url}`);
       try {
         const response = await fetch(url);
         if (!response.ok) {
@@ -1839,60 +2484,118 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
         }
         const payload = (await response.json()) as LiveVisualResponse;
         console.log(
-          `[LIVE] visual response recordId=${payload.record_id} status=${payload.status} buffer=${payload.buffer_samples} total=${payload.total_samples_received} hr=${payload.heart_rate_bpm ?? "null"}`,
+          `[LIVE] fetch success recordId=${payload.record_id} status=${payload.status} buffer=${payload.buffer_samples} total=${payload.total_samples_received} hr=${payload.heart_rate_bpm ?? "null"} updated_at=${payload.updated_at}`,
         );
         if (!active) return;
-        setPreviousData(latestDataRef.current);
-        latestDataRef.current = payload;
-        setData(payload);
-        setTransitionStartedAtMs(performance.now());
+        setData((current) => {
+          if (!current) {
+            console.log(
+              `[LIVE] apply snapshot recordId=${payload.record_id} total=${payload.total_samples_received} reason=initial`,
+            );
+            return payload;
+          }
+          if (payload.record_id !== current.record_id) {
+            console.log(
+              `[LIVE] apply snapshot recordId=${payload.record_id} total=${payload.total_samples_received} reason=record-switch previous=${current.record_id}`,
+            );
+            return payload;
+          }
+          if (payload.total_samples_received < current.total_samples_received) {
+            console.log(
+              `[LIVE] ignore snapshot recordId=${payload.record_id} total=${payload.total_samples_received} previous=${current.total_samples_received} reason=older-total`,
+            );
+            return current;
+          }
+          const currentUpdatedAt = Date.parse(current.updated_at || "");
+          const payloadUpdatedAt = Date.parse(payload.updated_at || "");
+          if (
+            Number.isFinite(currentUpdatedAt) &&
+            Number.isFinite(payloadUpdatedAt) &&
+            payloadUpdatedAt < currentUpdatedAt
+          ) {
+            console.log(
+              `[LIVE] ignore snapshot recordId=${payload.record_id} total=${payload.total_samples_received} reason=older-updated-at current=${current.updated_at} next=${payload.updated_at}`,
+            );
+            return current;
+          }
+          console.log(
+            `[LIVE] apply snapshot recordId=${payload.record_id} total=${payload.total_samples_received} reason=fresh`,
+          );
+          return payload;
+        });
         setError(null);
         if (payload.status === "ended") {
           stopped = true;
           setPollingStopped(true);
-          if (intervalId !== undefined) {
-            window.clearInterval(intervalId);
-            intervalId = undefined;
-          }
         } else {
           setPollingStopped(false);
         }
       } catch (err) {
         if (!active) return;
+        console.error("[LIVE] fetch error", err);
         setError(err instanceof Error ? err.message : "Unknown live session error");
       } finally {
-      if (active) {
+        inFlight = false;
+        if (active) {
           setLoading(false);
         }
       }
     }
 
     void load();
-    intervalId = window.setInterval(() => {
-      if (!stopped) {
-        void load();
+    const eventQuery = new URLSearchParams();
+    if (recordId) {
+      eventQuery.set("record_id", recordId);
+    }
+    const eventUrl = `/api/session/live/events?${eventQuery.toString()}`;
+    console.log(`[LIVE] sse connect url=${eventUrl}`);
+    eventSource = new EventSource(eventUrl);
+    eventSource.onopen = () => {
+      console.log(`[LIVE] sse open recordId=${recordId || "latest"}`);
+    };
+    eventSource.addEventListener("preview", (event) => {
+      if (!active || stopped) {
+        return;
       }
-    }, LIVE_FETCH_INTERVAL_MS);
+      try {
+        const payload = JSON.parse((event as MessageEvent).data) as {
+          record_id?: string;
+          status?: string;
+        };
+        if (recordId && payload.record_id && payload.record_id !== recordId) {
+          console.log(
+            `[LIVE] sse ignore recordId=${payload.record_id} current=${recordId}`,
+          );
+          return;
+        }
+        console.log(
+          `[LIVE] sse preview recordId=${payload.record_id ?? "unknown"} status=${payload.status ?? "unknown"}`,
+        );
+        if (payload.status === "ended") {
+          stopped = true;
+          setPollingStopped(true);
+        }
+      } catch {
+        console.warn("[LIVE] sse malformed preview event");
+      }
+      void load();
+    });
+    eventSource.onerror = () => {
+      if (!active || stopped) {
+        return;
+      }
+      console.warn(`[LIVE] sse error recordId=${recordId || "latest"}`);
+      void load();
+    };
 
     return () => {
       active = false;
-      if (intervalId !== undefined) {
-        window.clearInterval(intervalId);
+      if (eventSource) {
+        console.log(`[LIVE] sse close recordId=${recordId || "latest"}`);
+        eventSource.close();
       }
     };
   }, [recordId]);
-
-  const applyRecordId = () => {
-    const next = recordIdInput.trim();
-    const nextUrl = next ? `/session?recordId=${encodeURIComponent(next)}` : "/session";
-    window.history.replaceState({}, "", nextUrl);
-    setRecordId(next);
-    setPreviousData(null);
-    setData(null);
-    latestDataRef.current = null;
-    setLoading(true);
-    setPollingStopped(false);
-  };
 
   const playback = useMemo(() => {
     if (!data) return null;
@@ -1917,47 +2620,11 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
       CH3: data.channels.CH3.slice(-currentCount),
       CH4: data.channels.CH4.slice(-currentCount),
     };
-    if (!previousData || previousData.record_id !== data.record_id || data.status === "ended") {
-      return {
-        channels: currentChannels,
-        displayedSamples: currentCount,
-      };
-    }
-    const previousCount = Math.min(
-      previousData.channels.CH2.length,
-      previousData.channels.CH3.length,
-      previousData.channels.CH4.length,
-      previousData.buffer_samples || LIVE_VISUAL_BUFFER_SAMPLES,
-    );
-    if (previousCount !== currentCount || previousCount <= 0) {
-      return {
-        channels: currentChannels,
-        displayedSamples: currentCount,
-      };
-    }
-    const newSamples = Math.min(
-      Math.max(data.total_samples_received - previousData.total_samples_received, 0),
-      LIVE_VISUAL_BUFFER_SAMPLES,
-    );
-    const transitionDurationMs = Math.max(
-      1,
-      (newSamples / Math.max(data.sample_rate_hz || 500, 1)) * 1000,
-    );
-    const transitionProgress = Math.min(
-      Math.max((animationNowMs - transitionStartedAtMs) / transitionDurationMs, 0),
-      1,
-    );
-    const shiftSamples = Math.round(newSamples * transitionProgress);
-
     return {
-      channels: {
-        CH2: blendRollingBuffer(previousData.channels.CH2.slice(-currentCount), currentChannels.CH2, shiftSamples),
-        CH3: blendRollingBuffer(previousData.channels.CH3.slice(-currentCount), currentChannels.CH3, shiftSamples),
-        CH4: blendRollingBuffer(previousData.channels.CH4.slice(-currentCount), currentChannels.CH4, shiftSamples),
-      },
+      channels: currentChannels,
       displayedSamples: currentCount,
     };
-  }, [animationNowMs, data, previousData, transitionStartedAtMs]);
+  }, [data]);
 
   return (
     <main className="app-shell live-dashboard-shell">
@@ -1967,15 +2634,6 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
           <p className="eyebrow">Live Session Dashboard</p>
           <h1>Buffered Realtime Session View</h1>
           <p className="subtitle">Four synchronized quadrants with a deliberate 500 ms playback lag for smoother live visualization.</p>
-        </div>
-        <div className="live-controls">
-          <label className="channel-select record-input-card">
-            <span>Record ID</span>
-            <input value={recordIdInput} onChange={(event) => setRecordIdInput(event.target.value)} placeholder="Leave blank for latest active session" />
-          </label>
-          <button className="apply-button" onClick={applyRecordId}>
-            Apply
-          </button>
         </div>
       </header>
 
@@ -2005,31 +2663,16 @@ function LiveSessionPage({ currentPath }: { currentPath: string }) {
                   title="CH2"
                   samples={playback.channels.CH2}
                   sampleRateHz={data.sample_rate_hz}
-                  yMin={DEFAULT_ECG_Y_MIN_MV}
-                  yMax={DEFAULT_ECG_Y_MAX_MV}
                 />
                 <LiveWaveformCanvas
                   title="CH3"
                   samples={playback.channels.CH3}
                   sampleRateHz={data.sample_rate_hz}
-                  yMin={DEFAULT_ECG_Y_MIN_MV}
-                  yMax={DEFAULT_ECG_Y_MAX_MV}
                 />
                 <LiveWaveformCanvas
                   title="CH4"
                   samples={playback.channels.CH4}
                   sampleRateHz={data.sample_rate_hz}
-                  yMin={DEFAULT_ECG_Y_MIN_MV}
-                  yMax={DEFAULT_ECG_Y_MAX_MV}
-                />
-              </div>
-              <div className="live-vector-panel">
-                <LiveVector3DCanvas
-                  xSamples={playback.channels.CH2}
-                  ySamples={playback.channels.CH4}
-                  zSamples={playback.channels.CH3}
-                  yMin={DEFAULT_ECG_Y_MIN_MV}
-                  yMax={DEFAULT_ECG_Y_MAX_MV}
                 />
               </div>
             </div>
@@ -2045,5 +2688,5 @@ export default function App() {
   if (pathname.startsWith("/session")) {
     return <LiveSessionPage currentPath={pathname} />;
   }
-  return <ReviewPage currentPath={pathname} />;
+  return <StaticReviewPage currentPath={pathname} />;
 }

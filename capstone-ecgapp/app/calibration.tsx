@@ -74,6 +74,8 @@ export default function CalibrationScreen() {
     useAppStore();
   const { startEcgNotifications, stopEcgNotifications } = useBluetoothService();
   const packetCountRef = useRef(0);
+  const receivedPacketCountRef = useRef(0);
+  const skippedWarmupPacketRef = useRef(false);
   const invalidPacketCountRef = useRef(0);
   const packetsRef = useRef<Array<{ data: Uint8Array; receivedAt: number }>>(
     [],
@@ -124,7 +126,9 @@ export default function CalibrationScreen() {
     setElapsedMs(0);
     setLastPacketBytes(null);
     packetCountRef.current = 0;
+    receivedPacketCountRef.current = 0;
     invalidPacketCountRef.current = 0;
+    skippedWarmupPacketRef.current = false;
     packetsRef.current = [];
     calibrationStartRef.current = Date.now();
     isFinishingRef.current = false;
@@ -160,20 +164,20 @@ export default function CalibrationScreen() {
         );
         const quality = await getCalibrationSignalQuality(bytes, runId, user?.email ?? null);
         const message = quality.signalSuitable
-          ? `Signal quality ${quality.qualityPercentage}%. Calibration successful.`
-          : `Signal quality ${quality.qualityPercentage}%. Calibration failed. Please adjust device placement.`;
+          ? `Signal quality ${quality.qualityPercentage}%. Calibration complete.`
+          : `Signal quality ${quality.qualityPercentage}%. Calibration complete, but quality is poor. Review the signal before continuing.`;
 
         setSignalQuality(quality.qualityPercentage);
         setProgress(100);
         setResultMessage(message);
-        setCalibrationStatus(quality.signalSuitable ? "success" : "failed");
+        setCalibrationStatus("success");
         setGraphSeries({
           ch2: quality.preview.CH2,
           ch3: quality.preview.CH3,
           ch4: quality.preview.CH4,
         });
         setCalibrationResult({
-          status: quality.signalSuitable ? "success" : "failed",
+          status: "success",
           message,
           timestamp: new Date(),
           signalQuality: quality.qualityPercentage,
@@ -221,28 +225,43 @@ export default function CalibrationScreen() {
           return;
         }
 
+        receivedPacketCountRef.current += 1;
+        const receivedCount = receivedPacketCountRef.current;
+        if (!skippedWarmupPacketRef.current) {
+          skippedWarmupPacketRef.current = true;
+          console.log(
+            `[CAL] skipped warmup packet len=${bytes.length} received=${receivedCount}`,
+          );
+          if (calibrationStartRef.current) {
+            setElapsedMs(receivedAt - calibrationStartRef.current);
+          }
+          setProgress(0);
+          setPacketCount(0);
+          return;
+        }
+
         packetsRef.current.push({ data: bytes, receivedAt });
         packetCountRef.current += 1;
-        const count = packetCountRef.current;
-        setPacketCount(count);
+        const storedCount = packetCountRef.current;
+        setPacketCount(storedCount);
         setLastPacketBytes(bytes);
-        if (count === 1) {
+        if (storedCount === 1) {
           console.log(
-            `[CAL] first packet len=${bytes.length} bytes=${Array.from(bytes).join(",")}`,
+            `[CAL] first kept packet len=${bytes.length} received=${receivedCount}`,
           );
-        } else if (count % 20 === 0) {
-          console.log(`[CAL] packet=${count} len=${bytes.length}`);
+        } else if (receivedCount % 20 === 0) {
+          console.log(`[CAL] packet=${receivedCount} len=${bytes.length}`);
         }
         if (calibrationStartRef.current) {
           setElapsedMs(receivedAt - calibrationStartRef.current);
         }
         const pct = Math.min(
           100,
-          Math.round((count / targetPacketCount) * 100),
+          Math.round((storedCount / targetPacketCount) * 100),
         );
         setProgress(pct);
 
-        if (count >= targetPacketCount) {
+        if (storedCount >= targetPacketCount) {
           void finishSuccess();
         }
       },
@@ -275,7 +294,9 @@ export default function CalibrationScreen() {
     setGraphSeries({ ch2: [], ch3: [], ch4: [] });
     setGraphError(null);
     packetCountRef.current = 0;
+    receivedPacketCountRef.current = 0;
     packetsRef.current = [];
+    skippedWarmupPacketRef.current = false;
     calibrationStartRef.current = null;
     isFinishingRef.current = false;
   };
@@ -590,12 +611,18 @@ export default function CalibrationScreen() {
         <View
           className={`w-24 h-24 rounded-full items-center justify-center mb-4 ${
             calibrationStatus === "success"
-              ? "bg-green-500/20"
+              ? signalQuality >= 70
+                ? "bg-green-500/20"
+                : "bg-yellow-500/20"
               : "bg-red-500/20"
           }`}
         >
           {calibrationStatus === "success" ? (
-            <Check size={48} className="text-green-500" />
+            signalQuality >= 70 ? (
+              <Check size={48} className="text-green-500" />
+            ) : (
+              <Zap size={48} className="text-yellow-500" />
+            )
           ) : (
             <X size={48} className="text-red-500" />
           )}
@@ -603,7 +630,9 @@ export default function CalibrationScreen() {
 
         <Text variant="h3" className="text-center mb-0">
           {calibrationStatus === "success"
-            ? "Calibration Successful!"
+            ? signalQuality >= 70
+              ? "Calibration Complete"
+              : "Calibration Complete With Warning"
             : "Calibration Failed"}
         </Text>
         <Text className="text-muted-foreground text-center px-4">

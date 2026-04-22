@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -8,6 +9,7 @@ import os
 import threading
 import warnings
 from datetime import datetime
+from queue import Empty, Full, Queue
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -15,7 +17,9 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import matplotlib
 import neurokit2 as nk
+import numpy as np
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from pydantic import BaseModel, Field
 
@@ -63,12 +67,13 @@ from ui_previews import (
     trim_live_visual_snapshot,
 )
 
-STATUS_BYTES = 3
-TIMESTAMP_BYTES = 3
 BYTES_PER_SAMPLE = 3
 SAMPLES_PER_PACKET = 25
 CHANNELS = 3
-PACKET_BYTES = STATUS_BYTES + (BYTES_PER_SAMPLE * SAMPLES_PER_PACKET * CHANNELS) + TIMESTAMP_BYTES
+SIGNAL_BYTES = BYTES_PER_SAMPLE * SAMPLES_PER_PACKET * CHANNELS
+STATUS_BYTES = 3
+ELAPSED_TIME_BYTES = 3
+PACKET_BYTES = SIGNAL_BYTES + STATUS_BYTES + ELAPSED_TIME_BYTES
 CHANNEL_LABELS = ["CH2", "CH3", "CH4"]
 ADS1298_VREF = 2.4
 ADS1298_GAIN = 6.0
@@ -82,10 +87,19 @@ LAST_CALIBRATION_META = {
 
 ANALYSIS_JOBS: Dict[str, Dict[str, Any]] = {}
 DEFAULT_SAMPLE_RATE_HZ = 500
+REVIEW_WINDOW_SECONDS = 10
 REVIEW_ARTIFACT_CACHE: Dict[tuple[str, str, str], Dict[str, Any]] = {}
 VECTOR3D_IMAGE_CACHE: Dict[tuple[str, str, int, float, float, int], str] = {}
 VECTOR3D_PRELOAD_STATE: Dict[tuple[str, str, float, float, int], Dict[str, Any]] = {}
 VECTOR3D_PRELOAD_LOCK = threading.Lock()
+LIVE_EVENT_SUBSCRIBERS: list[Queue[str]] = []
+LIVE_EVENT_SUBSCRIBERS_LOCK = threading.Lock()
+STATIC_REVIEW_PROCESSING_VERSION = "static_review_meanbeat_v1"
+STATIC_REVIEW_PREFIX = "review-static"
+STATIC_REVIEW_WINDOW_SECONDS = 20
+STATIC_REVIEW_WINDOW_SAMPLES = DEFAULT_SAMPLE_RATE_HZ * STATIC_REVIEW_WINDOW_SECONDS
+STATIC_REVIEW_OUTLIER_Z_THRESHOLD = 2.5
+STATIC_REVIEW_IMAGE_CACHE: Dict[str, bytes] = {}
 
 
 def _normalize_iso_to_sg(value: Optional[str]) -> Optional[str]:
@@ -96,6 +110,37 @@ def _normalize_iso_to_sg(value: Optional[str]) -> Optional[str]:
         return parsed.astimezone(ZoneInfo("Asia/Singapore")).isoformat()
     except Exception:
         return value
+
+
+def _subscribe_live_events() -> Queue[str]:
+    subscriber: Queue[str] = Queue(maxsize=1)
+    with LIVE_EVENT_SUBSCRIBERS_LOCK:
+        LIVE_EVENT_SUBSCRIBERS.append(subscriber)
+    return subscriber
+
+
+def _unsubscribe_live_events(subscriber: Queue[str]) -> None:
+    with LIVE_EVENT_SUBSCRIBERS_LOCK:
+        if subscriber in LIVE_EVENT_SUBSCRIBERS:
+            LIVE_EVENT_SUBSCRIBERS.remove(subscriber)
+
+
+def _publish_live_event(event: Dict[str, Any]) -> None:
+    payload = json.dumps(event)
+    with LIVE_EVENT_SUBSCRIBERS_LOCK:
+        subscribers = list(LIVE_EVENT_SUBSCRIBERS)
+    for subscriber in subscribers:
+        try:
+            subscriber.put_nowait(payload)
+        except Full:
+            try:
+                subscriber.get_nowait()
+            except Exception:
+                pass
+            try:
+                subscriber.put_nowait(payload)
+            except Full:
+                pass
 
 
 def _decode_int16_le(payload: bytes) -> List[int]:
@@ -137,7 +182,7 @@ def _decode_ads1298_packets(payload: bytes) -> Dict[str, List[float]]:
     channels: Dict[str, List[float]] = {label: [] for label in CHANNEL_LABELS}
     for p in range(packet_count):
         base = p * PACKET_BYTES
-        offset = base + STATUS_BYTES  # skip status
+        offset = base + STATUS_BYTES
         for _ in range(SAMPLES_PER_PACKET):
             channels["CH2"].append(_counts_to_mv(_read24_signed_be(payload, offset)))
             offset += 3
@@ -196,25 +241,111 @@ def _packet_stats(payload: bytes) -> Dict[str, int]:
     packet_count = len(payload) // PACKET_BYTES
     sample_count_per_channel = packet_count * SAMPLES_PER_PACKET
     remainder = len(payload) % PACKET_BYTES
-    first_ts_ms = None
-    last_ts_ms = None
-    if TIMESTAMP_BYTES and packet_count > 0:
-        first_offset = PACKET_BYTES - TIMESTAMP_BYTES
-        last_offset = ((packet_count - 1) * PACKET_BYTES) + (PACKET_BYTES - TIMESTAMP_BYTES)
-        if last_offset + TIMESTAMP_BYTES <= len(payload):
-            first_ts_ms = _read24_unsigned_be(payload, first_offset)
-            last_ts_ms = _read24_unsigned_be(payload, last_offset)
+    elapsed_time_ms = 0
+    if ELAPSED_TIME_BYTES and packet_count > 0:
+        for packet_index in range(packet_count):
+            elapsed_offset = (packet_index * PACKET_BYTES) + (PACKET_BYTES - ELAPSED_TIME_BYTES)
+            if elapsed_offset + ELAPSED_TIME_BYTES <= len(payload):
+                elapsed_time_ms += _read24_unsigned_be(payload, elapsed_offset)
     stats: Dict[str, int] = {
         "packet_count": packet_count,
         "sample_count_per_channel": sample_count_per_channel,
         "remainder": remainder,
         "byte_length": len(payload),
+        "elapsed_time_ms": int(elapsed_time_ms),
     }
-    if first_ts_ms is not None:
-        stats["first_ts_ms"] = int(first_ts_ms)
-    if last_ts_ms is not None:
-        stats["last_ts_ms"] = int(last_ts_ms)
     return stats
+
+
+def _packet_elapsed_summary(payload: bytes, preview_count: int = 5) -> Dict[str, Any]:
+    packet_count = len(payload) // PACKET_BYTES
+    if packet_count <= 0:
+        return {
+            "packet_count": 0,
+            "preview_hex": [],
+            "preview_ms": [],
+            "min_ms": None,
+            "max_ms": None,
+            "mean_ms": None,
+            "total_ms": 0,
+        }
+
+    values: List[int] = []
+    preview_hex: List[str] = []
+    for packet_index in range(packet_count):
+        elapsed_offset = (packet_index * PACKET_BYTES) + (PACKET_BYTES - ELAPSED_TIME_BYTES)
+        raw_bytes = payload[elapsed_offset : elapsed_offset + ELAPSED_TIME_BYTES]
+        if len(raw_bytes) != ELAPSED_TIME_BYTES:
+            continue
+        value = _read24_unsigned_be(payload, elapsed_offset)
+        values.append(value)
+        if len(preview_hex) < preview_count:
+            preview_hex.append(raw_bytes.hex())
+
+    if not values:
+        return {
+            "packet_count": packet_count,
+            "preview_hex": preview_hex,
+            "preview_ms": [],
+            "min_ms": None,
+            "max_ms": None,
+            "mean_ms": None,
+            "total_ms": 0,
+        }
+
+    return {
+        "packet_count": packet_count,
+        "preview_hex": preview_hex,
+        "preview_ms": values[:preview_count],
+        "min_ms": min(values),
+        "max_ms": max(values),
+        "mean_ms": round(sum(values) / len(values), 3),
+        "total_ms": sum(values),
+    }
+
+
+def _effective_sps_from_stats(stats: Dict[str, int]) -> Optional[float]:
+    elapsed_time_ms = int(stats.get("elapsed_time_ms") or 0)
+    sample_count = int(stats.get("sample_count_per_channel") or 0)
+    if elapsed_time_ms <= 0 or sample_count <= 0:
+        return None
+    return round(float(sample_count) / (elapsed_time_ms / 1000.0), 4)
+
+
+def _resample_series(
+    samples: List[float],
+    source_sps: Optional[float],
+    target_sps: int,
+) -> List[float]:
+    if not samples:
+        return []
+    if source_sps is None or source_sps <= 0 or target_sps <= 0:
+        return list(samples)
+    if len(samples) < 2:
+        return list(samples)
+    if abs(float(source_sps) - float(target_sps)) < 1e-6:
+        return list(samples)
+
+    duration_seconds = len(samples) / float(source_sps)
+    target_count = max(1, int(round(duration_seconds * float(target_sps))))
+    if target_count == len(samples):
+        return list(samples)
+
+    source_positions = np.linspace(0.0, duration_seconds, num=len(samples), endpoint=False)
+    target_positions = np.linspace(0.0, duration_seconds, num=target_count, endpoint=False)
+    resampled = np.interp(target_positions, source_positions, np.asarray(samples, dtype=float))
+    return resampled.astype(float).tolist()
+
+
+def _resample_channels(
+    channels: Dict[str, List[float]],
+    source_sps: Optional[float],
+    target_sps: int,
+) -> Dict[str, List[float]]:
+    return {
+        label: _resample_series(channels.get(label, []), source_sps, target_sps)
+        for label in CHANNEL_LABELS
+    }
 
 
 def _handle_calibration_payload(
@@ -224,13 +355,18 @@ def _handle_calibration_payload(
     user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     stats = _packet_stats(data)
+    elapsed_summary = _packet_elapsed_summary(data)
     logger.info(
-        "[CALIBRATION] received run_id=%s byte_length=%s packet_count=%s sample_count_per_channel=%s remainder=%s",
+        "[CALIBRATION] received run_id=%s byte_length=%s packet_count=%s sample_count_per_channel=%s remainder=%s elapsed_preview_ms=%s elapsed_preview_hex=%s elapsed_mean_ms=%s elapsed_total_ms=%s",
         run_id,
         stats["byte_length"],
         stats["packet_count"],
         stats["sample_count_per_channel"],
         stats["remainder"],
+        elapsed_summary.get("preview_ms"),
+        elapsed_summary.get("preview_hex"),
+        elapsed_summary.get("mean_ms"),
+        elapsed_summary.get("total_ms"),
     )
     if stats["packet_count"] == 0:
         raise HTTPException(status_code=400, detail="No complete ECG packets received.")
@@ -240,12 +376,18 @@ def _handle_calibration_payload(
             detail=f"Payload length is not a multiple of packet size {PACKET_BYTES}.",
         )
 
-    channels = _decode_ads1298_packets(data)
+    effective_sps = _effective_sps_from_stats(stats)
+    decoded_channels = _decode_ads1298_packets(data)
+    channels = _resample_channels(
+        decoded_channels,
+        effective_sps or float(DEFAULT_SAMPLE_RATE_HZ),
+        DEFAULT_SAMPLE_RATE_HZ,
+    )
     ch2 = channels.get("CH2", [])
     if not ch2:
         raise HTTPException(status_code=400, detail="Decoded calibration signal is empty.")
     calibration_result = _process_window(ch2, DEFAULT_SAMPLE_RATE_HZ)
-    quality_percentage = 100 + round(
+    quality_percentage = round(
         _quality_to_percentage(calibration_result.get("quality")),
         2,
     )
@@ -259,13 +401,11 @@ def _handle_calibration_payload(
     LAST_CALIBRATION_SAMPLES.clear()
     LAST_CALIBRATION_SAMPLES.extend(calibration_result.get("cleaned", []))
     LAST_CALIBRATION_META["byte_length"] = stats["byte_length"]
-    LAST_CALIBRATION_META["sample_count"] = stats["sample_count_per_channel"]
+    LAST_CALIBRATION_META["sample_count"] = len(ch2)
 
-    stored_object_key = ""
-    if signal_suitable:
-        object_key = f"calibration/{run_id}.bin"
-        _upload_storage_bytes(object_key, data)
-        stored_object_key = object_key
+    object_key = f"calibration/{run_id}.bin"
+    _upload_storage_bytes(object_key, data)
+    stored_object_key = object_key
 
     record_id: Optional[str] = None
     if user_id and stored_object_key:
@@ -280,8 +420,10 @@ def _handle_calibration_payload(
                 "encoding": "ads1298_24be_mv",
                 "sample_rate_hz": 500,
                 "channels": 3,
-                "sample_count": stats["sample_count_per_channel"],
-                "duration_ms": round((stats["sample_count_per_channel"] / 500) * 1000),
+                "sample_count": len(ch2),
+                "duration_ms": int(stats.get("elapsed_time_ms") or round((stats["sample_count_per_channel"] / 500) * 1000)),
+                "elapsed_time_ms": stats.get("elapsed_time_ms"),
+                "effective_sps": effective_sps,
                 "byte_length": stats["byte_length"],
                 "status": "calibrated",
                 "notes": json.dumps(
@@ -303,11 +445,14 @@ def _handle_calibration_payload(
         )
 
     logger.info(
-        "[CALIBRATION] response run_id=%s quality_percentage=%.2f signal_suitable=%s stored_object_key=%s cleaned_samples=%s r_peaks=%s preview_lengths=%s",
+        "[CALIBRATION] response run_id=%s quality_percentage=%.2f signal_suitable=%s stored_object_key=%s effective_sps=%s raw_samples=%s resampled_samples=%s cleaned_samples=%s r_peaks=%s preview_lengths=%s",
         run_id,
         quality_percentage,
         signal_suitable,
         stored_object_key or "none",
+        effective_sps,
+        stats["sample_count_per_channel"],
+        len(ch2),
         len(calibration_result.get("cleaned", [])),
         len(calibration_result.get("r_peaks", [])),
         {label: len(previews.get(label, [])) for label in CHANNEL_LABELS},
@@ -342,17 +487,25 @@ def _validate_packet_payload(payload: bytes, context: str) -> Dict[str, int]:
             stats["remainder"],
         )
         raise HTTPException(status_code=400, detail="Invalid payload length.")
-    if stats.get("packet_count", 0) > 1 and "first_ts_ms" in stats and "last_ts_ms" in stats:
-        first_ts = stats["first_ts_ms"]
-        last_ts = stats["last_ts_ms"]
-        if first_ts == last_ts:
-            logger.error(
-                "[%s] invalid_timestamp_delta first_ts_ms=%s last_ts_ms=%s",
-                context,
-                first_ts,
-                last_ts,
-            )
-            raise HTTPException(status_code=400, detail="Invalid timestamp delta.")
+    if stats.get("packet_count", 0) > 0 and int(stats.get("elapsed_time_ms") or 0) <= 0:
+        logger.error(
+            "[%s] invalid_elapsed_time elapsed_time_ms=%s",
+            context,
+            stats.get("elapsed_time_ms"),
+        )
+        raise HTTPException(status_code=400, detail="Invalid elapsed time.")
+    elapsed_summary = _packet_elapsed_summary(payload)
+    mean_ms = elapsed_summary.get("mean_ms")
+    if mean_ms is not None and (float(mean_ms) <= 0.0 or float(mean_ms) > 1000.0):
+        logger.error(
+            "[%s] invalid_packet_elapsed preview_ms=%s preview_hex=%s mean_ms=%s total_ms=%s",
+            context,
+            elapsed_summary.get("preview_ms"),
+            elapsed_summary.get("preview_hex"),
+            elapsed_summary.get("mean_ms"),
+            elapsed_summary.get("total_ms"),
+        )
+        raise HTTPException(status_code=400, detail="Invalid packet elapsed timing.")
     return stats
 
 
@@ -376,8 +529,7 @@ def _store_session_chunk(
             "byte_length": stats["byte_length"],
             "packet_count": stats["packet_count"],
             "sample_count": stats["sample_count_per_channel"],
-            "first_ts_ms": stats.get("first_ts_ms"),
-            "last_ts_ms": stats.get("last_ts_ms"),
+            "elapsed_time_ms": stats.get("elapsed_time_ms"),
             "created_at": _sg_now_iso(),
         }
     )
@@ -409,34 +561,26 @@ def _finalize_session_upload(
     session_object_key = f"session/{session_id}.bin"
     normalized_start_time = _normalize_iso_to_sg(start_time)
     _upload_storage_bytes(session_object_key, payload)
-    duration_ms = round((stats["sample_count_per_channel"] / 500) * 1000)
-    effective_sps = None
-    if "first_ts_ms" in stats and "last_ts_ms" in stats:
-        first_ts = stats["first_ts_ms"]
-        last_ts = stats["last_ts_ms"]
-        if last_ts < first_ts:
-            last_ts += (1 << 24)
-        delta_ms = last_ts - first_ts
-        if delta_ms > 0:
-            effective_sps = round(
-                float(stats["sample_count_per_channel"]) / (delta_ms / 1000.0),
-                4,
-            )
-            duration_ms = int(delta_ms)
+    duration_ms = int(stats.get("elapsed_time_ms") or round((stats["sample_count_per_channel"] / 500) * 1000))
+    effective_sps = _effective_sps_from_stats(stats)
+    resampled_sample_count = (
+        max(1, int(round((duration_ms / 1000.0) * DEFAULT_SAMPLE_RATE_HZ)))
+        if duration_ms > 0
+        else stats["sample_count_per_channel"]
+    )
     _update_recording_row(
         record_id,
         {
             "user_id": user_id,
             "session_object_key": session_object_key,
-            "sample_count": stats["sample_count_per_channel"],
+            "sample_count": resampled_sample_count,
             "duration_ms": duration_ms,
             "start_time": normalized_start_time,
             "byte_length": stats["byte_length"],
             "encoding": "ads1298_24be_mv",
             "sample_rate_hz": 500,
             "channels": 3,
-            "first_ts_ms": stats.get("first_ts_ms"),
-            "last_ts_ms": stats.get("last_ts_ms"),
+            "elapsed_time_ms": stats.get("elapsed_time_ms"),
             "effective_sps": effective_sps,
             "notes": json.dumps(
                 {
@@ -481,6 +625,16 @@ def _finalize_session_upload(
             visual_snapshot["status"] = "ended"
             visual_snapshot["ended_at"] = ended_at
             visual_snapshot["updated_at"] = ended_at
+            _publish_live_event(
+                {
+                    "record_id": record_id,
+                    "session_id": state.get("session_id"),
+                    "status": "ended",
+                    "updated_at": ended_at,
+                    "total_samples_received": int(state.get("total_samples_received") or 0),
+                    "buffer_samples": int(visual_snapshot.get("buffer_samples") or 0),
+                }
+            )
     logger.info(
         "[%s] response record_id=%s session_object_key=%s duration_ms=%s",
         context,
@@ -517,8 +671,7 @@ def _refresh_live_session_state(
             "buffer": bytearray(),
             "total_packets_received": 0,
             "total_samples_received": 0,
-            "first_ts_ms": None,
-            "last_ts_ms": None,
+            "elapsed_time_ms": 0,
             "effective_sps": None,
             "last_hr_bpm": None,
             "preview_ch2": [],
@@ -533,24 +686,16 @@ def _refresh_live_session_state(
     state["is_active"] = True
     state["ended_at"] = None
     state.setdefault("total_samples_received", 0)
+    state.setdefault("elapsed_time_ms", 0)
     state["total_packets_received"] += stats["packet_count"]
     state["total_samples_received"] += stats["sample_count_per_channel"]
-    if "first_ts_ms" in stats and state.get("first_ts_ms") is None:
-        state["first_ts_ms"] = stats.get("first_ts_ms")
-    if "last_ts_ms" in stats:
-        state["last_ts_ms"] = stats.get("last_ts_ms")
+    state["elapsed_time_ms"] += int(stats.get("elapsed_time_ms") or 0)
 
-    if state.get("first_ts_ms") is not None and state.get("last_ts_ms") is not None:
-        first_ts = int(state["first_ts_ms"])
-        last_ts = int(state["last_ts_ms"])
-        if last_ts < first_ts:
-            last_ts += (1 << 24)
-        delta_ms = last_ts - first_ts
-        if delta_ms > 0:
-            state["effective_sps"] = round(
-                float(state["total_samples_received"]) / (delta_ms / 1000.0),
-                4,
-            )
+    if int(state.get("elapsed_time_ms") or 0) > 0:
+        state["effective_sps"] = round(
+            float(state["total_samples_received"]) / (float(state["elapsed_time_ms"]) / 1000.0),
+            4,
+        )
 
     channels = _decode_ads1298_packets(data)
     preview_ch2 = list(state.get("preview_ch2") or [])
@@ -613,35 +758,16 @@ def _refresh_live_session_state(
             "CH4": preview_ch4[-buffer_samples:],
         },
     }
-
-    try:
-        _upsert_live_preview_row(
-            {
-                "record_id": record_id,
-                "ch2_preview": preview_ch2[-buffer_samples:],
-                "ch3_preview": preview_ch3[-buffer_samples:],
-                "ch4_preview": preview_ch4[-buffer_samples:],
-                "sample_count": int(state.get("total_samples_received") or 0),
-                "last_ts_ms": state.get("last_ts_ms"),
-                "updated_at": updated_at,
-            }
-        )
-    except Exception as exc:  # pragma: no cover - best effort
-        logger.warning("[SESSION_ADD] live_preview_upsert_failed record_id=%s error=%s", record_id, exc)
-
-    try:
-        _update_recording_row(
-            record_id,
-            {
-                "packet_count": int(state.get("total_packets_received") or 0),
-                "sample_count": int(state.get("total_samples_received") or 0),
-                "first_ts_ms": state.get("first_ts_ms"),
-                "last_ts_ms": state.get("last_ts_ms"),
-                "effective_sps": state.get("effective_sps"),
-            },
-        )
-    except Exception as exc:  # pragma: no cover - best effort
-        logger.warning("[SESSION_ADD] record_update_failed record_id=%s error=%s", record_id, exc)
+    _publish_live_event(
+        {
+            "record_id": record_id,
+            "session_id": state.get("session_id"),
+            "status": state["visual_snapshot"]["status"],
+            "updated_at": updated_at,
+            "total_samples_received": int(state.get("total_samples_received") or 0),
+            "buffer_samples": buffer_samples,
+        }
+    )
 
     return {
         "record_id": record_id,
@@ -656,6 +782,79 @@ def _refresh_live_session_state(
         "reason_codes": [],
         "heart_rate_bpm": None,
     }
+
+
+def _persist_live_preview_state(record_id: str, context: str = "SESSION_ADD") -> None:
+    state = LIVE_SESSION_STATE.get(record_id)
+    if not state:
+        return
+    preview_ch2 = list(state.get("preview_ch2") or [])
+    preview_ch3 = list(state.get("preview_ch3") or [])
+    preview_ch4 = list(state.get("preview_ch4") or [])
+    buffer_samples = min(len(preview_ch2), len(preview_ch3), len(preview_ch4))
+    visual_snapshot = state.get("visual_snapshot")
+    updated_at = (
+        visual_snapshot.get("updated_at")
+        if isinstance(visual_snapshot, dict)
+        else None
+    ) or _sg_now_iso()
+
+    try:
+        _upsert_live_preview_row(
+            {
+                "record_id": record_id,
+                "ch2_preview": preview_ch2[-buffer_samples:],
+                "ch3_preview": preview_ch3[-buffer_samples:],
+                "ch4_preview": preview_ch4[-buffer_samples:],
+                "sample_count": int(state.get("total_samples_received") or 0),
+                "elapsed_time_ms": int(state.get("elapsed_time_ms") or 0),
+                "updated_at": updated_at,
+            }
+        )
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("[%s] live_preview_upsert_failed record_id=%s error=%s", context, record_id, exc)
+
+    try:
+        _update_recording_row(
+            record_id,
+            {
+                "packet_count": int(state.get("total_packets_received") or 0),
+                "sample_count": int(state.get("total_samples_received") or 0),
+                "elapsed_time_ms": int(state.get("elapsed_time_ms") or 0),
+                "effective_sps": state.get("effective_sps"),
+            },
+        )
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("[%s] record_update_failed record_id=%s error=%s", context, record_id, exc)
+
+
+def _persist_session_chunk_and_live_state(
+    *,
+    record_id: str,
+    session_id: str,
+    payload: bytes,
+    chunk_index: int,
+    stats: Dict[str, int],
+) -> None:
+    try:
+        _store_session_chunk(
+            record_id=record_id,
+            session_id=session_id,
+            payload=payload,
+            chunk_index=chunk_index,
+            context="SESSION_ADD",
+            stats=stats,
+        )
+    except Exception as exc:  # pragma: no cover - background best effort
+        logger.exception(
+            "[SESSION_ADD] deferred_store_failed record_id=%s session_id=%s chunk_index=%s error=%s",
+            record_id,
+            session_id,
+            chunk_index,
+            exc,
+        )
+        return
+    _persist_live_preview_state(record_id, context="SESSION_ADD")
 
 def _metrics_from_info(
     cleaned: List[float],
@@ -1174,7 +1373,7 @@ def _build_review_section_from_samples(
     samples: List[float],
     sample_rate_hz: int,
     include_interval_rows: bool = False,
-    window_seconds: int = 20,
+    window_seconds: int = REVIEW_WINDOW_SECONDS,
 ) -> Dict[str, Any]:
     processed = _process_window(samples, sample_rate_hz)
     cleaned = processed.get("cleaned", []) or list(samples)
@@ -1260,8 +1459,18 @@ def _artifact_type_for_channel(channel: str) -> str:
     return f"review_{channel.lower()}"
 
 
-def _process_review_artifacts_for_record(record_id: str) -> None:
-    logger.info("[PROCESSING] start record_id=%s", record_id)
+def _clear_review_caches_for_record(record_id: str) -> None:
+    for key in list(REVIEW_ARTIFACT_CACHE.keys()):
+        if key[0] == record_id:
+            REVIEW_ARTIFACT_CACHE.pop(key, None)
+    for key in list(VECTOR3D_IMAGE_CACHE.keys()):
+        if key[0] == record_id:
+            VECTOR3D_IMAGE_CACHE.pop(key, None)
+
+
+def _process_review_artifacts_for_record(record_id: str, *, resample: bool = True) -> None:
+    logger.info("[PROCESSING] start record_id=%s resample=%s", record_id, resample)
+    _clear_review_caches_for_record(record_id)
     _upsert_processed_record(record_id, status="processing", error_message=None)
     try:
         record = _fetch_recording_by_id(record_id)
@@ -1276,8 +1485,45 @@ def _process_review_artifacts_for_record(record_id: str) -> None:
         sample_rate_hz = int(record.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
         session_bytes = _fetch_storage_bytes(session_key)
         calibration_bytes = _fetch_storage_bytes(calibration_key)
-        decoded_session = _decode_ads1298_packets(session_bytes)
-        decoded_calibration = _decode_ads1298_packets(calibration_bytes)
+        session_elapsed_summary = _packet_elapsed_summary(session_bytes)
+        calibration_elapsed_summary = _packet_elapsed_summary(calibration_bytes)
+        logger.info(
+            "[PROCESSING] elapsed_decode record_id=%s calibration_preview_ms=%s calibration_preview_hex=%s calibration_mean_ms=%s calibration_total_ms=%s session_preview_ms=%s session_preview_hex=%s session_mean_ms=%s session_total_ms=%s",
+            record_id,
+            calibration_elapsed_summary.get("preview_ms"),
+            calibration_elapsed_summary.get("preview_hex"),
+            calibration_elapsed_summary.get("mean_ms"),
+            calibration_elapsed_summary.get("total_ms"),
+            session_elapsed_summary.get("preview_ms"),
+            session_elapsed_summary.get("preview_hex"),
+            session_elapsed_summary.get("mean_ms"),
+            session_elapsed_summary.get("total_ms"),
+        )
+        session_stats = _packet_stats(session_bytes)
+        calibration_stats = _packet_stats(calibration_bytes)
+        session_effective_sps = _effective_sps_from_stats(session_stats) or float(sample_rate_hz)
+        calibration_effective_sps = _effective_sps_from_stats(calibration_stats) or float(sample_rate_hz)
+        decoded_session_raw = _decode_ads1298_packets(session_bytes)
+        decoded_calibration_raw = _decode_ads1298_packets(calibration_bytes)
+        if resample:
+            decoded_session = _resample_channels(decoded_session_raw, session_effective_sps, sample_rate_hz)
+            decoded_calibration = _resample_channels(decoded_calibration_raw, calibration_effective_sps, sample_rate_hz)
+        else:
+            decoded_session = decoded_session_raw
+            decoded_calibration = decoded_calibration_raw
+
+        logger.info(
+            "[PROCESSING] transform record_id=%s resample=%s sample_rate_hz=%s calibration_effective_sps=%s calibration_raw_samples=%s calibration_processed_samples=%s session_effective_sps=%s session_raw_samples=%s session_processed_samples=%s",
+            record_id,
+            resample,
+            sample_rate_hz,
+            calibration_effective_sps,
+            calibration_stats.get("sample_count_per_channel"),
+            len(decoded_calibration.get("CH2", [])),
+            session_effective_sps,
+            session_stats.get("sample_count_per_channel"),
+            len(decoded_session.get("CH2", [])),
+        )
 
         for channel in CHANNEL_LABELS:
             artifact = _build_review_artifact(
@@ -1296,10 +1542,10 @@ def _process_review_artifacts_for_record(record_id: str) -> None:
             _upsert_processed_artifact(record_id, _artifact_type_for_channel(channel), object_key)
             REVIEW_ARTIFACT_CACHE[_review_cache_key(record_id, channel)] = artifact
         _upsert_processed_record(record_id, status="ready", error_message=None)
-        logger.info("[PROCESSING] ready record_id=%s", record_id)
+        logger.info("[PROCESSING] ready record_id=%s resample=%s", record_id, resample)
     except Exception as exc:
         _upsert_processed_record(record_id, status="error", error_message=str(exc))
-        logger.exception("[PROCESSING] failed record_id=%s", record_id)
+        logger.exception("[PROCESSING] failed record_id=%s resample=%s", record_id, resample)
         raise
 
 
@@ -1319,34 +1565,115 @@ def _load_review_artifact(record_id: str, channel: str) -> Dict[str, Any]:
         or processed.get("processing_version") != REVIEW_PROCESSING_VERSION
         or not artifact_key
     ):
-        _process_review_artifacts_for_record(record_id)
-        artifact_key = _fetch_processed_artifact_key(record_id, artifact_type)
-        if not artifact_key:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Processed review artifact missing for record_id={record_id}, channel={channel}.",
-            )
+        logger.info(
+            "[REVIEW] artifacts_not_ready record_id=%s channel=%s processed_status=%s artifact_key=%r processing_version=%s",
+            record_id,
+            channel,
+            processed.get("status") if processed else None,
+            artifact_key,
+            processed.get("processing_version") if processed else None,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "review_artifacts_not_ready",
+                "record_id": record_id,
+                "channel": channel,
+                "processed_status": processed.get("status") if processed else None,
+                "artifact_key": artifact_key,
+                "processing_version": processed.get("processing_version") if processed else None,
+            },
+        )
     try:
         artifact = _fetch_storage_json(artifact_key)
     except HTTPException as exc:
         if exc.status_code != 502:
             raise
         logger.warning(
-            "[PROCESSING] artifact fetch failed record_id=%s channel=%s object_key=%s; regenerating",
+            "[REVIEW] artifact_fetch_unavailable record_id=%s channel=%s object_key=%s",
             record_id,
             channel,
             artifact_key,
         )
-        _process_review_artifacts_for_record(record_id)
-        artifact_key = _fetch_processed_artifact_key(record_id, artifact_type)
-        if not artifact_key:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Processed review artifact missing after regeneration for record_id={record_id}, channel={channel}.",
-            ) from exc
-        artifact = _fetch_storage_json(artifact_key)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "review_artifact_fetch_unavailable",
+                "record_id": record_id,
+                "channel": channel,
+                "artifact_key": artifact_key,
+            },
+        ) from exc
     REVIEW_ARTIFACT_CACHE[cache_key] = artifact
     return artifact
+
+
+def _slice_signal_markers_for_window(
+    signal_markers: Optional[Dict[str, List[int]]],
+    start_index: int,
+    end_index: int,
+) -> Dict[str, List[int]]:
+    sliced: Dict[str, List[int]] = {}
+    for label, positions in (signal_markers or {}).items():
+        sliced[label] = [
+            position - start_index
+            for position in positions
+            if start_index <= position < end_index
+        ]
+    return sliced
+
+
+def _build_review_section_summary(section: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "meta": section.get("meta", {}),
+        "beats": section.get("beats", {"count": 0, "items": []}),
+        "beat_count_total": section.get("beat_count_total", 0),
+        "beat_count_included": section.get("beat_count_included", 0),
+        "beat_count_excluded": section.get("beat_count_excluded", 0),
+        "excluded_reason_counts": section.get("excluded_reason_counts", {}),
+        "window_count": section.get("window_count", 1),
+        "interval_related": section.get("interval_related"),
+        "interval_related_rows": section.get("interval_related_rows", []),
+    }
+
+
+def _build_review_window_section(
+    section: Dict[str, Any],
+    sample_rate_hz: int,
+    window_index: int,
+    window_seconds: int = REVIEW_WINDOW_SECONDS,
+) -> Dict[str, Any]:
+    signal = list((section.get("signal", {}) or {}).get("full", []) or [])
+    signal_markers = (section.get("signal", {}) or {}).get("markers", {}) or {}
+    r_peaks = list((section.get("signal", {}) or {}).get("r_peaks", []) or [])
+    beats = list((section.get("beats", {}) or {}).get("items", []) or [])
+    window_samples = max(1, sample_rate_hz * window_seconds)
+    window_count = max(1, (len(signal) + window_samples - 1) // window_samples)
+    bounded_window_index = max(1, min(window_index, window_count))
+    start_index = (bounded_window_index - 1) * window_samples
+    end_index = min(len(signal), start_index + window_samples)
+    interval_rows = list(section.get("interval_related_rows", []) or [])
+    interval_related = next(
+        (row for row in interval_rows if row.get("interval_index") == bounded_window_index),
+        None,
+    )
+    return {
+        "meta": section.get("meta", {}),
+        "signal": {
+            "full": signal[start_index:end_index],
+            "r_peaks": [peak - start_index for peak in r_peaks if start_index <= peak < end_index],
+            "markers": _slice_signal_markers_for_window(signal_markers, start_index, end_index),
+        },
+        "beats": {
+            "count": len([beat for beat in beats if beat.get("window_index") == bounded_window_index]),
+            "items": [beat for beat in beats if beat.get("window_index") == bounded_window_index],
+        },
+        "window_index": bounded_window_index,
+        "window_count": window_count,
+        "window_start_sample": start_index + 1 if signal else 1,
+        "window_end_sample": end_index,
+        "interval_related": interval_related,
+    }
 
 
 def _build_review_section(
@@ -1416,6 +1743,15 @@ def _set_job(job_id: str, **fields: Any) -> None:
 
 class SessionAnalysisStartRequest(BaseModel):
     record_id: str = Field(..., description="Supabase ecg_recordings.id")
+
+
+class ReviewProcessRequest(BaseModel):
+    resample: bool = True
+
+
+class StaticReviewProcessRequest(BaseModel):
+    max_windows: Optional[int] = None
+    force: bool = False
 
 
 class CalibrationSignalQualityResponse(BaseModel):
@@ -1531,12 +1867,43 @@ class ReviewSection(BaseModel):
     interval_related_rows: List[ReviewIntervalRow] = Field(default_factory=list)
 
 
-class ReviewResponse(BaseModel):
+class ReviewSectionSummary(BaseModel):
+    meta: ReviewMeta
+    beats: ReviewBeats
+    beat_count_total: int = 0
+    beat_count_included: int = 0
+    beat_count_excluded: int = 0
+    excluded_reason_counts: Dict[str, int] = Field(default_factory=dict)
+    window_count: int = 1
+    interval_related: Optional[ReviewIntervalRow] = None
+    interval_related_rows: List[ReviewIntervalRow] = Field(default_factory=list)
+
+
+class ReviewSummaryResponse(BaseModel):
     record_id: str
     channel: str
     sample_rate_hz: int
-    calibration: ReviewSection
-    session: ReviewSection
+    calibration: ReviewSectionSummary
+    session: ReviewSectionSummary
+
+
+class ReviewWindowSection(BaseModel):
+    meta: ReviewMeta
+    signal: ReviewSignal
+    beats: ReviewBeats
+    window_index: int = 1
+    window_count: int = 1
+    window_start_sample: int = 1
+    window_end_sample: int = 0
+    interval_related: Optional[ReviewIntervalRow] = None
+
+
+class ReviewWindowResponse(BaseModel):
+    record_id: str
+    channel: str
+    sample_rate_hz: int
+    section: str
+    window: ReviewWindowSection
 
 
 class ReviewSessionWindowResponse(BaseModel):
@@ -1711,6 +2078,24 @@ async def session_live_visual(
 
     state = LIVE_SESSION_STATE.get(selected_record_id)
     snapshot = state.get("visual_snapshot") if state else None
+    if (
+        not isinstance(snapshot, dict)
+        or int(snapshot.get("buffer_samples") or 0) <= 0
+    ):
+        latest_persisted_preview = _fetch_latest_live_preview_row()
+        latest_persisted_record_id = latest_persisted_preview.get("record_id") if latest_persisted_preview else None
+        if (
+            latest_persisted_preview
+            and latest_persisted_record_id
+            and (
+                latest_persisted_record_id != selected_record_id
+                or int(latest_persisted_preview.get("sample_count") or 0) > 0
+            )
+        ):
+            persisted_preview = latest_persisted_preview
+            selected_record_id = str(latest_persisted_record_id)
+            state = LIVE_SESSION_STATE.get(selected_record_id)
+            snapshot = state.get("visual_snapshot") if state else None
     if not isinstance(snapshot, dict):
         persisted_preview = persisted_preview or _fetch_live_preview_row(selected_record_id)
         if persisted_preview:
@@ -1775,6 +2160,39 @@ async def session_live_visual(
         payload.get("status"),
     )
     return LiveSessionVisualResponse(**payload)
+
+
+@app.get("/session/live/events")
+async def session_live_events(request: Request, record_id: Optional[str] = None) -> StreamingResponse:
+    subscriber = _subscribe_live_events()
+
+    async def stream():
+        try:
+            yield b": connected\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    payload = await asyncio.to_thread(subscriber.get, True, 15.0)
+                except Empty:
+                    yield b": keep-alive\n\n"
+                    continue
+                event = json.loads(payload)
+                if record_id and str(event.get("record_id")) != record_id:
+                    continue
+                yield f"event: preview\ndata: {payload}\n\n".encode("utf-8")
+        finally:
+            _unsubscribe_live_events(subscriber)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/session/start", response_model=SessionStartResponse)
@@ -1848,8 +2266,7 @@ async def session_start(payload: SessionStartRequest) -> SessionStartResponse:
         "session_id": payload.session_id,
         "total_packets_received": 0,
         "total_samples_received": 0,
-        "first_ts_ms": None,
-        "last_ts_ms": None,
+        "elapsed_time_ms": 0,
         "effective_sps": None,
         "last_hr_bpm": None,
         "preview_ch2": [],
@@ -1868,7 +2285,7 @@ async def session_start(payload: SessionStartRequest) -> SessionStartResponse:
                 "ch3_preview": [],
                 "ch4_preview": [],
                 "sample_count": 0,
-                "last_ts_ms": None,
+                "elapsed_time_ms": 0,
                 "updated_at": _sg_now_iso(),
             }
         )
@@ -1883,7 +2300,7 @@ async def session_start(payload: SessionStartRequest) -> SessionStartResponse:
 
 
 @app.post("/add_to_session", response_model=SessionChunkResponse)
-async def add_to_session(request: Request) -> SessionChunkResponse:
+async def add_to_session(request: Request, background_tasks: BackgroundTasks) -> SessionChunkResponse:
     payload = await request.body()
     record_id = request.headers.get("X-Record-Id")
     session_id = request.headers.get("X-Session-Id")
@@ -1909,27 +2326,6 @@ async def add_to_session(request: Request) -> SessionChunkResponse:
     if stats["packet_count"] == 0:
         raise HTTPException(status_code=400, detail="No complete ECG packets received.")
     try:
-        _store_session_chunk(
-            record_id=record_id,
-            session_id=session_id,
-            payload=payload,
-            chunk_index=chunk_index,
-            context="SESSION_ADD",
-            stats=stats,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover - unexpected failure
-        logger.exception(
-            "[SESSION_ADD] store_failed record_id=%s session_id=%s chunk_index=%s error=%s",
-            record_id,
-            session_id,
-            chunk_index,
-            exc,
-        )
-        raise HTTPException(status_code=502, detail=f"Failed to store session chunk: {exc}") from exc
-
-    try:
         _refresh_live_session_state(
             data=payload,
             stats=stats,
@@ -1945,6 +2341,14 @@ async def add_to_session(request: Request) -> SessionChunkResponse:
             chunk_index,
             exc,
         )
+    background_tasks.add_task(
+        _persist_session_chunk_and_live_state,
+        record_id=record_id,
+        session_id=session_id,
+        payload=payload,
+        chunk_index=chunk_index,
+        stats=stats,
+    )
     return SessionChunkResponse(
         record_id=record_id,
         session_id=session_id,
@@ -2052,6 +2456,498 @@ def _session_analysis_job(job_id: str, record_id: str) -> None:
         )
 
 
+def _review_processing_job(job_id: str, record_id: str, resample: bool) -> None:
+    logger.info("[REVIEW_PROCESS] start job_id=%s record_id=%s resample=%s", job_id, record_id, resample)
+    _set_job(
+        job_id,
+        status="running",
+        record_id=record_id,
+        details={"resample": resample},
+        error=None,
+    )
+    try:
+        _process_review_artifacts_for_record(record_id, resample=resample)
+        _set_job(
+            job_id,
+            status="ready",
+            record_id=record_id,
+            details={"resample": resample},
+            error=None,
+        )
+        logger.info("[REVIEW_PROCESS] ready job_id=%s record_id=%s resample=%s", job_id, record_id, resample)
+    except Exception as exc:
+        _set_job(
+            job_id,
+            status="error",
+            record_id=record_id,
+            details={"resample": resample},
+            error=str(exc),
+        )
+        logger.exception("[REVIEW_PROCESS] failed job_id=%s record_id=%s resample=%s", job_id, record_id, resample)
+
+
+def _static_review_manifest_key(record_id: str) -> str:
+    return f"{STATIC_REVIEW_PREFIX}/{record_id}/manifest.json"
+
+
+def _static_review_window_prefix(record_id: str, window_index: int) -> str:
+    return f"{STATIC_REVIEW_PREFIX}/{record_id}/windows/window_{window_index:04d}"
+
+
+def _upload_static_manifest(record_id: str, manifest: Dict[str, Any]) -> None:
+    _upload_storage_json(_static_review_manifest_key(record_id), manifest)
+
+
+def _load_static_review_manifest(record_id: str) -> Dict[str, Any]:
+    try:
+        return _fetch_storage_json(_static_review_manifest_key(record_id))
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "static_review_manifest_not_found",
+                "record_id": record_id,
+                "manifest_key": _static_review_manifest_key(record_id),
+            },
+        ) from exc
+
+
+def _clean_ecg_series(samples: List[float], sample_rate_hz: int) -> np.ndarray:
+    if not samples:
+        return np.array([], dtype=float)
+    try:
+        return np.asarray(
+            nk.ecg_clean(samples, sampling_rate=sample_rate_hz, method="neurokit"),
+            dtype=float,
+        )
+    except Exception as exc:
+        logger.warning("[STATIC_REVIEW] ecg_clean fallback raw error=%s", exc)
+        return np.asarray(samples, dtype=float)
+
+
+def _segments_to_epoch_axis(segments: Dict[str, Any]) -> np.ndarray:
+    if not segments:
+        return np.array([], dtype=float)
+    first_key = next(iter(segments))
+    epoch = segments[first_key]
+    try:
+        return np.asarray(epoch.index, dtype=float)
+    except Exception:
+        return np.arange(len(epoch), dtype=float)
+
+
+def segmentation_timestamps_fromCH4(
+    raw_ch4_20s: List[float],
+    sample_rate_hz: int = DEFAULT_SAMPLE_RATE_HZ,
+) -> Dict[str, Any]:
+    cleaned_ch4 = _clean_ecg_series(raw_ch4_20s, sample_rate_hz)
+    if cleaned_ch4.size < sample_rate_hz:
+        return {
+            "cleaned_ch4": cleaned_ch4,
+            "rpeaks": np.array([], dtype=int),
+            "epoch_axis": np.array([], dtype=float),
+            "center_idx": 0,
+            "boundaries": [],
+        }
+    try:
+        _, peak_info = nk.ecg_peaks(cleaned_ch4, sampling_rate=sample_rate_hz, method="neurokit")
+        rpeaks = np.asarray(peak_info.get("ECG_R_Peaks", []), dtype=int)
+    except Exception as exc:
+        logger.warning("[STATIC_REVIEW] ecg_peaks failed error=%s", exc)
+        rpeaks = np.array([], dtype=int)
+    if rpeaks.size == 0:
+        return {
+            "cleaned_ch4": cleaned_ch4,
+            "rpeaks": rpeaks,
+            "epoch_axis": np.array([], dtype=float),
+            "center_idx": 0,
+            "boundaries": [],
+        }
+
+    try:
+        segments = nk.ecg_segment(
+            cleaned_ch4,
+            rpeaks=rpeaks,
+            sampling_rate=sample_rate_hz,
+            show=False,
+        )
+        epoch_axis = _segments_to_epoch_axis(segments)
+    except Exception as exc:
+        logger.warning("[STATIC_REVIEW] ecg_segment failed error=%s", exc)
+        # Fallback keeps a 35/65 split similar to NeuroKit's default segmented window.
+        beat_len = int(round(sample_rate_hz * 0.8))
+        pre = int(round(beat_len * 0.35))
+        epoch_axis = (np.arange(beat_len) - pre) / float(sample_rate_hz)
+
+    if epoch_axis.size == 0:
+        return {
+            "cleaned_ch4": cleaned_ch4,
+            "rpeaks": rpeaks,
+            "epoch_axis": epoch_axis,
+            "center_idx": 0,
+            "boundaries": [],
+        }
+
+    center_idx = int(np.argmin(np.abs(epoch_axis)))
+    beat_length = int(epoch_axis.size)
+    boundaries = []
+    for rpeak in rpeaks:
+        start = int(rpeak) - center_idx
+        end = start + beat_length - 1
+        boundaries.append({"rpeak": int(rpeak), "start": start, "end": end})
+    return {
+        "cleaned_ch4": cleaned_ch4,
+        "rpeaks": rpeaks,
+        "epoch_axis": epoch_axis,
+        "center_idx": center_idx,
+        "boundaries": boundaries,
+    }
+
+
+def _beat_matrix_from_boundaries(
+    cleaned: np.ndarray,
+    boundaries: List[Dict[str, int]],
+    beat_length: int,
+) -> np.ndarray:
+    beats: List[np.ndarray] = []
+    for boundary in boundaries:
+        start = int(boundary["start"])
+        end = int(boundary["end"]) + 1
+        if start < 0 or end > cleaned.size:
+            continue
+        beat = cleaned[start:end]
+        if beat.size == beat_length:
+            beats.append(beat.astype(float))
+    if not beats:
+        return np.empty((0, beat_length), dtype=float)
+    return np.vstack(beats)
+
+
+def _reject_outlier_beats(
+    beat_matrix: np.ndarray,
+    z_threshold: float = STATIC_REVIEW_OUTLIER_Z_THRESHOLD,
+) -> tuple[np.ndarray, np.ndarray]:
+    if beat_matrix.size == 0 or beat_matrix.shape[0] <= 2:
+        keep = np.ones((beat_matrix.shape[0],), dtype=bool)
+        return beat_matrix, keep
+    center = np.nanmedian(beat_matrix, axis=0)
+    spread = np.nanstd(beat_matrix, axis=0)
+    spread = np.where(spread < 1e-9, np.nan, spread)
+    z_scores = np.abs((beat_matrix - center) / spread)
+    per_beat_score = np.nanmax(z_scores, axis=1)
+    keep = np.isfinite(per_beat_score) & (per_beat_score <= z_threshold)
+    if not np.any(keep):
+        keep = np.ones((beat_matrix.shape[0],), dtype=bool)
+    return beat_matrix[keep], keep
+
+
+def raw20s_to_meanbeat(
+    raw_window: Dict[str, List[float]],
+    ch4_segmentation: Dict[str, Any],
+    sample_rate_hz: int = DEFAULT_SAMPLE_RATE_HZ,
+) -> Dict[str, Any]:
+    epoch_axis = np.asarray(ch4_segmentation.get("epoch_axis", []), dtype=float)
+    boundaries = list(ch4_segmentation.get("boundaries", []))
+    beat_length = int(epoch_axis.size)
+    if beat_length <= 0 or not boundaries:
+        raise ValueError("Cannot compute mean beat without CH4-derived segmentation boundaries.")
+
+    mean_beats: Dict[str, List[float]] = {}
+    raw_counts: Dict[str, int] = {}
+    kept_counts: Dict[str, int] = {}
+    for channel in CHANNEL_LABELS:
+        cleaned = _clean_ecg_series(raw_window.get(channel, []), sample_rate_hz)
+        beat_matrix = _beat_matrix_from_boundaries(cleaned, boundaries, beat_length)
+        filtered_matrix, keep_mask = _reject_outlier_beats(beat_matrix)
+        if filtered_matrix.size == 0:
+            mean = np.full((beat_length,), np.nan, dtype=float)
+        else:
+            mean = np.nanmean(filtered_matrix, axis=0)
+        mean_beats[channel] = mean.astype(float).tolist()
+        raw_counts[channel] = int(beat_matrix.shape[0])
+        kept_counts[channel] = int(np.sum(keep_mask)) if keep_mask.size else 0
+
+    return {
+        "epoch_axis": epoch_axis.astype(float).tolist(),
+        "mean_beats": mean_beats,
+        "raw_beat_counts": raw_counts,
+        "kept_beat_counts": kept_counts,
+    }
+
+
+def _window_channels(channels: Dict[str, List[float]], start: int, end: int) -> Dict[str, List[float]]:
+    return {channel: list(channels.get(channel, [])[start:end]) for channel in CHANNEL_LABELS}
+
+
+def _plot_to_png_bytes(fig: plt.Figure) -> bytes:
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=100, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    payload = buffer.getvalue()
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(payload))
+        optimized = io.BytesIO()
+        image.save(optimized, format="PNG", optimize=True)
+        payload = optimized.getvalue()
+    except Exception:
+        pass
+    return payload
+
+
+def _safe_series(values: List[float]) -> np.ndarray:
+    return np.asarray(values, dtype=float)
+
+
+def _finite_axis_limit(*arrays: np.ndarray, default: float = 0.25) -> float:
+    finite_values: List[float] = []
+    for array in arrays:
+        finite = np.asarray(array, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        if finite.size:
+            finite_values.append(float(np.max(np.abs(finite))))
+    max_abs = max(finite_values) if finite_values else default
+    return max(default, max_abs * 1.15)
+
+
+def _make_waveform_compare_png(
+    calibration: Dict[str, Any],
+    session: Dict[str, Any],
+    channel: str,
+    window_label: str,
+) -> bytes:
+    cal_x = _safe_series(calibration["epoch_axis"])
+    ses_x = _safe_series(session["epoch_axis"])
+    cal_y = _safe_series(calibration["mean_beats"][channel])
+    ses_y = _safe_series(session["mean_beats"][channel])
+    y_limit = _finite_axis_limit(cal_y, ses_y, default=0.15)
+    fig, ax = plt.subplots(figsize=(5.6, 4.2))
+    ax.plot(cal_x, cal_y, color="#8a8f98", linewidth=1.6, label="Calibration")
+    ax.plot(ses_x, ses_y, color="#d13f3f", linewidth=1.6, label="Session window")
+    ax.axhline(0, color="#607080", linewidth=0.8, alpha=0.35)
+    ax.axvline(0, color="#607080", linewidth=0.8, alpha=0.35)
+    ax.set_ylim(-y_limit, y_limit)
+    ax.set_title(f"{channel} representative mean beat\\n{window_label}", fontsize=11)
+    ax.set_xlabel("Aligned beat axis (s)")
+    ax.set_ylabel("mV")
+    ax.grid(True, alpha=0.22)
+    ax.legend(loc="upper right", fontsize=8)
+    return _plot_to_png_bytes(fig)
+
+
+def _make_2d_vcg_compare_png(
+    calibration: Dict[str, Any],
+    session: Dict[str, Any],
+    plane: str,
+    x_channel: str,
+    y_channel: str,
+    window_label: str,
+) -> bytes:
+    cal_x = _safe_series(calibration["mean_beats"][x_channel])
+    cal_y = _safe_series(calibration["mean_beats"][y_channel])
+    ses_x = _safe_series(session["mean_beats"][x_channel])
+    ses_y = _safe_series(session["mean_beats"][y_channel])
+    limit = _finite_axis_limit(cal_x, cal_y, ses_x, ses_y, default=0.15)
+    fig, ax = plt.subplots(figsize=(5.6, 4.2))
+    ax.plot(cal_x, cal_y, color="#8a8f98", linewidth=1.5, label="Calibration")
+    ax.plot(ses_x, ses_y, color="#d13f3f", linewidth=1.5, label="Session window")
+    ax.axhline(0, color="#607080", linewidth=0.8, alpha=0.35)
+    ax.axvline(0, color="#607080", linewidth=0.8, alpha=0.35)
+    ax.set_xlim(-limit, limit)
+    ax.set_ylim(-limit, limit)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title(f"{plane} VCG-style comparison\\n{window_label}", fontsize=11)
+    ax.set_xlabel(f"{x_channel} (mV)")
+    ax.set_ylabel(f"{y_channel} (mV)")
+    ax.grid(True, alpha=0.22)
+    ax.legend(loc="upper right", fontsize=8)
+    return _plot_to_png_bytes(fig)
+
+
+def _make_3d_vcg_compare_png(
+    calibration: Dict[str, Any],
+    session: Dict[str, Any],
+    window_label: str,
+) -> bytes:
+    cal_x = _safe_series(calibration["mean_beats"]["CH2"])
+    cal_y = _safe_series(calibration["mean_beats"]["CH4"])
+    cal_z = _safe_series(calibration["mean_beats"]["CH3"])
+    ses_x = _safe_series(session["mean_beats"]["CH2"])
+    ses_y = _safe_series(session["mean_beats"]["CH4"])
+    ses_z = _safe_series(session["mean_beats"]["CH3"])
+    limit = _finite_axis_limit(cal_x, cal_y, cal_z, ses_x, ses_y, ses_z, default=0.15)
+    fig = plt.figure(figsize=(5.6, 4.2))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot(cal_x, cal_y, cal_z, color="#8a8f98", linewidth=1.3, label="Calibration")
+    ax.plot(ses_x, ses_y, ses_z, color="#d13f3f", linewidth=1.3, label="Session window")
+    ax.set_xlim(-limit, limit)
+    ax.set_ylim(-limit, limit)
+    ax.set_zlim(-limit, limit)
+    ax.set_xlabel("CH2")
+    ax.set_ylabel("CH4")
+    ax.set_zlabel("CH3")
+    ax.set_title(f"3D VCG-style comparison\\n{window_label}", fontsize=11)
+    ax.view_init(elev=24, azim=42)
+    ax.legend(loc="upper left", fontsize=8)
+    return _plot_to_png_bytes(fig)
+
+
+def _generate_static_review_window_images(
+    record_id: str,
+    window_index: int,
+    window_label: str,
+    calibration_result: Dict[str, Any],
+    session_result: Dict[str, Any],
+) -> Dict[str, str]:
+    prefix = _static_review_window_prefix(record_id, window_index)
+    image_payloads = {
+        "ch2": _make_waveform_compare_png(calibration_result, session_result, "CH2", window_label),
+        "ch3": _make_waveform_compare_png(calibration_result, session_result, "CH3", window_label),
+        "ch4": _make_waveform_compare_png(calibration_result, session_result, "CH4", window_label),
+        "frontal": _make_2d_vcg_compare_png(calibration_result, session_result, "Frontal Plane", "CH2", "CH3", window_label),
+        "transverse": _make_2d_vcg_compare_png(calibration_result, session_result, "Transverse Plane", "CH2", "CH4", window_label),
+        "sagittal": _make_2d_vcg_compare_png(calibration_result, session_result, "Sagittal Plane", "CH4", "CH3", window_label),
+        "vcg3d": _make_3d_vcg_compare_png(calibration_result, session_result, window_label),
+    }
+    image_keys: Dict[str, str] = {}
+    for name, payload in image_payloads.items():
+        object_key = f"{prefix}/{name}.png"
+        _upload_storage_bytes(object_key, payload)
+        STATIC_REVIEW_IMAGE_CACHE[object_key] = payload
+        image_keys[name] = object_key
+    return image_keys
+
+
+def _static_review_job(job_id: str, record_id: str, max_windows: Optional[int] = None, force: bool = False) -> None:
+    logger.info("[STATIC_REVIEW] start job_id=%s record_id=%s max_windows=%s force=%s", job_id, record_id, max_windows, force)
+    _set_job(job_id, status="running", record_id=record_id, details={"completed_window_count": 0}, error=None)
+    try:
+        if not force:
+            try:
+                existing = _load_static_review_manifest(record_id)
+                if existing.get("processing_version") == STATIC_REVIEW_PROCESSING_VERSION and existing.get("status") == "ready":
+                    _set_job(job_id, status="ready", record_id=record_id, details=existing, error=None)
+                    return
+            except HTTPException:
+                pass
+
+        record = _fetch_recording_by_id(record_id)
+        session_key = record.get("session_object_key")
+        calibration_key = record.get("calibration_object_key")
+        if not session_key or not calibration_key:
+            raise HTTPException(status_code=400, detail="Missing session_object_key or calibration_object_key in record.")
+
+        sample_rate_hz = int(record.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
+        window_samples = sample_rate_hz * STATIC_REVIEW_WINDOW_SECONDS
+        session_bytes = _fetch_storage_bytes(session_key)
+        calibration_bytes = _fetch_storage_bytes(calibration_key)
+        session_channels = _decode_ads1298_packets(session_bytes)
+        calibration_channels = _decode_ads1298_packets(calibration_bytes)
+
+        calibration_window = _window_channels(calibration_channels, 0, window_samples)
+        calibration_segmentation = segmentation_timestamps_fromCH4(calibration_window["CH4"], sample_rate_hz)
+        calibration_result = raw20s_to_meanbeat(calibration_window, calibration_segmentation, sample_rate_hz)
+
+        total_window_count = min(len(session_channels.get("CH2", [])), len(session_channels.get("CH3", [])), len(session_channels.get("CH4", []))) // window_samples
+        if max_windows is not None and max_windows > 0:
+            total_to_process = min(total_window_count, max_windows)
+        else:
+            total_to_process = total_window_count
+
+        manifest: Dict[str, Any] = {
+            "record_id": record_id,
+            "status": "running",
+            "processing_version": STATIC_REVIEW_PROCESSING_VERSION,
+            "sample_rate_hz": sample_rate_hz,
+            "window_seconds": STATIC_REVIEW_WINDOW_SECONDS,
+            "window_samples": window_samples,
+            "total_window_count": total_window_count,
+            "target_window_count": total_to_process,
+            "completed_window_count": 0,
+            "calibration_object_key": calibration_key,
+            "session_object_key": session_key,
+            "manifest_object_key": _static_review_manifest_key(record_id),
+            "windows": [],
+            "created_at": _sg_now_iso(),
+            "updated_at": _sg_now_iso(),
+        }
+        _upload_static_manifest(record_id, manifest)
+
+        for zero_index in range(total_to_process):
+            start = zero_index * window_samples
+            end = start + window_samples
+            window_index = zero_index + 1
+            start_sec = start / sample_rate_hz
+            end_sec = end / sample_rate_hz
+            window_label = f"Window {window_index} | {start_sec:.0f}s - {end_sec:.0f}s"
+            try:
+                session_window = _window_channels(session_channels, start, end)
+                session_segmentation = segmentation_timestamps_fromCH4(session_window["CH4"], sample_rate_hz)
+                session_result = raw20s_to_meanbeat(session_window, session_segmentation, sample_rate_hz)
+                images = _generate_static_review_window_images(
+                    record_id=record_id,
+                    window_index=window_index,
+                    window_label=window_label,
+                    calibration_result=calibration_result,
+                    session_result=session_result,
+                )
+                window_entry = {
+                    "window_index": window_index,
+                    "start_sample": start,
+                    "end_sample": end,
+                    "start_sec": start_sec,
+                    "end_sec": end_sec,
+                    "status": "ready",
+                    "images": images,
+                    "raw_beat_counts": session_result.get("raw_beat_counts", {}),
+                    "kept_beat_counts": session_result.get("kept_beat_counts", {}),
+                }
+            except Exception as exc:
+                logger.exception("[STATIC_REVIEW] window_failed record_id=%s window=%s", record_id, window_index)
+                window_entry = {
+                    "window_index": window_index,
+                    "start_sample": start,
+                    "end_sample": end,
+                    "start_sec": start_sec,
+                    "end_sec": end_sec,
+                    "status": "error",
+                    "error": str(exc),
+                    "images": {},
+                }
+            manifest["windows"].append(window_entry)
+            manifest["completed_window_count"] = len([item for item in manifest["windows"] if item.get("status") == "ready"])
+            manifest["updated_at"] = _sg_now_iso()
+            _upload_static_manifest(record_id, manifest)
+            _set_job(
+                job_id,
+                status="running",
+                record_id=record_id,
+                details={
+                    "completed_window_count": manifest["completed_window_count"],
+                    "target_window_count": total_to_process,
+                },
+                error=None,
+            )
+
+        manifest["status"] = "ready"
+        manifest["updated_at"] = _sg_now_iso()
+        _upload_static_manifest(record_id, manifest)
+        _set_job(job_id, status="ready", record_id=record_id, details=manifest, error=None)
+        logger.info("[STATIC_REVIEW] ready job_id=%s record_id=%s windows=%s", job_id, record_id, total_to_process)
+    except Exception as exc:
+        logger.exception("[STATIC_REVIEW] failed job_id=%s record_id=%s", job_id, record_id)
+        try:
+            manifest = _load_static_review_manifest(record_id)
+            manifest["status"] = "error"
+            manifest["error"] = str(exc)
+            manifest["updated_at"] = _sg_now_iso()
+            _upload_static_manifest(record_id, manifest)
+        except Exception:
+            pass
+        _set_job(job_id, status="error", record_id=record_id, details={"record_id": record_id}, error=str(exc))
+
+
 @app.post("/session_analysis/start", response_model=SessionAnalysisJob)
 async def session_analysis_start(
     payload: SessionAnalysisStartRequest,
@@ -2094,24 +2990,130 @@ async def session_analysis_status(job_id: str) -> SessionAnalysisJob:
     )
 
 
-@app.get("/review/latest", response_model=ReviewResponse)
-async def review_latest(channel: str = "CH2", session_window_index: int = 1) -> ReviewResponse:
-    latest_id = _fetch_latest_recording_id()
-    if not latest_id:
-        raise HTTPException(status_code=404, detail="No recordings found.")
-    return await review_record(
-        latest_id,
-        channel=channel,
-        session_window_index=session_window_index,
+@app.post("/review/{record_id}/process", response_model=SessionAnalysisJob)
+async def review_process_start(
+    record_id: str,
+    payload: ReviewProcessRequest,
+    background_tasks: BackgroundTasks,
+) -> SessionAnalysisJob:
+    job_id = uuid4().hex
+    _clear_review_caches_for_record(record_id)
+    _set_job(
+        job_id,
+        status="queued",
+        record_id=record_id,
+        details={"resample": payload.resample},
+        error=None,
+    )
+    background_tasks.add_task(_review_processing_job, job_id, record_id, payload.resample)
+    logger.info(
+        "[REVIEW_PROCESS] queued job_id=%s record_id=%s resample=%s",
+        job_id,
+        record_id,
+        payload.resample,
+    )
+    return SessionAnalysisJob(
+        job_id=job_id,
+        status="queued",
+        record_id=record_id,
+        details={"resample": payload.resample},
+        error=None,
     )
 
 
-@app.get("/review/{record_id}", response_model=ReviewResponse)
+@app.get("/review/process/{job_id}", response_model=SessionAnalysisJob)
+async def review_process_status(job_id: str) -> SessionAnalysisJob:
+    job = ANALYSIS_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    logger.info(
+        "[REVIEW_PROCESS] status job_id=%s record_id=%s status=%s details=%s",
+        job_id,
+        job.get("record_id", ""),
+        job.get("status", "unknown"),
+        job.get("details"),
+    )
+    return SessionAnalysisJob(
+        job_id=job_id,
+        status=job.get("status", "unknown"),
+        record_id=job.get("record_id", ""),
+        details=job.get("details"),
+        error=job.get("error"),
+    )
+
+
+@app.get("/review_static/{record_id}/manifest")
+async def static_review_manifest(record_id: str) -> Dict[str, Any]:
+    return _load_static_review_manifest(record_id)
+
+
+@app.post("/review_static/{record_id}/process", response_model=SessionAnalysisJob)
+async def static_review_process_start(
+    record_id: str,
+    payload: StaticReviewProcessRequest,
+    background_tasks: BackgroundTasks,
+) -> SessionAnalysisJob:
+    job_id = uuid4().hex
+    _set_job(
+        job_id,
+        status="queued",
+        record_id=record_id,
+        details={"max_windows": payload.max_windows, "force": payload.force},
+        error=None,
+    )
+    background_tasks.add_task(_static_review_job, job_id, record_id, payload.max_windows, payload.force)
+    return SessionAnalysisJob(
+        job_id=job_id,
+        status="queued",
+        record_id=record_id,
+        details={"max_windows": payload.max_windows, "force": payload.force},
+        error=None,
+    )
+
+
+@app.get("/review_static/process/{job_id}", response_model=SessionAnalysisJob)
+async def static_review_process_status(job_id: str) -> SessionAnalysisJob:
+    job = ANALYSIS_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return SessionAnalysisJob(
+        job_id=job_id,
+        status=job.get("status", "unknown"),
+        record_id=job.get("record_id", ""),
+        details=job.get("details"),
+        error=job.get("error"),
+    )
+
+
+@app.get("/review_static/{record_id}/image")
+async def static_review_image(record_id: str, object_key: str) -> Response:
+    expected_prefix = f"{STATIC_REVIEW_PREFIX}/{record_id}/"
+    if not object_key.startswith(expected_prefix) or not object_key.endswith(".png"):
+        raise HTTPException(status_code=400, detail="Invalid static review image key.")
+    payload = STATIC_REVIEW_IMAGE_CACHE.get(object_key)
+    if payload is None:
+        payload = _fetch_storage_bytes(object_key)
+        STATIC_REVIEW_IMAGE_CACHE[object_key] = payload
+    return Response(
+        content=payload,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.get("/review/latest", response_model=ReviewSummaryResponse)
+async def review_latest(channel: str = "CH2") -> ReviewSummaryResponse:
+    latest_id = _fetch_latest_recording_id()
+    if not latest_id:
+        raise HTTPException(status_code=404, detail="No recordings found.")
+    return await review_record(latest_id, channel=channel)
+
+
+@app.get("/review/{record_id}", response_model=ReviewSummaryResponse)
 async def review_record(
     record_id: str,
     channel: str = "CH2",
-    session_window_index: int = 1,
-) -> ReviewResponse:
+) -> ReviewSummaryResponse:
     selected_channel = (channel or "CH2").upper()
     if selected_channel not in CHANNEL_LABELS:
         raise HTTPException(status_code=400, detail="Invalid channel.")
@@ -2127,21 +3129,67 @@ async def review_record(
     sample_rate_hz = int(artifact.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
 
     logger.info(
-        "[REVIEW] response record_id=%s channel=%s calibration_samples=%s calibration_beats=%s session_samples=%s session_beats=%s session_intervals=%s",
+        "[REVIEW] summary record_id=%s channel=%s calibration_beats=%s session_beats=%s session_windows=%s session_intervals=%s",
         record_id,
         selected_channel,
-        calibration_section["meta"]["sample_count"],
         calibration_section["beats"]["count"],
-        session_section["meta"]["sample_count"],
         session_section["beats"]["count"],
+        session_section.get("window_count", 1),
         len(session_section["interval_related_rows"]),
     )
-    return ReviewResponse(
+    return ReviewSummaryResponse(
         record_id=record_id,
         channel=selected_channel,
         sample_rate_hz=sample_rate_hz,
-        calibration=ReviewSection(**calibration_section),
-        session=ReviewSection(**session_section),
+        calibration=ReviewSectionSummary(**_build_review_section_summary(calibration_section)),
+        session=ReviewSectionSummary(**_build_review_section_summary(session_section)),
+    )
+
+
+@app.get("/review/{record_id}/window", response_model=ReviewWindowResponse)
+async def review_window(
+    record_id: str,
+    section: str = "session",
+    channel: str = "CH2",
+    window_index: int = 1,
+) -> ReviewWindowResponse:
+    selected_channel = (channel or "CH2").upper()
+    selected_section = (section or "session").lower()
+    if selected_channel not in CHANNEL_LABELS:
+        raise HTTPException(status_code=400, detail="Invalid channel.")
+    if selected_section not in {"calibration", "session"}:
+        raise HTTPException(status_code=400, detail="Invalid section.")
+
+    logger.info(
+        "[REVIEW] window request record_id=%s channel=%s section=%s window_index=%s",
+        record_id,
+        selected_channel,
+        selected_section,
+        window_index,
+    )
+    artifact = _load_review_artifact(record_id, selected_channel)
+    sample_rate_hz = int(artifact.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
+    section_payload = _build_review_window_section(
+        artifact.get(selected_section, {}),
+        sample_rate_hz,
+        window_index,
+    )
+    logger.info(
+        "[REVIEW] window response record_id=%s channel=%s section=%s window=%s/%s samples=%s beats=%s",
+        record_id,
+        selected_channel,
+        selected_section,
+        section_payload["window_index"],
+        section_payload["window_count"],
+        len(section_payload["signal"]["full"]),
+        section_payload["beats"]["count"],
+    )
+    return ReviewWindowResponse(
+        record_id=record_id,
+        channel=selected_channel,
+        sample_rate_hz=sample_rate_hz,
+        section=selected_section,
+        window=ReviewWindowSection(**section_payload),
     )
 
 
@@ -2165,7 +3213,7 @@ async def review_session_window(
     sample_rate_hz = int(artifact.get("sample_rate_hz") or DEFAULT_SAMPLE_RATE_HZ)
     session_section = artifact.get("session", {})
     signal = session_section.get("signal", {}).get("full", []) or []
-    window_samples = sample_rate_hz * 20
+    window_samples = sample_rate_hz * REVIEW_WINDOW_SECONDS
     window_count = max(1, (len(signal) + window_samples - 1) // window_samples)
     bounded_window_index = max(1, min(session_window_index, window_count))
     start_index = (bounded_window_index - 1) * window_samples

@@ -2,43 +2,46 @@ Refactor plan (Option B, raw-first, end-only processing)
 
 Goals
 - Treat packets as 25 samples, not time-based.
-- Use hardware timestamps (not BLE timing) to estimate effective sampling rate.
+- Use hardware-provided elapsed-time values (not BLE timing) to estimate effective sampling rate.
 - Store long time-series as blobs in storage; keep DB rows minimal.
 - No resampling or cleaning during the session; only at the end.
 - `/add_to_session` must be fast and only update live preview and raw storage.
 - Improve readability by splitting backend into 3 modules: `supabase.py`, `ui_previews.py`, `app.py`.
 
-Packet format (Option B: append hardware timestamp)
+Packet format (Option B: append hardware elapsed time)
 - Payload length: 231 bytes.
   - STATUS (3 bytes)
   - CH2 (25 * 3 bytes)
   - CH3 (25 * 3 bytes)
   - CH4 (25 * 3 bytes)
-  - TIMESTAMP (3 bytes, ms of last sample in packet)
-- Timestamp is appended (do not overwrite CH4).
-- Timestamp is produced by hardware directly, not inferred from BLE intervals.
-- Handle 24-bit wrap: 16,777,216 ms (~4.66 hours).
+  - ELAPSED_TIME_MS (3 bytes)
+- The first 3 bytes are the packet status word.
+- The next 225 bytes are signal data.
+- The final 3 bytes are produced by hardware directly, not inferred from BLE intervals.
+- No first-timestamp / last-timestamp delta is needed in the backend.
 - Validation constants (single source of truth in mobile + backend):
-  - STATUS_BYTES = 3
-  - TIMESTAMP_BYTES = 3
   - BYTES_PER_SAMPLE = 3
   - SAMPLES_PER_PACKET = 25
   - CHANNELS = 3
-  - PACKET_BYTES = (STATUS_BYTES + TIMESTAMP_BYTES) + (BYTES_PER_SAMPLE * SAMPLES_PER_PACKET * CHANNELS)
+  - SIGNAL_BYTES = BYTES_PER_SAMPLE * SAMPLES_PER_PACKET * CHANNELS
+  - STATUS_BYTES = 3
+  - ELAPSED_TIME_BYTES = 3
+  - PACKET_BYTES = SIGNAL_BYTES + STATUS_BYTES + ELAPSED_TIME_BYTES
 - Validate payload length and reject anything else.
 
 Effective sampling rate estimation
-- Compute once from full start/end timestamps:
+- Each packet already carries an elapsed-time contribution in milliseconds.
+- For any payload:
+  - total_elapsed_time_ms = sum(packet_elapsed_time_ms for each packet)
   - total_samples = packet_count * 25
-  - elapsed_ms = last_ts - first_ts (wrap-aware)
-  - effective_sps = total_samples / (elapsed_ms / 1000)
+  - effective_sps = total_samples / (total_elapsed_time_ms / 1000)
 - Used only for end-of-session resampling.
 
 Calibration flow (send at end only)
 - Device collects 10,000 samples (400 packets).
-- Mobile sends full raw payload + timestamps to `/calibration_completion`.
+- Mobile sends full raw payload + elapsed-time bytes to `/calibration_completion`.
 - Backend pipeline:
-  1) Compute effective_sps from timestamps.
+  1) Compute effective_sps from total_elapsed_time_ms.
   2) Resample to 500 Hz.
   3) ecg_clean.
   4) ecg_quality (averageQRS).
@@ -46,9 +49,9 @@ Calibration flow (send at end only)
 
 Session flow (incremental raw, no cleaning)
 - `/add_to_session` called every 20 packets:
-  - Accept raw packets + timestamps only.
+  - Accept raw packets + elapsed-time bytes only.
   - Append raw data to storage (no parsing beyond basic validation).
-  - Update session metadata (packet_count, last_ts, effective_sps estimate).
+  - Update session metadata (packet_count, cumulative elapsed_time_ms, effective_sps estimate).
   - Trigger refresh_livefeed():
     - Update a rolling preview buffer with last 500 samples.
     - Keep only last 4000 samples (explicit slice).
@@ -56,7 +59,7 @@ Session flow (incremental raw, no cleaning)
 - `/end_session` called once:
   - Backend:
     1) Load full raw stream from storage.
-    2) Compute effective_sps from timestamps.
+    2) Compute effective_sps from total_elapsed_time_ms.
     3) Resample to 500 Hz.
     4) ecg_clean.
     5) Generate review artifacts (beats, markers, intervals).
@@ -68,13 +71,13 @@ Raw storage strategy (Supabase)
   - Use chunk objects (e.g., `session/{session_id}/chunks/{chunk_index}.bin`).
   - Maintain a manifest / chunk list in DB.
   - At end, concatenate chunks in order.
-- Store timestamps alongside samples in the raw blobs (same 231-byte packets).
+- Store elapsed-time bytes alongside samples in the raw blobs (same 231-byte packets).
 
 Live preview storage
 - A small DB row or cache for current preview:
   - last 4000 samples per channel
   - latest effective_sps estimate
-  - last timestamp / sample index
+  - cumulative elapsed_time_ms
 - Only for live UI; not used for final processing.
 
 Processed artifacts storage
@@ -82,8 +85,8 @@ Processed artifacts storage
 - DB row only keeps metadata: object_key, version, sample_count, timestamps.
 
 Validation and failure handling
-- Reject packets with invalid length or non-monotonic timestamp (beyond wrap).
-- Log packet index and timestamp deltas for debugging.
+- Reject packets with invalid length or non-positive cumulative elapsed time.
+- Log packet counts and cumulative elapsed_time_ms for debugging.
 - If a chunk upload fails, keep ingesting and mark gap in manifest.
 
 Backend file layout (readability)
@@ -153,8 +156,7 @@ Supabase schema proposal (minimal, debuggable)
   - session_chunks_prefix text (e.g., `session/{session_id}/chunks`)
   - packet_count int default 0
   - sample_count int default 0
-  - first_ts_ms int
-  - last_ts_ms int
+  - elapsed_time_ms int
   - effective_sps numeric(10,4)
   - processing_version text
   - status text (e.g., started | ended | processed | error)
@@ -167,8 +169,7 @@ Supabase schema proposal (minimal, debuggable)
   - byte_length int not null
   - packet_count int not null
   - sample_count int not null
-  - first_ts_ms int
-  - last_ts_ms int
+  - elapsed_time_ms int
   - created_at timestamptz default now()
   - unique (record_id, chunk_index)
 
@@ -178,7 +179,7 @@ Supabase schema proposal (minimal, debuggable)
   - ch3_preview float4[] not null
   - ch4_preview float4[] not null
   - sample_count int not null
-  - last_ts_ms int
+  - elapsed_time_ms int
   - updated_at timestamptz default now()
 
 - Table: ecg_processed_artifacts
