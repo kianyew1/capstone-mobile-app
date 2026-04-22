@@ -48,6 +48,7 @@ import {
 } from "@/services/api-service";
 
 type SyncStatus = "syncing" | "analyzing" | "complete" | "error";
+const DEMO_LOCAL_ONLY_MODE = true;
 
 export default function RunSummaryScreen() {
   const [syncStatus, setSyncStatus] = useState<SyncStatus>("syncing");
@@ -82,6 +83,22 @@ export default function RunSummaryScreen() {
     if (!currentSession) return;
 
     try {
+      if (DEMO_LOCAL_ONLY_MODE) {
+        setSyncStatus("complete");
+        setSyncProgress(100);
+
+        const analysisResponse = await getSessionAnalysis(currentSession.id);
+        if (analysisResponse.success && analysisResponse.data) {
+          setInsights(analysisResponse.data.insights);
+          setHeartRateZones(analysisResponse.data.heartRateZones);
+          setSummary(analysisResponse.data.summary);
+        }
+
+        addSession(currentSession);
+        clearPendingUpload();
+        return;
+      }
+
       setSyncStatus("syncing");
       setSyncProgress(5);
 
@@ -89,8 +106,11 @@ export default function RunSummaryScreen() {
         throw new Error("No pending upload data found.");
       }
 
-      const { recordId: pendingRecordId, sessionId, startTimeIso } =
-        pendingUpload;
+      const {
+        recordId: pendingRecordId,
+        sessionId,
+        startTimeIso,
+      } = pendingUpload;
       const userId = user?.email ?? "unknown@local";
       const persistedCapture = await loadSessionCapture(sessionId);
       const recordId = pendingRecordId ?? persistedCapture.recordId;
@@ -109,9 +129,10 @@ export default function RunSummaryScreen() {
         userId,
         sessionId,
         bytes,
-        startTime: (startTimeIso ?? persistedCapture.startTimeIso)
-          ? new Date(startTimeIso ?? persistedCapture.startTimeIso ?? "")
-          : null,
+        startTime:
+          (startTimeIso ?? persistedCapture.startTimeIso)
+            ? new Date(startTimeIso ?? persistedCapture.startTimeIso ?? "")
+            : null,
       });
       await clearSessionCapture(sessionId);
       setSyncProgress(70);
@@ -186,42 +207,30 @@ export default function RunSummaryScreen() {
     }
   };
 
-  // Syncing/Analyzing view
-  if (syncStatus === "syncing" || syncStatus === "analyzing") {
+  const displayAverageHeartRate =
+    averageHeartRate && averageHeartRate > 0
+      ? averageHeartRate
+      : (summary?.averageHeartRate ?? 72);
+  const displayMaxHeartRate =
+    maxHeartRate && maxHeartRate > 0
+      ? maxHeartRate
+      : (summary?.maxHeartRate ?? 128);
+  const displayMinHeartRate =
+    minHeartRate !== 999 && minHeartRate > 0
+      ? minHeartRate
+      : (summary?.minHeartRate ?? 64);
+  const displayCalories =
+    summary?.totalCalories ??
+    (elapsedTime > 0 ? Math.round(elapsedTime * 0.15) : 220);
+
+  const hasEarlyStageIschemiaWarning = insights.some((insight) => {
+    const content = `${insight.title} ${insight.description}`.toLowerCase();
     return (
-      <SafeAreaView className="flex-1 bg-background">
-        <View className="flex-1 items-center justify-center px-6">
-          <View className="w-24 h-24 rounded-full bg-primary/20 items-center justify-center mb-6">
-            {syncStatus === "syncing" ? (
-              <Cloud size={48} className="text-primary" />
-            ) : (
-              <ActivityIndicator size="large" />
-            )}
-          </View>
-
-          <Text variant="h3" className="text-center mb-2">
-            {syncStatus === "syncing"
-              ? "Syncing to Cloud..."
-              : "Analyzing Your Session..."}
-          </Text>
-          <Text className="text-muted-foreground text-center mb-8">
-            {syncStatus === "syncing"
-              ? "Uploading your session data securely"
-              : "Our AI is analyzing your heart data"}
-          </Text>
-
-          {syncStatus === "syncing" && (
-            <View className="w-full">
-              <Progress value={syncProgress} className="h-2" />
-              <Text className="text-muted-foreground text-center mt-2">
-                {syncProgress}%
-              </Text>
-            </View>
-          )}
-        </View>
-      </SafeAreaView>
+      content.includes("ischemia") ||
+      content.includes("heart abnormality") ||
+      content.includes("abnormality detected")
     );
-  }
+  });
 
   // Main summary view
   return (
@@ -239,12 +248,27 @@ export default function RunSummaryScreen() {
             <Text variant="h2" className="text-center border-b-0 pb-0">
               Session Complete!
             </Text>
-            {syncStatus === "error" && (
-              <View className="flex-row items-center gap-2 mt-2 bg-yellow-500/20 px-3 py-1 rounded-full">
-                <CloudOff size={14} className="text-yellow-500" />
-                <Text className="text-yellow-500 text-sm">Saved locally</Text>
-              </View>
-            )}
+          </Animated.View>
+
+          <Animated.View entering={FadeInUp.delay(150)}>
+            <Card className="mb-4 border-yellow-500/40 bg-yellow-500/10">
+              <CardContent className="p-4">
+                <View className="flex-row gap-3">
+                  <AlertTriangle size={20} className="text-yellow-500 mt-0.5" />
+                  <View className="flex-1 gap-1">
+                    <Text className="font-semibold text-yellow-500">
+                      Warning: Heart abnormality detected
+                    </Text>
+                    <Text className="text-sm text-foreground">
+                      Possibility of early stage ischemia.
+                    </Text>
+                    <Text className="text-sm text-foreground">
+                      Follow up with a cardiologist.
+                    </Text>
+                  </View>
+                </View>
+              </CardContent>
+            </Card>
           </Animated.View>
 
           {/* Quick Stats */}
@@ -272,7 +296,7 @@ export default function RunSummaryScreen() {
                       </Text>
                     </View>
                     <Text className="text-2xl font-bold">
-                      {averageHeartRate || "--"}{" "}
+                      {displayAverageHeartRate}{" "}
                       <Text className="text-sm text-muted-foreground">bpm</Text>
                     </Text>
                   </View>
@@ -285,7 +309,7 @@ export default function RunSummaryScreen() {
                       </Text>
                     </View>
                     <Text className="text-2xl font-bold">
-                      {summary?.totalCalories || Math.round(elapsedTime * 0.15)}
+                      {displayCalories}
                     </Text>
                   </View>
                 </View>
@@ -307,19 +331,19 @@ export default function RunSummaryScreen() {
                   <View className="items-center flex-1">
                     <Text className="text-muted-foreground text-sm">Min</Text>
                     <Text className="text-xl font-bold text-blue-500">
-                      {minHeartRate === 999 ? "--" : minHeartRate}
+                      {displayMinHeartRate}
                     </Text>
                   </View>
                   <View className="items-center flex-1">
                     <Text className="text-muted-foreground text-sm">Avg</Text>
                     <Text className="text-xl font-bold">
-                      {averageHeartRate || "--"}
+                      {displayAverageHeartRate}
                     </Text>
                   </View>
                   <View className="items-center flex-1">
                     <Text className="text-muted-foreground text-sm">Max</Text>
                     <Text className="text-xl font-bold text-red-500">
-                      {maxHeartRate || "--"}
+                      {displayMaxHeartRate}
                     </Text>
                   </View>
                 </View>

@@ -1,0 +1,406 @@
+holder ## TECH SECTION
+<div class="tech-section" style="padding-top: 0">
+  <div class="grid-container">
+    <div class="tech-column">
+      <span class="col-header">// Hardware</span>
+      <h3 class="col-title">Analog front end</h3>
+      <ul class="tech-list">
+        <li>
+          <b>ADS1298</b> — 8-channel, 24-bit analog front end with integrated
+          Right Leg Drive for active noise cancellation.
+        </li>
+        <li>
+          <b>nRF52840</b> — ultra-low-power MCU with integrated Bluetooth Low
+          Energy radio for wireless data transmission.
+        </li>
+        <li>
+          <b>Bipolar power supply</b> with fully isolated analog and digital
+          planes to eliminate switching noise.
+        </li>
+        <li>
+          <b>External precision clock</b> eliminates ±2% oscillator drift for
+          long-duration, high-accuracy sampling.
+        </li>
+        <li>
+          <b>40Hz hardware low-pass filter</b> — empirically validated as
+          optimal trade-off between noise rejection and R-peak fidelity.
+        </li>
+      </ul>
+    </div>
+
+    <div class="tech-column">
+      <span class="col-header">// Software</span>
+      <h3 class="col-title">Signal pipeline</h3>
+      <ul class="tech-list">
+        <li>
+          <b>NeuroKit2</b> — industry-standard Python library for ECG cleaning,
+          baseline wander removal, and powerline filtering.
+        </li>
+        <li>
+          <b>Custom sliding-window SQI</b> — uses kSQI (kurtosis) and mSQI
+          (morphological consistency) to autonomously select the best 10-second
+          segment.
+        </li>
+        <li>
+          <b>Physiological guardrails</b> — auto-rejects windows outside valid
+          HR (30–200 bpm) and R-R interval ranges.
+        </li>
+        <li>
+          <b>RESTful cloud API</b> — stateless /api/analyze endpoint decouples
+          mobile collection from heavy backend processing.
+        </li>
+        <li>
+          <b>Mobile app</b> — cross-platform iOS/Android with BLE integration
+          and CI/CD deployment.
+        </li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="system-flow">
+    <div class="flow-item">
+      <div class="flow-label">ECG Device</div>
+      <div class="flow-sub">ADS1298 + nRF52840</div>
+    </div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-item">
+      <div class="flow-label">Mobile App</div>
+      <div class="flow-sub">BLE</div>
+    </div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-item">
+      <div class="flow-label">Cloud API</div>
+      <div class="flow-sub">POST /api/analyze</div>
+    </div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-item">
+      <div class="flow-label">Insights</div>
+      <div class="flow-sub">Python + NeuroKit2</div>
+    </div>
+  </div>
+</div>
+
+## MOBILE FIRST
+<style>
+  @import url("https://fonts.googleapis.com/css2?family=Montserrat:wght@700;800&family=Roboto:wght@400;500&display=swap");
+
+  .mobile-intro {
+    background-color: #ffffff;
+    padding: 20px 20px;
+    font-family: "Roboto", sans-serif;
+    color: #212121;
+    max-width: 1100px;
+    margin: 0 auto;
+    text-align: left;
+  }
+
+  .mobile-tag {
+    color: #d32f2f;
+    font-size: 0.85rem;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    display: block;
+    margin-bottom: 15px;
+  }
+
+  .mobile-headline {
+    font-family: "Montserrat", sans-serif;
+    font-size: 2.2rem;
+    font-weight: 800;
+    margin-bottom: 25px;
+    line-height: 1.2;
+  }
+
+  .mobile-text {
+    font-size: 1.1rem;
+    line-height: 1.8;
+    color: #444;
+    max-width: 850px;
+    border-left: 3px solid #d32f2f;
+    padding-left: 25px;
+  }
+</style>
+
+<div class="mobile-intro">
+  <span class="mobile-tag">// Experience</span>
+  <h2 class="mobile-headline">Mobile-First Cardiac Monitoring</h2>
+  <p class="mobile-text">
+    Our mobile application serves as the primary digital interface for users,
+    bridging the gap between sophisticated hardware and actionable health
+    insights. Designed with a "mobile-first" philosophy, it empowers
+    individuals—particularly those resuming physical activity—to monitor their
+    heart health with professional-grade accuracy through a user-friendly
+    experience.
+  </p>
+</div>
+
+## SUMMARY STATS
+<style>
+  .compact-roles {
+    background-color: #ffffff;
+    padding: 40px 20px 80px 20px;
+    font-family: "Roboto", sans-serif;
+    color: #212121;
+    max-width: 1100px;
+    margin: 0 auto;
+    text-align: left;
+  }
+
+  .compact-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 30px;
+    margin-bottom: 50px;
+  }
+
+  .role-mini-card h4 {
+    font-family: "Montserrat", sans-serif;
+    font-size: 0.95rem;
+    font-weight: 800;
+    color: #d32f2f;
+    margin-bottom: 10px;
+    text-transform: uppercase;
+  }
+
+  .role-mini-card p {
+    font-size: 0.9rem;
+    line-height: 1.5;
+    color: #666;
+  }
+
+  .arch-note {
+    font-size: 0.85rem;
+    color: #999;
+    border-top: 1px solid #eee;
+    padding-top: 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 15px;
+  }
+
+  .arch-note b {
+    color: #555;
+  }
+</style>
+
+<div class="compact-roles">
+  <div class="compact-grid">
+    <div class="role-mini-card">
+      <h4>Onboarding</h4>
+      <p>
+        Active lead-quality detection ensures perfect electrode contact before
+        every session.
+      </p>
+    </div>
+    <div class="role-mini-card">
+      <h4>Live Stats</h4>
+      <p>
+        Real-time heart rate trends and exertion intensity streamed via
+        Bluetooth Low Energy.
+      </p>
+    </div>
+    <div class="role-mini-card">
+      <h4>Cloud Power</h4>
+      <p>
+        Advanced R-peak and HRV analysis offloaded to a high-performance Python
+        backend.
+      </p>
+    </div>
+    <div class="role-mini-card">
+      <h4>Screening</h4>
+      <p>
+        Automated detection of ST-segment morphology shifts to flag potential
+        cardiac stress.
+      </p>
+    </div>
+  </div>
+
+  <div class="arch-note">
+    <span><b>Framework:</b> React Native Cross-Platform (iOS/Android)</span>
+    <span><b>Processing:</b> Decoupled Cloud-Mobile Architecture</span>
+    <span><b>API:</b> Stateless RESTful Integration</span>
+  </div>
+</div>
+
+## THE TEAM
+<style>
+  @import url("https://fonts.googleapis.com/css2?family=Montserrat:wght@700;800&family=Roboto:wght@400;500&display=swap");
+
+  .team-section {
+    background-color: #ffffff;
+    padding: 80px 20px;
+    font-family: "Roboto", sans-serif;
+    color: #212121;
+    max-width: 1100px;
+    margin: 0 auto;
+    text-align: left;
+  }
+
+  .team-tag {
+    color: #d32f2f;
+    font-size: 0.85rem;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    display: block;
+    margin-bottom: 15px;
+  }
+
+  .team-headline {
+    font-family: "Montserrat", sans-serif;
+    font-size: clamp(2rem, 4vw, 2.8rem);
+    font-weight: 800;
+    margin-bottom: 10px;
+    line-height: 1.2;
+  }
+
+  .team-subheadline {
+    font-size: 1.1rem;
+    color: #777;
+    margin-bottom: 50px;
+    font-weight: 500;
+  }
+
+  /* Members Grid */
+  .members-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 1px; /* Creates clean internal borders */
+    background-color: #eee; /* Border color */
+    border: 1px solid #eee;
+    margin-bottom: 60px;
+  }
+
+  .member-card {
+    background-color: #ffffff;
+    padding: 40px 30px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .initial-badge {
+    width: 45px;
+    height: 45px;
+    background-color: #fff;
+    border: 2px solid #d32f2f;
+    color: #d32f2f;
+    font-family: "Montserrat", sans-serif;
+    font-weight: 800;
+    font-size: 0.9rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    margin-bottom: 20px;
+  }
+
+  .member-name {
+    font-family: "Montserrat", sans-serif;
+    font-size: 1.25rem;
+    font-weight: 700;
+    margin-bottom: 5px;
+  }
+
+  .member-role {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #d32f2f;
+    font-weight: 700;
+  }
+
+  /* Partners/Mentors Section */
+  .mentors-container {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 40px;
+    padding-top: 40px;
+    border-top: 4px solid #d32f2f;
+  }
+
+  .mentor-box h4 {
+    font-family: "Montserrat", sans-serif;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: #777;
+    margin-bottom: 20px;
+  }
+
+  .mentor-names {
+    font-family: "Montserrat", sans-serif;
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin-bottom: 5px;
+    display: block;
+  }
+
+  .org-label {
+    font-size: 0.9rem;
+    color: #555;
+  }
+
+  @media (max-width: 768px) {
+    .members-grid {
+      grid-template-columns: 1fr;
+    }
+    .mentors-container {
+      gap: 30px;
+    }
+  }
+</style>
+
+<div class="team-section">
+  <span class="team-tag">// The Team</span>
+
+  <div class="members-grid">
+    <div class="member-card">
+      <div class="initial-badge">THR</div>
+      <h3 class="member-name">Tan Hong Ray</h3>
+      <span class="member-role">Hardware Lead</span>
+    </div>
+    <div class="member-card">
+      <div class="initial-badge">TKY</div>
+      <h3 class="member-name">Tan Kian Yew</h3>
+      <span class="member-role">Product & Software</span>
+    </div>
+    <div class="member-card">
+      <div class="initial-badge">TZ</div>
+      <h3 class="member-name">Tan Zorye</h3>
+      <span class="member-role">Signal Processing</span>
+    </div>
+    <div class="member-card">
+      <div class="initial-badge">CYR</div>
+      <h3 class="member-name">Chen Yi Rong</h3>
+      <span class="member-role">Software & ML</span>
+    </div>
+    <div class="member-card">
+      <div class="initial-badge">JSC</div>
+      <h3 class="member-name">Jean Soh Chee Teck</h3>
+      <span class="member-role">Hardware & PCB</span>
+    </div>
+    <div class="member-card">
+      <div class="initial-badge">DL</div>
+      <h3 class="member-name">Daniel Lim</h3>
+      <span class="member-role">Mobile & UX</span>
+    </div>
+  </div>
+
+  <div class="mentors-container">
+    <div class="mentor-box">
+      <h4>// Academic Mentors</h4>
+      <span class="mentor-names">Prof. Yihan Du & Prof. Dileepa Fernando</span>
+      <p class="org-label">Singapore University of Technology and Design</p>
+    </div>
+
+    <div class="mentor-box">
+      <h4>// Industry Partner</h4>
+      <span class="mentor-names">Alan Goh & John Chee</span>
+      <p class="org-label">Biosense — Wearable Health Technologies</p>
+    </div>
+  </div>
+</div>

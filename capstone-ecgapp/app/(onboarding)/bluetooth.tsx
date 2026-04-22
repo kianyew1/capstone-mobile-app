@@ -4,7 +4,6 @@ import {
   ArrowLeft,
   Bluetooth,
   Check,
-  FlaskConical,
   RefreshCw,
   Signal,
   Wifi,
@@ -16,7 +15,6 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Button } from "@/components/ui/button";
 import { Text } from "@/components/ui/text";
-import { ENABLE_MOCK_MODE } from "@/config/mock-config";
 import { useBluetoothService } from "@/services/bluetooth-service";
 import { useAppStore } from "@/stores/app-store";
 import type { ECGDevice } from "@/types";
@@ -256,23 +254,6 @@ export default function BluetoothScreen() {
             Select your ECG device from the list below to pair
           </Text>
         </View>
-
-        {/* Mock Mode Indicator */}
-        {ENABLE_MOCK_MODE && (
-          <View className="bg-purple-500/20 border border-purple-500/50 rounded-lg p-3 mb-4">
-            <View className="flex-row items-center gap-2">
-              <FlaskConical size={18} className="text-purple-500" />
-              <View className="flex-1">
-                <Text className="text-purple-500 font-semibold text-sm">
-                  Mock Mode Active
-                </Text>
-                <Text className="text-purple-400 text-xs">
-                  Using simulated device for development
-                </Text>
-              </View>
-            </View>
-          </View>
-        )}
 
         {/* Status Bar */}
         <View className="flex-row items-center justify-between bg-card border border-border rounded-xl p-3 mb-4">

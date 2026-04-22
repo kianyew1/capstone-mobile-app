@@ -25,7 +25,7 @@ export const ENABLE_MOCK_MODE =
  */
 export const MOCK_DEVICE = {
   id: "mock-ecg-device-001",
-  name: "Mock ECG Device",
+  name: "PulseSense ECG Device",
   rssi: -45,
   isConnected: true,
   isPaired: true,

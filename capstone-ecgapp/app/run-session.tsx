@@ -4,7 +4,6 @@ import {
   ChevronUp,
   Clock,
   Flag,
-  FlaskConical,
   Heart,
   Pause,
   Play,
@@ -62,7 +61,9 @@ export default function RunSessionScreen() {
   const [isAppActive, setIsAppActive] = useState(true);
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const sessionCheckTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const sessionCheckTimerRef = useRef<ReturnType<typeof setInterval> | null>(
+    null,
+  );
   const expectedPacketBytes = ECG_PACKET_BYTES;
 
   const {
@@ -97,6 +98,7 @@ export default function RunSessionScreen() {
   const sessionCheckPacketsRef = useRef<Uint8Array[]>([]);
   const sessionPacketCountRef = useRef(0);
   const invalidPacketCountRef = useRef(0);
+  const simulatedHeartRateRef = useRef(78);
   const sessionStartRef = useRef<Date | null>(null);
   const isStreamingRef = useRef(false);
   const isSessionCheckInFlightRef = useRef(false);
@@ -160,7 +162,10 @@ export default function RunSessionScreen() {
       const calibrationObjectKey = calibrationResult?.calibrationObjectKey;
       if (!calibrationObjectKey) {
         hasPreparedUploadRef.current = false;
-        console.error("Failed to prepare session upload:", new Error("Missing calibration object key."));
+        console.error(
+          "Failed to prepare session upload:",
+          new Error("Missing calibration object key."),
+        );
         return;
       }
 
@@ -176,15 +181,14 @@ export default function RunSessionScreen() {
             console.log(
               `[SESSION] Supabase record created record_id=${recordIdRef.current}`,
             );
-            void setSessionCaptureRecordId(
-              sessionId,
-              record.recordId,
-            ).catch((error) => {
-              console.error(
-                "Failed to persist session record id to SQLite:",
-                error,
-              );
-            });
+            void setSessionCaptureRecordId(sessionId, record.recordId).catch(
+              (error) => {
+                console.error(
+                  "Failed to persist session record id to SQLite:",
+                  error,
+                );
+              },
+            );
           }
         })
         .catch((error) => {
@@ -234,16 +238,19 @@ export default function RunSessionScreen() {
         });
       }
       if (count === 1) {
-        console.log(
-          `[SESSION] first packet bytes=${bytes.length}`,
-        );
+        console.log(`[SESSION] first packet bytes=${bytes.length}`);
       } else if (count % 20 === 0) {
         console.log(`[SESSION] packet=${count}`);
       }
     }).catch((error) => {
       console.error("Failed to start ECG stream:", error);
     });
-  }, [calibrationResult?.calibrationObjectKey, sessionStatus, startEcgNotifications, userId]);
+  }, [
+    calibrationResult?.calibrationObjectKey,
+    sessionStatus,
+    startEcgNotifications,
+    userId,
+  ]);
 
   useEffect(() => {
     if (sessionStatus !== "running") {
@@ -315,6 +322,28 @@ export default function RunSessionScreen() {
       stopEcgNotifications();
     }
   }, [sessionStatus, stopEcgNotifications]);
+
+  useEffect(() => {
+    if (sessionStatus !== "running" || !ENABLE_MOCK_MODE) {
+      return;
+    }
+
+    const timer = setInterval(() => {
+      const drift = Math.floor(Math.random() * 7) - 3;
+      const baselineShift = Math.sin(Date.now() / 5000) * 2;
+      const next = Math.round(
+        simulatedHeartRateRef.current + drift + baselineShift,
+      );
+      simulatedHeartRateRef.current = Math.min(142, Math.max(64, next));
+
+      addHeartRateData({
+        heartRate: simulatedHeartRateRef.current,
+        timestamp: Date.now(),
+      });
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [addHeartRateData, sessionStatus]);
 
   useEffect(() => {
     return () => {
@@ -470,23 +499,6 @@ export default function RunSessionScreen() {
     return (
       <SafeAreaView className="flex-1 bg-background">
         <View className="flex-1 px-6 pt-4">
-          {/* Mock Mode Indicator */}
-          {ENABLE_MOCK_MODE && (
-            <View className="bg-purple-500/20 border border-purple-500/50 rounded-lg p-3 mb-4">
-              <View className="flex-row items-center gap-2">
-                <FlaskConical size={20} className="text-purple-500" />
-                <View className="flex-1">
-                  <Text className="text-purple-500 font-semibold text-sm">
-                    Mock Mode Active
-                  </Text>
-                  <Text className="text-purple-400 text-xs">
-                    Using simulated ECG data for prototyping
-                  </Text>
-                </View>
-              </View>
-            </View>
-          )}
-
           <View className="flex-1 items-center justify-center">
             {/* Device Status */}
             <Card className="w-full mb-8">
@@ -557,18 +569,6 @@ export default function RunSessionScreen() {
   return (
     <SafeAreaView className="flex-1 bg-black">
       <View className="flex-1">
-        {/* Mock Mode Banner */}
-        {ENABLE_MOCK_MODE && (
-          <View className="bg-purple-500/90 px-4 py-2 border-b border-purple-400">
-            <View className="flex-row items-center justify-center gap-2">
-              <FlaskConical size={16} color="white" />
-              <Text className="text-white font-medium text-xs">
-                MOCK MODE - Simulated Data
-              </Text>
-            </View>
-          </View>
-        )}
-
         {/* Background Tip Banner */}
         {showBackgroundTip && sessionStatus === "running" && (
           <Animated.View

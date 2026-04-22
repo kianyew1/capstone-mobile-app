@@ -1,12 +1,5 @@
 import { router, useLocalSearchParams } from "expo-router";
-import {
-  ArrowLeft,
-  Check,
-  FlaskConical,
-  RefreshCw,
-  X,
-  Zap,
-} from "lucide-react-native";
+import { ArrowLeft, Check, RefreshCw, X, Zap } from "lucide-react-native";
 import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Image, ScrollView, View } from "react-native";
 import Animated, {
@@ -125,7 +118,7 @@ export default function CalibrationScreen() {
     isFinishingRef.current = false;
     invalidPacketCountRef.current = 0;
     console.log(
-      `[CAL] start mock=${ENABLE_MOCK_MODE} env=${process.env.EXPO_PUBLIC_MOCK_MODE ?? "undefined"} target=${targetPacketCount} expectedBytes=${expectedPacketBytes}`,
+      `[CAL] start target=${targetPacketCount} expectedBytes=${expectedPacketBytes}`,
     );
 
     const runTimestamp = Date.now();
@@ -144,8 +137,7 @@ export default function CalibrationScreen() {
         setIsGraphLoading(true);
         setGraphError(null);
         const packetTotal = packetsRef.current.length;
-        const samplesPerChannel =
-          packetTotal * ECG_SAMPLES_PER_PACKET;
+        const samplesPerChannel = packetTotal * ECG_SAMPLES_PER_PACKET;
         console.log(
           `[CAL] packets=${packetTotal} samplesPerChannel=${samplesPerChannel}`,
         );
@@ -339,11 +331,7 @@ export default function CalibrationScreen() {
     return d;
   };
 
-  const buildSampleMarkers = (
-    count: number,
-    stepX: number,
-    height: number,
-  ) => {
+  const buildSampleMarkers = (count: number, stepX: number, height: number) => {
     if (count <= 1) return null;
     const markerStep = count >= 2500 ? 500 : count >= 1000 ? 250 : 100;
     const markers = [];
@@ -415,7 +403,7 @@ export default function CalibrationScreen() {
       {/* Device placement image */}
       <View className="bg-muted rounded-2xl h-64 items-center justify-center mb-4 overflow-hidden">
         <Image
-          source={require("../assets/images/calibration_example.png")}
+          source={require("../assets/images/calibration_example.jpg")}
           className="w-full h-full"
           resizeMode="cover"
         />
@@ -561,19 +549,9 @@ export default function CalibrationScreen() {
         <Progress value={progress} className="h-3" />
       </View>
       <Text className="text-muted-foreground">{Math.round(progress)}%</Text>
-      <View className="mt-2 items-center">
-        <Text className="text-muted-foreground text-sm">
-          Packets received: {packetCount} / {targetPacketCount}
-        </Text>
-        <Text className="text-muted-foreground text-sm mt-0">
-          Time: {formatSeconds(elapsedMs)}s
-        </Text>
-        {lastPacketBytes && (
-          <Text className="text-muted-foreground text-xs mt-0">
-            Last packet bytes: {formatPacketBytes(lastPacketBytes)}
-          </Text>
-        )}
-      </View>
+      <Text className="text-muted-foreground text-sm mt-2 text-center">
+        Keep still while we collect a clean signal.
+      </Text>
     </View>
   );
 
@@ -745,23 +723,6 @@ export default function CalibrationScreen() {
           <Text className="font-semibold">Device Calibration</Text>
           <View className="w-10" />
         </View>
-
-        {/* Mock Mode Indicator */}
-        {ENABLE_MOCK_MODE && step === "guidance" && (
-          <View className="bg-purple-500/20 border border-purple-500/50 rounded-lg p-3 mb-3">
-            <View className="flex-row items-center gap-2">
-              <FlaskConical size={18} className="text-purple-500" />
-              <View className="flex-1">
-                <Text className="text-purple-500 font-semibold text-sm">
-                  Mock Mode Active
-                </Text>
-                <Text className="text-purple-400 text-xs">
-                  Calibration will use simulated signal data
-                </Text>
-              </View>
-            </View>
-          </View>
-        )}
 
         {/* Content based on step */}
         {step === "guidance" && renderGuidance()}

@@ -16,10 +16,7 @@ import {
   type Subscription,
 } from "react-native-ble-plx";
 import { useBluetoothStore } from "@/stores/bluetooth-store";
-import {
-  ECG_PACKET_BYTES,
-  ECG_SAMPLES_PER_PACKET,
-} from "@/services/ecg-utils";
+import { ECG_PACKET_BYTES, ECG_SAMPLES_PER_PACKET } from "@/services/ecg-utils";
 
 // Service/Characteristic UUIDs for the XIAO nRF52840 ECG firmware
 // Keep in sync with nrf52480.ino
@@ -50,7 +47,7 @@ const MOCK_ECG_NOISE_AMPLITUDE_MV = 0.03;
 const MOCK_PACKET_STATUS = 0xc00000;
 const ADS1298_VREF = 2.4;
 const ADS1298_GAIN = 6;
-const ADS1298_MAX_CODE = (2 ** 23) - 1;
+const ADS1298_MAX_CODE = 2 ** 23 - 1;
 let mockPhase = 0;
 
 const syntheticEcg = (t: number) => {
@@ -76,11 +73,7 @@ const millivoltsToCounts = (millivolts: number) => {
   return clamp24Signed(counts);
 };
 
-const write24SignedBE = (
-  buffer: Uint8Array,
-  offset: number,
-  value: number,
-) => {
+const write24SignedBE = (buffer: Uint8Array, offset: number, value: number) => {
   const clamped = clamp24Signed(value);
   const unsigned = clamped < 0 ? clamped + (1 << 24) : clamped;
   buffer[offset] = (unsigned >> 16) & 0xff;
@@ -90,8 +83,7 @@ const write24SignedBE = (
 
 const nextMockTriplet = () => {
   const baseFreqHz = MOCK_HEART_RATE_CONFIG.baseHeartRate / 60;
-  const phaseStep =
-    (2 * Math.PI * baseFreqHz) / MOCK_SAMPLE_RATE_HZ;
+  const phaseStep = (2 * Math.PI * baseFreqHz) / MOCK_SAMPLE_RATE_HZ;
 
   const t = mockPhase / (2 * Math.PI);
   const ch2 =
@@ -176,7 +168,12 @@ export function useBluetoothService() {
       setDiscoveredDevices([MOCK_DEVICE]);
       console.log("🎭 Mock Mode Enabled - Using simulated ECG device");
     }
-  }, [setPairedDevice, setBluetoothStatus, setConnectionStatus, setDiscoveredDevices]);
+  }, [
+    setPairedDevice,
+    setBluetoothStatus,
+    setConnectionStatus,
+    setDiscoveredDevices,
+  ]);
 
   // Monitor Bluetooth state
   useEffect(() => {
@@ -293,7 +290,7 @@ export function useBluetoothService() {
           MOCK_DEVICE,
           {
             id: "mock-ecg-device-002",
-            name: "Mock ECG Device 2",
+            name: "Airpods Pro",
             rssi: -65,
             isConnected: false,
             isPaired: false,
@@ -426,8 +423,7 @@ export function useBluetoothService() {
             `[BLE] mtu requested=${DESIRED_MTU} result=${device.mtu ?? "unknown"}`,
           );
         } catch (err: unknown) {
-          const message =
-            err instanceof Error ? err.message : "unknown error";
+          const message = err instanceof Error ? err.message : "unknown error";
           console.warn(`[BLE] mtu request failed: ${message}`);
         }
 
@@ -576,10 +572,7 @@ export function useBluetoothService() {
 
         const intervalMs =
           options?.mockPacketIntervalMs ?? MOCK_PACKET_INTERVAL_MS;
-        const packetsPerTick = Math.max(
-          1,
-          options?.mockPacketsPerTick ?? 1,
-        );
+        const packetsPerTick = Math.max(1, options?.mockPacketsPerTick ?? 1);
         console.log(
           `[BLE] mock stream intervalMs=${intervalMs} packetsPerTick=${packetsPerTick} expectedPacketsPerSecond=${Math.round((1000 / intervalMs) * packetsPerTick)}`,
         );
