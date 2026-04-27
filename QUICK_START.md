@@ -1,175 +1,93 @@
-# React Native Reusables - Quick Start
+# Quick Start
 
-Your React Native project has been successfully set up with React Native Reusables, Nativewind, and Tailwind CSS!
+Use this file when you need the shortest path to get the repository working on a new machine.
 
-## 🚀 Quick Commands
+For architecture and detailed handover notes, read `README.md` first.
 
-### Start Development
+## 1. Start the backend
 
-```bash
-# Navigate to project
-cd /Users/kianyew/Desktop/projects/capstone/ky-mobile-app/capstone-ecgapp
-
-# Start for Android (using your installed Android Studio)
-npm run android
-
-# Start for iOS
-npm run ios
-
-# Start for Web
-npm run web
+```powershell
+cd C:\src\capstone-ecgapp\backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+fastapi dev app.py --host 127.0.0.1 --port 8001
 ```
 
-### Add New Components
+Verify:
 
-```bash
-# Add a button component
-npx @react-native-reusables/cli@latest add button
-
-# Add more components (card, input, dialog, etc.)
-npx @react-native-reusables/cli@latest add [component-name]
+```powershell
+Invoke-RestMethod http://127.0.0.1:8001/health
 ```
 
-## 📁 Project Structure
+## 2. Start the review web
 
-```
-capstone-ecgapp/
-├── app/                    # Expo Router routes
-├── components/
-│   └── ui/                 # UI components (Button, Text)
-├── lib/
-│   ├── cn.ts              # Class name helper
-│   └── theme.ts           # Theme colors
-├── global.css             # Tailwind + color variables
-├── tailwind.config.js     # Tailwind configuration
-├── metro.config.js        # Metro bundler config
-└── babel.config.js        # Babel with Nativewind
+Open a second terminal:
+
+```powershell
+cd C:\src\capstone-ecgapp\ecg-review-web
+npm install
+npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
-## 🎨 What's Included
+Open `http://127.0.0.1:5173`.
 
-✅ **React Native Reusables** - Pre-built, accessible UI components
-✅ **Nativewind** - Tailwind CSS for React Native  
-✅ **Tailwind CSS** - Utility-first CSS framework
-✅ **Expo Router** - File-based routing
-✅ **TypeScript** - Full type safety
-✅ **Android & iOS** - Native builds ready to go
-✅ **Web Support** - Responsive web app support
+If you already have valid Supabase records, this is the fastest path to verify the backend + review workflow.
 
-## 💡 Usage Examples
+## 3. Start the mobile app
 
-### Using a Button
+Open a third terminal:
 
-```tsx
-import { Button } from "@/components/ui/button";
-
-export default function Screen() {
-  return (
-    <Button
-      label="Click me"
-      onPress={() => alert("Pressed!")}
-      className="bg-accent"
-    />
-  );
-}
-```
-
-### Using Tailwind Classes
-
-```tsx
-import { View, Text } from "react-native";
-
-export default function Screen() {
-  return (
-    <View className="flex-1 p-4 bg-background gap-4">
-      <Text className="text-2xl font-bold text-foreground">Hello World</Text>
-    </View>
-  );
-}
-```
-
-### Merging Classes with cn()
-
-```tsx
-import { cn } from "@/lib/cn";
-
-const buttonClass = cn(
-  "px-4 py-2 rounded-lg bg-primary",
-  isDisabled && "opacity-50",
-);
-```
-
-## 🎯 Next Steps
-
-1. **Open Android Studio** with the `android/` directory to set up emulator/device
-2. **Run `npm run android`** to start the app
-3. **Edit files in `app/` directory** to build your app
-4. **Add components** using the CLI command above
-5. **Customize theme** in `global.css` and `tailwind.config.js`
-
-## 📚 Documentation
-
-- **React Native Reusables**: https://reactnativereusables.com/
-- **Nativewind**: https://www.nativewind.dev/
-- **Tailwind CSS**: https://tailwindcss.com/
-- **Expo**: https://docs.expo.dev/
-- **Expo Router**: https://expo.github.io/router/
-
-## ⚙️ Configuration Files
-
-### `global.css`
-
-Contains Tailwind directives and CSS variables for theming. Colors use HSL format for easy adjustment.
-
-### `tailwind.config.js`
-
-Extends Tailwind with color variables and presets from Nativewind.
-
-### `babel.config.js`
-
-Configured with `nativewind/babel` preset for proper compilation.
-
-### `metro.config.js`
-
-Configured with Nativewind integration for CSS processing.
-
-### `app.json`
-
-Expo configuration with Android/iOS settings.
-
-## 🐛 Troubleshooting
-
-### Build fails with missing modules
-
-```bash
+```powershell
+cd C:\src\capstone-ecgapp\capstone-ecgapp
 npm install
 ```
 
-### Cache issues
+Create or update `.env` with at least:
 
-```bash
-npm start -- --clear
+```text
+EXPO_PUBLIC_APP_ENV=DEV
+EXPO_PUBLIC_MOCK_MODE=PROD
+EXPO_PUBLIC_BACKEND_BASE_URL=http://127.0.0.1:8001
 ```
 
-### Port 8081 already in use
+For Android device testing over USB, you will usually want:
 
-Expo will automatically use a different port. You can also specify one:
-
-```bash
-npm run web -- --port 3000
+```powershell
+adb reverse tcp:8001 tcp:8001
 ```
 
-## 📝 Environment Setup
+Then run:
 
-- ✅ Android Studio installed
-- ✅ Xcode installed (for iOS)
-- ✅ CocoaPods installed (automatically configured)
-- ✅ Node.js and npm configured
-- ✅ TypeScript configured
-- ✅ All dependencies installed
+```powershell
+npm run android
+```
 
-## 🎉 You're all set!
+Use `EXPO_PUBLIC_MOCK_MODE=DEV` if you need simulated Bluetooth in development.
 
-Your project is ready to use. Start building amazing React Native apps with React Native Reusables and Nativewind!
+## 4. Know the key folders
 
-For more detailed setup information, see `SETUP_GUIDE.md`
+- `backend/` - FastAPI service and Supabase integration
+- `capstone-ecgapp/` - Expo mobile app
+- `ecg-review-web/` - review UI
+- `hardware-code/` - firmware
+- `signal-processing-intense/` - notebooks and generated analysis artifacts
+
+Before trying a real client setup, apply `schema.sql` in Supabase and read `DATABASE-README.md` for the required tables, policies, and storage bucket.
+
+## 5. Read these next
+
+- `backend/README.md`
+- `capstone-ecgapp/README.md`
+- `ecg-review-web/README.md`
+- `hardware-code/README.md`
+- `signal-processing-intense/README.md`
+- `DATABASE-README.md`
+- `schema.sql`
+
+## 6. Handover cautions
+
+- Apply `schema.sql` before testing a fresh client Supabase project.
+- The mobile summary screen still contains mock insight content even though calibration and session upload are real.
+- If `npm run dev:review` fails on a non-Windows machine, start the backend and review web in separate terminals instead.
+- Do one full real dry run: calibration -> run session -> end session -> load the resulting `ecg_recordings.id` in the review web.

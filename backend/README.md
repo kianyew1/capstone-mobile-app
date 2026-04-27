@@ -1,118 +1,176 @@
-# Capstone ECG App Backend
+# Backend
 
-This service is a minimal FastAPI app with a `/health` endpoint.
+This folder contains the FastAPI backend used by the mobile app and the review web.
 
-## Local setup
+## Responsibilities
 
-1. Create and activate a virtual environment.
+The backend currently handles five distinct jobs:
 
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   ```
+1. calibration ingestion and quality scoring,
+2. live session chunk ingestion and preview buffering,
+3. final session upload and raw binary storage,
+4. processed review artifact generation,
+5. static comparison image generation for the review web.
 
-   ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
+## Main files
 
-2. Ensure Python 3.12+ is available (see `pyproject.toml`).
-3. Install dependencies:
+- `app.py` - FastAPI application and almost all ECG processing logic
+- `supabase.py` - REST + storage helpers for Supabase
+- `ui_previews.py` - live preview state helpers
+- `requirements.txt` - Python dependencies
+- `tests/test_imports.py` - basic import smoke test
 
-   ```bash
-   pip install -r requirements.txt
-   ```
+## Python and dependencies
 
-   ```powershell
-   pip install -r requirements.txt
-   ```
+- Python `3.12+`
+- Dependencies from `requirements.txt`
 
-4. Run the dev server:
+Create a local environment and install dependencies:
 
-   ```bash
-   fastapi dev app.py --host 0.0.0.0 --port 8001
-   ```
+```powershell
+cd C:\src\capstone-ecgapp\backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
 
-   ```powershell
-   fastapi dev app.py --host 0.0.0.0 --port 8001
-   ```
+For a fresh client database, apply the repo-root `schema.sql` first, then follow the environment setup below.
 
-   Or, if you prefer specifying the module directly:
+## Environment variables
 
-   ```bash
-   fastapi dev app.py --host 0.0.0.0 --port 8001
-   ```
+The backend requires Supabase credentials and storage bucket configuration.
 
-   ```powershell
-   fastapi dev app.py --host 0.0.0.0 --port 8001
-   ```
+Required:
 
-5. Verify the health check:
+- `SUPABASE_URL` or `EXPO_PUBLIC_SUPABASE_URL`
+- `SUPABASE_ANON_KEY` or `EXPO_PUBLIC_SUPABASE_ANON_KEY`
+- `SUPABASE_STORAGE_BUCKET` or `EXPO_PUBLIC_SUPABASE_STORAGE_BUCKET`
 
-   ```bash
-   curl http://127.0.0.1:8001/health
-   ```
+Optional:
 
-   ```powershell
-   Invoke-RestMethod http://127.0.0.1:8001/health
-   ```
+- `BASE_URL` - defaults to `http://127.0.0.1:8001`
 
-## Deploy to FastAPI Cloud
+## Run locally
 
-1. Ensure dependencies are declared in `pyproject.toml` or `requirements.txt`.
-2. From the project root, log in:
+```powershell
+fastapi dev app.py --host 127.0.0.1 --port 8001
+```
 
-   ```bash
-   fastapi login
-   ```
+Health check:
 
-3. Deploy:
+```powershell
+Invoke-RestMethod http://127.0.0.1:8001/health
+```
 
-   ```bash
-   fastapi deploy
-   ```
+## Supabase dependencies
 
-4. If auto-detection fails, set the entrypoint in `pyproject.toml`:
+### Tables used
 
-   ```toml
-   [tool.fastapi]
-   entrypoint = "app:app"
-   ```
+- `ecg_recordings`
+- `ecg_session_chunks`
+- `ecg_live_preview`
+- `ecg_processed_records`
+- `ecg_processed_artifacts`
 
-5. Re-deploy with `fastapi deploy`.
-6. After deploy, FastAPI Cloud will provide a URL for your service. Use `/health` to verify responsiveness.
+### Storage usage
 
-## Deploy to Render (CLI-first)
+The configured storage bucket is used for:
 
-1. Create a Render account and add a payment method if prompted.
-2. Create a Web Service once in the Render Dashboard with these settings:
-  Language: `Python 3`
-  Build Command: `pip install -r requirements.txt`
-  Start Command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-  Root Directory: `backend` (only if this repo is in a monorepo)
-  Python version: set `PYTHON_VERSION=3.12.x` or add a `.python-version` file with `3.12`
-3. Install the Render CLI and ensure `render` is on your PATH.
-4. Log in and choose your workspace:
+- raw calibration binaries: `calibration/<run_id>.bin`
+- raw session binaries: `session/<session_id>.bin`
+- processed JSON artifacts: `processed/<record_id>/...`
+- static review manifests and PNGs: `review-static/<record_id>/...`
 
-   ```bash
-   render login
-   render workspace set
-   ```
+## Runtime flows
 
-5. List services and copy the service ID:
+### Calibration flow
 
-   ```bash
-   render services
-   ```
+`POST /calibration_completion`
 
-6. Deploy the latest commit for that service:
+- expects raw packet bytes in the body,
+- validates packet framing and elapsed-time data,
+- decodes ADS1298 packets,
+- resamples to 500 Hz,
+- scores CH2 signal quality,
+- stores the raw calibration binary,
+- optionally inserts an `ecg_recordings` row when `X-User-Id` is supplied,
+- returns cleaned preview arrays for CH2/CH3/CH4.
 
-   ```bash
-   render deploys create <SERVICE_ID> --wait
-   ```
+### Live session flow
 
-7. View recent deploys:
+`POST /session/start` initializes the record and in-memory preview state.
 
-   ```bash
-   render deploys list <SERVICE_ID>
-   ```
+`POST /add_to_session`:
+
+- accepts 20-packet chunks from the mobile app,
+- updates the in-memory live preview buffer,
+- publishes SSE preview events,
+- persists preview state to Supabase in the background,
+- stores the chunk metadata row.
+
+`GET /session/live/visual` and `GET /session/live/events` power the live dashboard in `ecg-review-web`.
+
+### Final session upload
+
+`POST /end_session`
+
+- stores the full session binary,
+- updates the `ecg_recordings` row,
+- marks the live session as ended,
+- triggers review artifact generation.
+
+## Review processing
+
+There are two distinct review paths.
+
+### Channel review artifacts
+
+`_process_review_artifacts_for_record()` generates JSON artifacts for CH2, CH3, and CH4 and writes them under `processed/<record_id>/...`.
+
+The relevant endpoints are:
+
+- `POST /review/{record_id}/process`
+- `GET /review/process/{job_id}`
+- `GET /review/latest`
+- `GET /review/{record_id}`
+- `GET /review/{record_id}/window`
+- `GET /review/{record_id}/session_window`
+- `GET /review/{record_id}/vector_beat`
+- `GET /review/{record_id}/vector3d_beat`
+- `POST /review/{record_id}/vector3d_preload`
+
+### Static review images
+
+The newer review web path uses backend-generated static PNGs instead of plotting in the browser.
+
+Key endpoints:
+
+- `GET /review_static/{record_id}/manifest`
+- `POST /review_static/{record_id}/process`
+- `GET /review_static/process/{job_id}`
+- `GET /review_static/{record_id}/image`
+
+Current method summary:
+
+- window size is 20 seconds,
+- CH4 is used as the segmentation anchor,
+- CH2/CH3/CH4 mean beats are derived using CH4-based boundaries,
+- outlier beats are rejected using a z-threshold,
+- backend emits waveform, 2D VCG-style, and 3D VCG-style PNGs per window.
+
+## Important implementation facts
+
+- Packet format assumed by the backend must match the firmware in `hardware-code/`.
+- `DEFAULT_SAMPLE_RATE_HZ` is 500 Hz.
+- Live preview buffers are intentionally short and are not the same as full-run processing.
+- Static review logic in `app.py` is derived from the notebooks in `signal-processing-intense/`.
+
+## Testing
+
+Smoke test:
+
+```powershell
+pytest
+```
+
+The current test coverage is minimal. The test suite verifies import stability only.
