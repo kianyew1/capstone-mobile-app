@@ -1,4 +1,0 @@
-neurokit2
-numpy
-scipy
-pandas

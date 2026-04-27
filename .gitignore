@@ -59,9 +59,14 @@ calibration_mv.csv
 buffer.txt
 calibration_mv.csv
 channels_volts.csv
+<<<<<<< Updated upstream
 ecg-review-web/.env
 /signal-processing-intense/.venv
 /signal-processing-intense/plots
 Capstone final report USE ME.docx
 signal_report.md
 showcase_display/data/live_ch2.csv
+=======
+/signal-processing-intense/.venv
+/signal-processing-intense/plots
+>>>>>>> Stashed changes
