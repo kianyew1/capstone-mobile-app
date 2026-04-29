@@ -2149,6 +2149,46 @@ function StaticReviewPage({ currentPath }: { currentPath: string }) {
           .map((objectKey) => imageUrl(objectKey))
       : [];
 
+  useEffect(() => {
+    if (recordId.trim()) {
+      return;
+    }
+    let active = true;
+    async function loadLatestRecordId() {
+      setLoadingManifest(true);
+      try {
+        const response = await fetch("/api/review_static/latest");
+        if (!response.ok) {
+          if (response.status === 404) {
+            if (!active) return;
+            setError("No ECG recordings are available yet.");
+            setManifest(null);
+            return;
+          }
+          const text = await response.text();
+          throw new Error(`Latest record lookup failed: ${response.status} ${text}`);
+        }
+        const payload = (await response.json()) as { record_id: string };
+        if (!active) return;
+        const latestRecordId = payload.record_id.trim();
+        const nextUrl = `${currentPath}?recordId=${encodeURIComponent(latestRecordId)}`;
+        window.history.replaceState({}, "", nextUrl);
+        setRecordIdInput(latestRecordId);
+        setRecordId(latestRecordId);
+        setError(null);
+      } catch (err) {
+        if (!active) return;
+        setError(err instanceof Error ? err.message : "Unknown latest record lookup error");
+      } finally {
+        if (active) setLoadingManifest(false);
+      }
+    }
+    void loadLatestRecordId();
+    return () => {
+      active = false;
+    };
+  }, [currentPath, recordId]);
+
   async function loadManifest(targetRecordId = recordId, silent = false) {
     const trimmed = targetRecordId.trim();
     if (!trimmed) {

@@ -15,13 +15,25 @@ The frontend does not do heavy ECG processing. It depends on the FastAPI backend
 
 ## Local run
 
+Recommended hosted-demo launcher from repo root:
+
+```powershell
+.\start_review_web_demo.ps1
+```
+
+This starts the review web on `http://127.0.0.1:5173` and proxies `/api/*` to the hosted backend used for the demo.
+
+Manual run:
+
 ```powershell
 cd C:\src\capstone-ecgapp\ecg-review-web
 npm install
 npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
-The Vite dev server proxies `/api/*` to `http://127.0.0.1:8001`.
+The Vite dev server proxies `/api/*` to `VITE_BACKEND_URL` when set, otherwise it defaults to the hosted backend:
+
+- `https://capstone-mobile-app.onrender.com`
 
 If your backend runs elsewhere, update `vite.config.ts`.
 
@@ -87,7 +99,7 @@ Live page:
 
 ## Typical operator workflow
 
-1. start the backend,
+1. run `.\start_review_web_demo.ps1` from the repo root,
 2. open the review web,
 3. paste a valid `ecg_recordings.id`,
 4. click `Load` if artifacts already exist,

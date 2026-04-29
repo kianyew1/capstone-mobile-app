@@ -1754,6 +1754,10 @@ class StaticReviewProcessRequest(BaseModel):
     force: bool = False
 
 
+class LatestRecordResponse(BaseModel):
+    record_id: str
+
+
 class CalibrationSignalQualityResponse(BaseModel):
     quality_percentage: float
     signal_suitable: bool
@@ -3045,6 +3049,14 @@ async def review_process_status(job_id: str) -> SessionAnalysisJob:
 @app.get("/review_static/{record_id}/manifest")
 async def static_review_manifest(record_id: str) -> Dict[str, Any]:
     return _load_static_review_manifest(record_id)
+
+
+@app.get("/review_static/latest", response_model=LatestRecordResponse)
+async def static_review_latest_record() -> LatestRecordResponse:
+    latest_id = _fetch_latest_recording_id()
+    if not latest_id:
+        raise HTTPException(status_code=404, detail="No ECG recordings available yet.")
+    return LatestRecordResponse(record_id=latest_id)
 
 
 @app.post("/review_static/{record_id}/process", response_model=SessionAnalysisJob)
